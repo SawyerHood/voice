@@ -1,8 +1,10 @@
 mod api_key_store;
 mod audio_capture_service;
+mod auth_store;
 mod history_store;
 mod hotkey_service;
 mod logging;
+mod oauth;
 mod permission_service;
 mod settings_store;
 mod status_notifier;
@@ -25,6 +27,7 @@ use audio_capture_service::{
     AudioCaptureService, AudioInputChunk, AudioInputChunkCallback, AudioInputStreamErrorEvent,
     MicrophoneInfo, RecordedAudio, AUDIO_INPUT_STREAM_ERROR_EVENT, AUDIO_LEVEL_EVENT,
 };
+use auth_store::{AuthMethod, AuthStore};
 use history_store::{HistoryEntry, HistoryStore};
 use hotkey_service::{
     HotkeyConfig, HotkeyService, RecordingMode, RecordingTransition, StopProcessingDecision,
@@ -46,12 +49,13 @@ use tauri::{
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt as AutostartManagerExt};
 use text_insertion_service::TextInsertionService;
 use tracing::{debug, error, info, warn};
+use transcription::chatgpt::{ChatGptTranscriptionConfig, ChatGptTranscriptionProvider};
 use transcription::openai::{OpenAiTranscriptionConfig, OpenAiTranscriptionProvider};
 use transcription::realtime::{
     OpenAiRealtimeTranscriptionClient, OpenAiRealtimeTranscriptionConfig,
     RealtimeTranscriptionSession,
 };
-use transcription::{TranscriptionOptions, TranscriptionOrchestrator};
+use transcription::{TranscriptionOptions, TranscriptionOrchestrator, TranscriptionProvider};
 use voice_pipeline::{PipelineError, PipelineTranscript, VoicePipeline, VoicePipelineDelegate};
 
 const EVENT_STATUS_CHANGED: &str = "voice://status-changed";
@@ -250,23 +254,38 @@ struct PipelineErrorEvent {
     message: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatGptAuthStatus {
+    account_id: String,
+    expires_at: u64,
+}
+
 #[derive(Debug)]
 struct AppServices {
     audio_capture_service: AudioCaptureService,
     transcription_orchestrator: TranscriptionOrchestrator,
+    chatgpt_transcription_provider: ChatGptTranscriptionProvider,
     realtime_transcription_client: OpenAiRealtimeTranscriptionClient,
     text_insertion_service: TextInsertionService,
     settings_store: SettingsStore,
     api_key_store: ApiKeyStore,
+    auth_store: AuthStore,
     permission_service: PermissionService,
 }
 
 impl AppServices {
     fn new(app_data_dir: PathBuf) -> Self {
+        let api_key_store = ApiKeyStore::new(app_data_dir.clone());
+        let auth_store = AuthStore::new(app_data_dir.clone());
         let mut openai_config = OpenAiTranscriptionConfig::from_env();
         openai_config.api_key_store_app_data_dir = Some(app_data_dir.clone());
         let provider = OpenAiTranscriptionProvider::new(openai_config.clone());
         let transcription_orchestrator = TranscriptionOrchestrator::new(Arc::new(provider));
+        let chatgpt_transcription_provider = ChatGptTranscriptionProvider::new(
+            ChatGptTranscriptionConfig::from_env(),
+            auth_store.clone(),
+        );
         let mut realtime_config = OpenAiRealtimeTranscriptionConfig::from_env();
         if realtime_config.transcription_model.trim().is_empty() {
             realtime_config.transcription_model = openai_config.model.clone();
@@ -279,12 +298,18 @@ impl AppServices {
         Self {
             audio_capture_service: AudioCaptureService::new(),
             transcription_orchestrator,
+            chatgpt_transcription_provider,
             realtime_transcription_client,
             text_insertion_service: TextInsertionService::new(),
             settings_store: SettingsStore::new(),
-            api_key_store: ApiKeyStore::new(app_data_dir),
+            api_key_store,
+            auth_store,
             permission_service: PermissionService::new(),
         }
+    }
+
+    fn current_auth_method(&self) -> Result<AuthMethod, String> {
+        self.auth_store.effective_auth_method(&self.api_key_store)
     }
 }
 
@@ -541,10 +566,16 @@ impl VoicePipelineDelegate for AppPipelineDelegate {
 
         self.clear_realtime_session();
 
-        let realtime_session = if state
+        let auth_method = state
             .services
-            .realtime_transcription_client
-            .model_supports_realtime()
+            .current_auth_method()
+            .map_err(|error| format!("Failed to resolve active auth method: {error}"))?;
+
+        let realtime_session = if auth_method == AuthMethod::ApiKey
+            && state
+                .services
+                .realtime_transcription_client
+                .model_supports_realtime()
         {
             let options = TranscriptionOptions {
                 language: settings.language.clone(),
@@ -573,6 +604,13 @@ impl VoicePipelineDelegate for AppPipelineDelegate {
                     None
                 }
             }
+        } else if auth_method != AuthMethod::ApiKey {
+            debug!(
+                session_id = ?self.session_id,
+                auth_method = auth_method.as_str(),
+                "active auth method does not support realtime transcription; using REST upload fallback"
+            );
+            None
         } else {
             debug!(
                 session_id = ?self.session_id,
@@ -641,45 +679,64 @@ impl VoicePipelineDelegate for AppPipelineDelegate {
             on_delta: Some(self.build_delta_callback()),
             ..TranscriptionOptions::default()
         };
-        let orchestrator = {
-            let state = self.app.state::<AppState>();
-            state.services.transcription_orchestrator.clone()
-        };
-        let provider_name = orchestrator.active_provider_name().to_string();
+        let state = self.app.state::<AppState>();
+        let auth_method = state
+            .services
+            .current_auth_method()
+            .map_err(|error| format!("Failed to resolve active auth method: {error}"))?;
+        let orchestrator = state.services.transcription_orchestrator.clone();
+        let chatgpt_provider = state.services.chatgpt_transcription_provider.clone();
+        let provider_name = match auth_method {
+            AuthMethod::ApiKey => "openai",
+            AuthMethod::ChatgptOauth => "chatgpt-oauth",
+            AuthMethod::None => "none",
+        }
+        .to_string();
         let provider_name_for_error = provider_name.clone();
 
-        if let Some(realtime_session) = self.take_realtime_session() {
-            info!(
-                session_id = ?self.session_id,
-                provider = "openai-realtime",
-                "awaiting realtime transcription completion"
-            );
+        if auth_method == AuthMethod::ApiKey {
+            if let Some(realtime_session) = self.take_realtime_session() {
+                info!(
+                    session_id = ?self.session_id,
+                    provider = "openai-realtime",
+                    "awaiting realtime transcription completion"
+                );
 
-            match realtime_session.commit_and_wait().await {
-                Ok(transcription) => {
-                    let transcript = PipelineTranscript {
-                        text: transcription.text,
-                        duration_secs: transcription.duration_secs,
-                        language: transcription.language,
-                        provider: "openai-realtime".to_string(),
-                    };
-                    info!(
-                        session_id = ?self.session_id,
-                        provider = %transcript.provider,
-                        transcript_chars = transcript.text.chars().count(),
-                        "realtime transcription completed"
-                    );
-                    return Ok(transcript);
-                }
-                Err(error) => {
-                    warn!(
-                        session_id = ?self.session_id,
-                        error = %error,
-                        provider = "openai-realtime",
-                        "realtime transcription failed; falling back to REST upload"
-                    );
+                match realtime_session.commit_and_wait().await {
+                    Ok(transcription) => {
+                        let transcript = PipelineTranscript {
+                            text: transcription.text,
+                            duration_secs: transcription.duration_secs,
+                            language: transcription.language,
+                            provider: "openai-realtime".to_string(),
+                        };
+                        info!(
+                            session_id = ?self.session_id,
+                            provider = %transcript.provider,
+                            transcript_chars = transcript.text.chars().count(),
+                            "realtime transcription completed"
+                        );
+                        return Ok(transcript);
+                    }
+                    Err(error) => {
+                        warn!(
+                            session_id = ?self.session_id,
+                            error = %error,
+                            provider = "openai-realtime",
+                            "realtime transcription failed; falling back to REST upload"
+                        );
+                    }
                 }
             }
+        } else {
+            self.clear_realtime_session();
+        }
+
+        if auth_method == AuthMethod::None {
+            return Err(
+                "No authentication configured. Add an OpenAI API key or login with ChatGPT."
+                    .to_string(),
+            );
         }
 
         info!(
@@ -689,9 +746,13 @@ impl VoicePipelineDelegate for AppPipelineDelegate {
             "starting REST transcription fallback request"
         );
 
-        orchestrator
-            .transcribe(wav_bytes, options)
-            .await
+        let transcription = match auth_method {
+            AuthMethod::ApiKey => orchestrator.transcribe(wav_bytes, options).await,
+            AuthMethod::ChatgptOauth => chatgpt_provider.transcribe(wav_bytes, options).await,
+            AuthMethod::None => unreachable!("auth method none is handled above"),
+        };
+
+        transcription
             .map(|transcription| PipelineTranscript {
                 text: transcription.text,
                 duration_secs: transcription.duration_secs,
@@ -1362,6 +1423,60 @@ fn has_api_key(provider: String, state: tauri::State<'_, AppState>) -> Result<bo
 }
 
 #[tauri::command]
+fn get_auth_method(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let method = state.services.current_auth_method()?;
+    Ok(method.as_str().to_string())
+}
+
+#[tauri::command]
+fn set_auth_method(method: String, state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let parsed = AuthMethod::parse(&method)?;
+    state.services.auth_store.set_auth_method(parsed)?;
+    Ok(parsed.as_str().to_string())
+}
+
+#[tauri::command]
+fn get_chatgpt_auth_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<ChatGptAuthStatus>, String> {
+    Ok(state
+        .services
+        .auth_store
+        .chatgpt_credentials()?
+        .map(|credentials| ChatGptAuthStatus {
+            account_id: credentials.account_id,
+            expires_at: credentials.expires_at,
+        }))
+}
+
+#[tauri::command]
+async fn start_chatgpt_login(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<ChatGptAuthStatus, String> {
+    info!("ChatGPT OAuth login requested");
+    let login = oauth::start_chatgpt_login(&app).await?;
+    state.services.auth_store.save_chatgpt_login(
+        &login.access_token,
+        &login.refresh_token,
+        login.expires_at,
+        &login.account_id,
+    )?;
+
+    Ok(ChatGptAuthStatus {
+        account_id: login.account_id,
+        expires_at: login.expires_at,
+    })
+}
+
+#[tauri::command]
+fn logout_chatgpt(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    info!("ChatGPT OAuth logout requested");
+    state.services.auth_store.logout_chatgpt()?;
+    Ok(())
+}
+
+#[tauri::command]
 fn set_api_key(
     provider: String,
     key: String,
@@ -1374,7 +1489,16 @@ fn set_api_key(
         .set_api_key(provider.as_str(), key.as_str());
     if let Err(error) = &result {
         error!(provider = %provider, %error, "api key set failed");
+        return result;
     }
+
+    if provider.trim().eq_ignore_ascii_case("openai") {
+        if let Err(error) = state.services.auth_store.set_api_key(key.as_str()) {
+            error!(provider = %provider, %error, "failed to update auth store after setting API key");
+            return Err(error);
+        }
+    }
+
     result
 }
 
@@ -1387,7 +1511,16 @@ fn delete_api_key(provider: String, state: tauri::State<'_, AppState>) -> Result
         .delete_api_key(provider.as_str());
     if let Err(error) = &result {
         error!(provider = %provider, %error, "api key delete failed");
+        return result;
     }
+
+    if provider.trim().eq_ignore_ascii_case("openai") {
+        if let Err(error) = state.services.auth_store.clear_api_key() {
+            error!(provider = %provider, %error, "failed to update auth store after deleting API key");
+            return Err(error);
+        }
+    }
+
     result
 }
 
@@ -1511,12 +1644,22 @@ async fn transcribe_audio(
     request_options.on_delta = Some(Arc::new(move |delta| {
         emit_transcription_delta_event(&app_for_delta, &delta);
     }));
+    let auth_method = state.services.current_auth_method()?;
+    let orchestrator = state.services.transcription_orchestrator.clone();
+    let chatgpt_provider = state.services.chatgpt_transcription_provider.clone();
 
-    let result = state
-        .services
-        .transcription_orchestrator
-        .transcribe(audio_bytes, request_options)
-        .await;
+    let result = match auth_method {
+        AuthMethod::ApiKey => orchestrator.transcribe(audio_bytes, request_options).await,
+        AuthMethod::ChatgptOauth => {
+            chatgpt_provider
+                .transcribe(audio_bytes, request_options)
+                .await
+        }
+        AuthMethod::None => Err(transcription::TranscriptionError::Provider(
+            "No authentication configured. Add an OpenAI API key or login with ChatGPT."
+                .to_string(),
+        )),
+    };
 
     match result {
         Ok(transcription) => {
@@ -1780,6 +1923,11 @@ pub fn run() {
             get_launch_at_login,
             set_launch_at_login,
             has_api_key,
+            get_auth_method,
+            set_auth_method,
+            get_chatgpt_auth_status,
+            start_chatgpt_login,
+            logout_chatgpt,
             set_api_key,
             delete_api_key,
             list_microphones,

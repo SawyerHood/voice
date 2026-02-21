@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Eye, EyeOff, RefreshCw, Download, Key, Trash2 } from "lucide-react";
+import { Eye, EyeOff, RefreshCw, Download, Key, Trash2, LogIn, LogOut, UserRound } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -53,6 +53,13 @@ type SaveFeedback = {
   message: string;
 };
 
+type AuthMethod = "none" | "api_key" | "chatgpt_oauth";
+
+type ChatGptAuthStatus = {
+  accountId: string;
+  expiresAt: number;
+};
+
 function toErrorMessage(error: unknown, fallback: string): string {
   if (typeof error === "string") {
     const trimmed = error.trim();
@@ -72,6 +79,12 @@ function formatMicrophoneLabel(device: MicrophoneInfo): string {
   if (device.channels) details.push(`${device.channels} ch`);
   if (details.length === 0) return device.name;
   return `${device.name} (${details.join(", ")})`;
+}
+
+function formatAuthMethodLabel(method: AuthMethod): string {
+  if (method === "api_key") return "API Key";
+  if (method === "chatgpt_oauth") return "ChatGPT OAuth";
+  return "None";
 }
 
 const HOTKEY_PRESETS = [
@@ -99,6 +112,9 @@ const RECORDING_MODE_OPTIONS: ReadonlyArray<{
 export default function Settings() {
   const [isLoading, setIsLoading] = useState(true);
   const [isSavingApiKey, setIsSavingApiKey] = useState(false);
+  const [isSavingAuthMethod, setIsSavingAuthMethod] = useState(false);
+  const [isStartingChatgptLogin, setIsStartingChatgptLogin] = useState(false);
+  const [isLoggingOutChatgpt, setIsLoggingOutChatgpt] = useState(false);
   const [isRefreshingMics, setIsRefreshingMics] = useState(false);
   const [isExportingLogs, setIsExportingLogs] = useState(false);
   const [feedback, setFeedback] = useState<SaveFeedback | null>(null);
@@ -118,6 +134,9 @@ export default function Settings() {
   const [hasStoredApiKey, setHasStoredApiKey] = useState(false);
   const [apiKeyDraft, setApiKeyDraft] = useState("");
   const [isApiKeyDraftVisible, setIsApiKeyDraftVisible] = useState(false);
+  const [activeAuthMethod, setActiveAuthMethod] = useState<AuthMethod>("none");
+  const [selectedAuthMethod, setSelectedAuthMethod] = useState<"api_key" | "chatgpt_oauth">("api_key");
+  const [chatgptAuthStatus, setChatgptAuthStatus] = useState<ChatGptAuthStatus | null>(null);
 
   useEffect(() => {
     if (!feedback) return undefined;
@@ -139,10 +158,12 @@ export default function Settings() {
   const loadSettings = useCallback(async () => {
     setIsLoading(true);
     try {
-      const [settings, hotkeyConfig, hasOpenAiKey] = await Promise.all([
+      const [settings, hotkeyConfig, hasOpenAiKey, authMethod, chatgptStatus] = await Promise.all([
         invoke<VoiceSettings>("get_settings"),
         invoke<HotkeyConfig>("get_hotkey_config"),
         invoke<boolean>("has_api_key", { provider: OPENAI_PROVIDER }),
+        invoke<AuthMethod>("get_auth_method"),
+        invoke<ChatGptAuthStatus | null>("get_chatgpt_auth_status"),
       ]);
 
       setHotkeyShortcut(hotkeyConfig.shortcut || settings.hotkey_shortcut);
@@ -154,6 +175,9 @@ export default function Settings() {
       setHasStoredApiKey(hasOpenAiKey);
       setApiKeyDraft("");
       setIsApiKeyDraftVisible(false);
+      setActiveAuthMethod(authMethod);
+      setSelectedAuthMethod(authMethod === "chatgpt_oauth" ? "chatgpt_oauth" : "api_key");
+      setChatgptAuthStatus(chatgptStatus);
 
       try {
         setLaunchAtLogin(await invoke<boolean>("get_launch_at_login"));
@@ -190,6 +214,12 @@ export default function Settings() {
   const canSaveApiKey = apiKeyDraft.trim().length > 0;
   const canClearApiKey = hasStoredApiKey;
   const canRevealApiKeyDraft = apiKeyDraft.trim().length > 0;
+  const isApiKeyAuthSelected = selectedAuthMethod === "api_key";
+  const isChatgptAuthSelected = selectedAuthMethod === "chatgpt_oauth";
+  const chatgptSessionExpiresLabel = useMemo(() => {
+    if (!chatgptAuthStatus) return null;
+    return new Date(chatgptAuthStatus.expiresAt * 1000).toLocaleString();
+  }, [chatgptAuthStatus]);
 
   const handleShortcutPresetChange = useCallback((presetValue: string) => {
     if (presetValue === CUSTOM_SHORTCUT_PRESET_VALUE) {
@@ -277,6 +307,48 @@ export default function Settings() {
     setIsRefreshingMics(false);
   }
 
+  async function handleSelectAuthMethod(nextMethod: "api_key" | "chatgpt_oauth") {
+    setSelectedAuthMethod(nextMethod);
+    setIsSavingAuthMethod(true);
+    try {
+      const updatedMethod = await invoke<AuthMethod>("set_auth_method", { method: nextMethod });
+      setActiveAuthMethod(updatedMethod);
+    } catch (error) {
+      setFeedback({ kind: "error", message: toErrorMessage(error, "Unable to update auth method.") });
+    } finally {
+      setIsSavingAuthMethod(false);
+    }
+  }
+
+  async function handleStartChatgptLogin() {
+    setIsStartingChatgptLogin(true);
+    try {
+      const status = await invoke<ChatGptAuthStatus>("start_chatgpt_login");
+      setChatgptAuthStatus(status);
+      setActiveAuthMethod("chatgpt_oauth");
+      setSelectedAuthMethod("chatgpt_oauth");
+      setFeedback({ kind: "success", message: "Logged in with ChatGPT." });
+    } catch (error) {
+      setFeedback({ kind: "error", message: toErrorMessage(error, "ChatGPT login failed.") });
+    } finally {
+      setIsStartingChatgptLogin(false);
+    }
+  }
+
+  async function handleLogoutChatgpt() {
+    setIsLoggingOutChatgpt(true);
+    try {
+      await invoke("logout_chatgpt");
+      setChatgptAuthStatus(null);
+      setActiveAuthMethod("none");
+      setFeedback({ kind: "success", message: "ChatGPT session cleared." });
+    } catch (error) {
+      setFeedback({ kind: "error", message: toErrorMessage(error, "Unable to logout from ChatGPT.") });
+    } finally {
+      setIsLoggingOutChatgpt(false);
+    }
+  }
+
   async function handleSaveApiKey() {
     const key = apiKeyDraft.trim();
     if (!key) {
@@ -288,6 +360,8 @@ export default function Settings() {
     try {
       await invoke("set_api_key", { provider: OPENAI_PROVIDER, key });
       setHasStoredApiKey(true);
+      setActiveAuthMethod("api_key");
+      setSelectedAuthMethod("api_key");
       setApiKeyDraft("");
       setIsApiKeyDraftVisible(false);
       setFeedback({ kind: "success", message: "OpenAI API key saved." });
@@ -309,6 +383,9 @@ export default function Settings() {
     try {
       await invoke("delete_api_key", { provider: OPENAI_PROVIDER });
       setHasStoredApiKey(false);
+      if (activeAuthMethod === "api_key") {
+        setActiveAuthMethod("none");
+      }
       setApiKeyDraft("");
       setIsApiKeyDraftVisible(false);
       setFeedback({ kind: "success", message: "OpenAI API key removed." });
@@ -538,63 +615,136 @@ export default function Settings() {
         </CardContent>
       </Card>
 
-      {/* ── API Key ── */}
+      {/* ── Authentication ── */}
       <Card>
         <CardContent className="space-y-3 py-4">
           <div className="flex items-center gap-2">
-            <Key className="size-3.5 text-muted-foreground" />
+            <UserRound className="size-3.5 text-muted-foreground" />
             <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-              OpenAI API Key
+              Authentication
             </p>
           </div>
 
-          <div className="flex gap-2">
-            <Input
-              type={isApiKeyDraftVisible ? "text" : "password"}
-              value={apiKeyDraft}
-              onChange={(e) => setApiKeyDraft(e.currentTarget.value)}
-              placeholder={apiKeyPlaceholder}
-              autoComplete="off"
-              spellCheck={false}
-              className="h-8 flex-1 text-xs font-mono"
-            />
-            <Button
+          <div className="flex rounded-lg border bg-muted/50 p-0.5">
+            <button
               type="button"
-              variant="outline"
-              size="icon-sm"
-              onClick={() => setIsApiKeyDraftVisible((v) => !v)}
-              disabled={!canRevealApiKeyDraft}
+              className={cn(
+                "flex-1 rounded-md px-3 py-1.5 text-xs font-medium transition-all",
+                selectedAuthMethod === "api_key"
+                  ? "bg-background text-foreground shadow-sm"
+                  : "text-muted-foreground hover:text-foreground"
+              )}
+              onClick={() => void handleSelectAuthMethod("api_key")}
+              disabled={isSavingAuthMethod}
             >
-              {isApiKeyDraftVisible ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
-            </Button>
-          </div>
-
-          <div className="flex gap-2">
-            <Button
+              API Key
+            </button>
+            <button
               type="button"
-              size="xs"
-              onClick={handleSaveApiKey}
-              disabled={!canSaveApiKey || isSavingApiKey}
+              className={cn(
+                "flex-1 rounded-md px-3 py-1.5 text-xs font-medium transition-all",
+                selectedAuthMethod === "chatgpt_oauth"
+                  ? "bg-background text-foreground shadow-sm"
+                  : "text-muted-foreground hover:text-foreground"
+              )}
+              onClick={() => void handleSelectAuthMethod("chatgpt_oauth")}
+              disabled={isSavingAuthMethod}
             >
-              {isSavingApiKey ? "Saving..." : "Save Key"}
-            </Button>
-            <Button
-              type="button"
-              variant="outline"
-              size="xs"
-              onClick={handleClearApiKey}
-              disabled={!canClearApiKey || isSavingApiKey}
-            >
-              <Trash2 className="size-3" />
-              Clear Key
-            </Button>
+              Login with ChatGPT
+            </button>
           </div>
 
           <p className="text-[11px] text-muted-foreground">
-            {hasStoredApiKey
-              ? "✓ API key set. Stored securely in macOS Keychain."
-              : "No API key configured."}
+            Active method: {formatAuthMethodLabel(activeAuthMethod)}
+            {isSavingAuthMethod ? " (updating...)" : ""}
           </p>
+
+          {isApiKeyAuthSelected && (
+            <>
+              <div className="flex items-center gap-2">
+                <Key className="size-3.5 text-muted-foreground" />
+                <p className="text-[11px] text-muted-foreground">OpenAI API Key</p>
+              </div>
+
+              <div className="flex gap-2">
+                <Input
+                  type={isApiKeyDraftVisible ? "text" : "password"}
+                  value={apiKeyDraft}
+                  onChange={(e) => setApiKeyDraft(e.currentTarget.value)}
+                  placeholder={apiKeyPlaceholder}
+                  autoComplete="off"
+                  spellCheck={false}
+                  className="h-8 flex-1 text-xs font-mono"
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="icon-sm"
+                  onClick={() => setIsApiKeyDraftVisible((v) => !v)}
+                  disabled={!canRevealApiKeyDraft}
+                >
+                  {isApiKeyDraftVisible ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
+                </Button>
+              </div>
+
+              <div className="flex gap-2">
+                <Button
+                  type="button"
+                  size="xs"
+                  onClick={handleSaveApiKey}
+                  disabled={!canSaveApiKey || isSavingApiKey}
+                >
+                  {isSavingApiKey ? "Saving..." : "Save Key"}
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="xs"
+                  onClick={handleClearApiKey}
+                  disabled={!canClearApiKey || isSavingApiKey}
+                >
+                  <Trash2 className="size-3" />
+                  Clear Key
+                </Button>
+              </div>
+
+              <p className="text-[11px] text-muted-foreground">
+                {hasStoredApiKey ? "✓ API key set." : "No API key configured."}
+              </p>
+            </>
+          )}
+
+          {isChatgptAuthSelected && (
+            <div className="space-y-2">
+              <div className="flex gap-2">
+                <Button
+                  type="button"
+                  size="xs"
+                  onClick={handleStartChatgptLogin}
+                  disabled={isStartingChatgptLogin}
+                >
+                  <LogIn className="size-3.5" />
+                  {isStartingChatgptLogin ? "Opening browser..." : "Login with ChatGPT"}
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="xs"
+                  onClick={handleLogoutChatgpt}
+                  disabled={!chatgptAuthStatus || isLoggingOutChatgpt}
+                >
+                  <LogOut className="size-3.5" />
+                  {isLoggingOutChatgpt ? "Logging out..." : "Logout"}
+                </Button>
+              </div>
+
+              <p className="text-[11px] text-muted-foreground">
+                {chatgptAuthStatus
+                  ? `Logged in (${chatgptAuthStatus.accountId}). Token expires ${chatgptSessionExpiresLabel ?? "soon"}.`
+                  : "Not logged in with ChatGPT."}
+              </p>
+            </div>
+          )}
         </CardContent>
       </Card>
 

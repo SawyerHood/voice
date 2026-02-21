@@ -1,3 +1,4 @@
+pub mod chatgpt;
 pub mod openai;
 pub mod realtime;
 
@@ -101,10 +102,6 @@ impl TranscriptionOrchestrator {
             "transcription orchestrator initialized"
         );
         Self { active_provider }
-    }
-
-    pub fn active_provider_name(&self) -> &'static str {
-        self.active_provider.name()
     }
 
     pub async fn transcribe(
