@@ -23,21 +23,20 @@ const DEFAULT_OPENAI_REALTIME_MODEL: &str = "gpt-realtime";
 const DEFAULT_OPENAI_TRANSCRIPTION_MODEL: &str = "gpt-4o-mini-transcribe";
 const DEFAULT_COMMIT_TIMEOUT_SECS: u64 = 20;
 const DEFAULT_TURN_THRESHOLD: f32 = 0.5;
+const DEFAULT_PREFIX_PADDING_MS: u64 = 300;
 const DEFAULT_SILENCE_DURATION_MS: u64 = 500;
 const REALTIME_OUTPUT_SAMPLE_RATE_HZ: u32 = 24_000;
-const OPENAI_BETA_REALTIME_HEADER_VALUE: &str = "realtime=v1";
-
-const EVENT_SESSION_CREATED: &str = "transcription_session.created";
-const EVENT_SESSION_UPDATED: &str = "transcription_session.updated";
+const EVENT_SESSION_CREATED: &str = "session.created";
+const EVENT_SESSION_UPDATED: &str = "session.updated";
 const EVENT_SPEECH_STARTED: &str = "input_audio_buffer.speech_started";
 const EVENT_SPEECH_STOPPED: &str = "input_audio_buffer.speech_stopped";
 const EVENT_DELTA: &str = "conversation.item.input_audio_transcription.delta";
 const EVENT_COMPLETED: &str = "conversation.item.input_audio_transcription.completed";
 const EVENT_FALLBACK_DELTA: &str = "transcript.text.delta";
 const EVENT_FALLBACK_COMPLETED: &str = "transcript.text.done";
-// Also accept legacy event names from general realtime sessions
-const EVENT_SESSION_CREATED_LEGACY: &str = "session.created";
-const EVENT_SESSION_UPDATED_LEGACY: &str = "session.updated";
+// Also accept legacy transcription session lifecycle events for compatibility.
+const EVENT_SESSION_CREATED_LEGACY: &str = "transcription_session.created";
+const EVENT_SESSION_UPDATED_LEGACY: &str = "transcription_session.updated";
 const EVENT_ERROR: &str = "error";
 
 #[derive(Debug, Clone)]
@@ -341,10 +340,6 @@ async fn run_realtime_session(
     request
         .headers_mut()
         .insert("Authorization", authorization_header_value);
-    request.headers_mut().insert(
-        "OpenAI-Beta",
-        HeaderValue::from_static(OPENAI_BETA_REALTIME_HEADER_VALUE),
-    );
 
     info!(
         endpoint = %endpoint,
@@ -633,13 +628,26 @@ fn build_session_update_payload(
     }
 
     json!({
-        "type": "transcription_session.update",
+        "type": "session.update",
         "session": {
-            "input_audio_transcription": transcription_config,
-            "turn_detection": {
-                "type": "server_vad",
-                "threshold": config.turn_detection_threshold,
-                "silence_duration_ms": config.silence_duration_ms,
+            "type": "transcription",
+            "audio": {
+                "input": {
+                    "format": {
+                        "type": "audio/pcm",
+                        "rate": REALTIME_OUTPUT_SAMPLE_RATE_HZ,
+                    },
+                    "noise_reduction": {
+                        "type": "near_field"
+                    },
+                    "transcription": transcription_config,
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "threshold": config.turn_detection_threshold,
+                        "prefix_padding_ms": DEFAULT_PREFIX_PADDING_MS,
+                        "silence_duration_ms": config.silence_duration_ms,
+                    }
+                }
             }
         }
     })
@@ -804,28 +812,44 @@ mod tests {
             },
         );
 
-        assert_eq!(payload["type"], Value::String("transcription_session.update".to_string()));
+        assert_eq!(payload["type"], Value::String("session.update".to_string()));
         assert_eq!(
-            payload["session"]["input_audio_transcription"]["model"],
+            payload["session"]["type"],
+            Value::String("transcription".to_string())
+        );
+        assert_eq!(
+            payload["session"]["audio"]["input"]["transcription"]["model"],
             Value::String(config.transcription_model.clone())
         );
         assert_eq!(
-            payload["session"]["input_audio_transcription"]["language"],
+            payload["session"]["audio"]["input"]["transcription"]["language"],
             Value::String("en".to_string())
         );
         assert_eq!(
-            payload["session"]["turn_detection"]["type"],
+            payload["session"]["audio"]["input"]["format"]["type"],
+            Value::String("audio/pcm".to_string())
+        );
+        assert_eq!(
+            payload["session"]["audio"]["input"]["format"]["rate"],
+            Value::from(REALTIME_OUTPUT_SAMPLE_RATE_HZ)
+        );
+        assert_eq!(
+            payload["session"]["audio"]["input"]["turn_detection"]["type"],
             Value::String("server_vad".to_string())
         );
         assert_eq!(
-            payload["session"]["turn_detection"]["silence_duration_ms"],
+            payload["session"]["audio"]["input"]["turn_detection"]["prefix_padding_ms"],
+            Value::from(DEFAULT_PREFIX_PADDING_MS)
+        );
+        assert_eq!(
+            payload["session"]["audio"]["input"]["turn_detection"]["silence_duration_ms"],
             Value::from(config.silence_duration_ms)
         );
     }
 
     #[test]
     fn resolve_realtime_endpoint_appends_model_query_parameter() {
-        let endpoint = "wss://api.openai.com/v1/realtime?intent=transcription";
+        let endpoint = "wss://api.openai.com/v1/realtime";
         let resolved = resolve_realtime_endpoint(endpoint, "gpt-realtime")
             .expect("endpoint should parse and include model query");
         let parsed = Url::parse(&resolved).expect("resolved endpoint should be valid URL");
@@ -907,8 +931,6 @@ mod tests {
         let endpoint = format!("ws://{address}");
         let observed_authorization_header = Arc::new(Mutex::new(None::<String>));
         let authorization_header_for_server = Arc::clone(&observed_authorization_header);
-        let observed_openai_beta_header = Arc::new(Mutex::new(None::<String>));
-        let openai_beta_header_for_server = Arc::clone(&observed_openai_beta_header);
         let observed_request_uri = Arc::new(Mutex::new(None::<String>));
         let request_uri_for_server = Arc::clone(&observed_request_uri);
 
@@ -928,15 +950,6 @@ mod tests {
                         .lock()
                         .expect("authorization header lock should not be poisoned") =
                         authorization_header;
-
-                    let openai_beta_header = request
-                        .headers()
-                        .get("OpenAI-Beta")
-                        .and_then(|value| value.to_str().ok())
-                        .map(|value| value.to_string());
-                    *openai_beta_header_for_server
-                        .lock()
-                        .expect("beta header lock should not be poisoned") = openai_beta_header;
 
                     *request_uri_for_server
                         .lock()
@@ -958,9 +971,18 @@ mod tests {
             let first_text = first.into_text().expect("session update should be text");
             let first_payload: Value = serde_json::from_str(first_text.as_ref())
                 .expect("session update JSON should parse");
-            assert_eq!(first_payload["type"], "transcription_session.update");
+            assert_eq!(first_payload["type"], "session.update");
+            assert_eq!(first_payload["session"]["type"], "transcription");
             assert_eq!(
-                first_payload["session"]["input_audio_transcription"]["model"],
+                first_payload["session"]["audio"]["input"]["format"]["type"],
+                Value::String("audio/pcm".to_string())
+            );
+            assert_eq!(
+                first_payload["session"]["audio"]["input"]["format"]["rate"],
+                Value::from(REALTIME_OUTPUT_SAMPLE_RATE_HZ)
+            );
+            assert_eq!(
+                first_payload["session"]["audio"]["input"]["transcription"]["model"],
                 Value::String(DEFAULT_OPENAI_TRANSCRIPTION_MODEL.to_string())
             );
 
@@ -1058,13 +1080,6 @@ mod tests {
             .clone()
             .unwrap_or_default();
         assert_eq!(authorization_header, "Bearer test-key");
-
-        let beta_header = observed_openai_beta_header
-            .lock()
-            .expect("beta header lock should not be poisoned")
-            .clone()
-            .unwrap_or_default();
-        assert_eq!(beta_header, "realtime=v1");
 
         let request_uri = observed_request_uri
             .lock()
