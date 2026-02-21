@@ -36,6 +36,8 @@ body {
   width: 300px;
   height: 56px;
   margin: 0;
+  position: relative;
+  pointer-events: auto;
   border-radius: 999px;
   border: 1px solid rgba(255, 255, 255, 0.14);
   background: linear-gradient(135deg, rgba(8, 10, 14, 0.88), rgba(19, 24, 32, 0.78));
@@ -101,6 +103,37 @@ body {
   letter-spacing: 0.06em;
   color: rgba(243, 247, 255, 0.82);
   font-variant-numeric: tabular-nums;
+}
+
+.overlay-cancel-button {
+  position: absolute;
+  top: 6px;
+  right: 10px;
+  width: 18px;
+  height: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 999px;
+  background: rgba(10, 12, 16, 0.56);
+  color: rgba(243, 247, 255, 0.78);
+  font-size: 13px;
+  line-height: 1;
+  padding: 0;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+
+.overlay-cancel-button:hover {
+  background: rgba(255, 89, 89, 0.24);
+  border-color: rgba(255, 120, 120, 0.44);
+  color: rgba(255, 240, 240, 0.92);
+}
+
+.overlay-cancel-button:focus-visible {
+  outline: 2px solid rgba(110, 199, 255, 0.85);
+  outline-offset: 1px;
 }
 
 @keyframes recording-pulse {

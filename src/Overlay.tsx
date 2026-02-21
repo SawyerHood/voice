@@ -7,12 +7,14 @@ import "./Overlay.css";
 type AppStatus = "idle" | "listening" | "transcribing" | "error";
 
 const EVENT_STATUS_CHANGED = "voice://status-changed";
+const COMMAND_CANCEL_RECORDING = "cancel_recording";
 
 function Overlay() {
   const [status, setStatus] = useState<AppStatus>("idle");
   const [elapsedMs, setElapsedMs] = useState(0);
   const statusRef = useRef<AppStatus>("idle");
   const startedAtRef = useRef<number | null>(null);
+  const cancelInFlightRef = useRef(false);
 
   useEffect(() => {
     let isMounted = true;
@@ -107,7 +109,19 @@ function Overlay() {
 
   const isListening = status === "listening";
   const isTranscribing = status === "transcribing";
+  const canCancel = isListening || isTranscribing;
   const statusLabel = isListening ? "Listening..." : isTranscribing ? "Transcribing..." : "";
+
+  const handleCancel = () => {
+    if (cancelInFlightRef.current) {
+      return;
+    }
+
+    cancelInFlightRef.current = true;
+    void invoke(COMMAND_CANCEL_RECORDING).finally(() => {
+      cancelInFlightRef.current = false;
+    });
+  };
 
   return (
     <main className="overlay-root">
@@ -116,6 +130,16 @@ function Overlay() {
           isTranscribing ? "transcribing" : ""
         }`}
       >
+        {canCancel ? (
+          <button
+            type="button"
+            className="overlay-cancel-button"
+            onClick={handleCancel}
+            aria-label="Cancel recording"
+          >
+            ×
+          </button>
+        ) : null}
         <span className="recording-indicator" aria-hidden="true">
           <span className="recording-dot" />
         </span>

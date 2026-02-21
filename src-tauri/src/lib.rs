@@ -975,8 +975,8 @@ fn create_recording_overlay_window(app: &AppHandle) -> Result<WebviewWindow, Str
     if let Err(error) = window.set_focusable(false) {
         warn!(%error, "failed to set recording overlay as non-focusable");
     }
-    if let Err(error) = window.set_ignore_cursor_events(true) {
-        warn!(%error, "failed to make recording overlay click-through");
+    if let Err(error) = window.set_ignore_cursor_events(false) {
+        warn!(%error, "failed to enable recording overlay cursor events");
     }
 
     position_overlay_window(&window, app);
@@ -1108,6 +1108,25 @@ fn permission_preflight_error_message(
             PermissionState::Granted => String::new(),
         },
     }
+}
+
+fn cancel_recording_with_hooks<BeginSession, ForceStopRecording, AbortRecording, SetStatus>(
+    mut begin_session: BeginSession,
+    mut force_stop_recording: ForceStopRecording,
+    mut abort_recording: AbortRecording,
+    mut set_status: SetStatus,
+) -> Result<bool, String>
+where
+    BeginSession: FnMut(),
+    ForceStopRecording: FnMut(),
+    AbortRecording: FnMut() -> Result<bool, String>,
+    SetStatus: FnMut(AppStatus),
+{
+    begin_session();
+    force_stop_recording();
+    let abort_result = abort_recording();
+    set_status(AppStatus::Idle);
+    abort_result
 }
 
 fn handle_audio_input_stream_error_with_hooks<
@@ -1605,6 +1624,42 @@ fn stop_recording(
 }
 
 #[tauri::command]
+fn cancel_recording(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    info!("recording/transcription cancel requested");
+    let cancel_result = cancel_recording_with_hooks(
+        || {
+            let runtime_state = app.state::<PipelineRuntimeState>();
+            runtime_state.begin_session();
+        },
+        || {
+            let hotkey_service = app.state::<HotkeyService>();
+            hotkey_service.force_stop_recording(&app);
+        },
+        || {
+            state
+                .services
+                .audio_capture_service
+                .abort_recording(app.clone())
+        },
+        |status| set_status_for_state(&app, &state, status),
+    );
+
+    match cancel_result {
+        Ok(recording_aborted) => {
+            info!(
+                recording_aborted,
+                "recording/transcription cancel completed"
+            );
+            Ok(())
+        }
+        Err(error) => {
+            error!(%error, "recording/transcription cancel failed");
+            Err(error)
+        }
+    }
+}
+
+#[tauri::command]
 fn get_audio_level(state: tauri::State<'_, AppState>) -> f32 {
     state.services.audio_capture_service.get_audio_level()
 }
@@ -1939,6 +1994,7 @@ pub fn run() {
             request_permission,
             start_recording,
             stop_recording,
+            cancel_recording,
             get_audio_level,
             insert_text,
             copy_to_clipboard,
@@ -1982,7 +2038,8 @@ mod tests {
 
     use super::{
         active_pipeline_session_id, apply_hotkey_from_settings_with_fallback,
-        apply_settings_transaction_with_hooks, handle_audio_input_stream_error_with_hooks,
+        apply_settings_transaction_with_hooks, cancel_recording_with_hooks,
+        handle_audio_input_stream_error_with_hooks,
         has_api_key, load_startup_settings_with_fallback, overlay_position_from_work_area,
         permission_preflight_error_message, should_show_overlay_for_status,
         spawn_pipeline_stage_error_reset, AppState, PipelineRuntimeState,
@@ -2621,6 +2678,136 @@ mod tests {
                 stage: PipelineErrorStage::RecordingRuntime,
                 message: "stream disconnected".to_string(),
             }]
+        );
+    }
+
+    #[test]
+    fn cancel_recording_resets_to_idle_after_abort_attempt() {
+        let call_order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let statuses: Arc<Mutex<Vec<AppStatus>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let begin_call_order = Arc::clone(&call_order);
+        let stop_call_order = Arc::clone(&call_order);
+        let abort_call_order = Arc::clone(&call_order);
+        let status_call_order = Arc::clone(&call_order);
+        let status_log = Arc::clone(&statuses);
+
+        let result = cancel_recording_with_hooks(
+            move || {
+                begin_call_order
+                    .lock()
+                    .expect("call-order lock should not be poisoned")
+                    .push("begin_session");
+            },
+            move || {
+                stop_call_order
+                    .lock()
+                    .expect("call-order lock should not be poisoned")
+                    .push("force_stop_recording");
+            },
+            move || {
+                abort_call_order
+                    .lock()
+                    .expect("call-order lock should not be poisoned")
+                    .push("abort_recording");
+                Ok(true)
+            },
+            move |status| {
+                status_call_order
+                    .lock()
+                    .expect("call-order lock should not be poisoned")
+                    .push("set_status");
+                status_log
+                    .lock()
+                    .expect("status lock should not be poisoned")
+                    .push(status);
+            },
+        );
+
+        assert_eq!(result, Ok(true));
+        assert_eq!(
+            call_order
+                .lock()
+                .expect("call-order lock should not be poisoned")
+                .clone(),
+            vec![
+                "begin_session",
+                "force_stop_recording",
+                "abort_recording",
+                "set_status"
+            ]
+        );
+        assert_eq!(
+            statuses
+                .lock()
+                .expect("status lock should not be poisoned")
+                .clone(),
+            vec![AppStatus::Idle]
+        );
+    }
+
+    #[test]
+    fn cancel_recording_still_resets_to_idle_when_abort_fails() {
+        let call_order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let statuses: Arc<Mutex<Vec<AppStatus>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let begin_call_order = Arc::clone(&call_order);
+        let stop_call_order = Arc::clone(&call_order);
+        let abort_call_order = Arc::clone(&call_order);
+        let status_call_order = Arc::clone(&call_order);
+        let status_log = Arc::clone(&statuses);
+
+        let result = cancel_recording_with_hooks(
+            move || {
+                begin_call_order
+                    .lock()
+                    .expect("call-order lock should not be poisoned")
+                    .push("begin_session");
+            },
+            move || {
+                stop_call_order
+                    .lock()
+                    .expect("call-order lock should not be poisoned")
+                    .push("force_stop_recording");
+            },
+            move || {
+                abort_call_order
+                    .lock()
+                    .expect("call-order lock should not be poisoned")
+                    .push("abort_recording");
+                Err("abort failure".to_string())
+            },
+            move |status| {
+                status_call_order
+                    .lock()
+                    .expect("call-order lock should not be poisoned")
+                    .push("set_status");
+                status_log
+                    .lock()
+                    .expect("status lock should not be poisoned")
+                    .push(status);
+            },
+        );
+
+        assert_eq!(result, Err("abort failure".to_string()));
+        assert_eq!(
+            call_order
+                .lock()
+                .expect("call-order lock should not be poisoned")
+                .clone(),
+            vec![
+                "begin_session",
+                "force_stop_recording",
+                "abort_recording",
+                "set_status"
+            ]
+        );
+        assert_eq!(
+            statuses
+                .lock()
+                .expect("status lock should not be poisoned")
+                .clone(),
+            vec![AppStatus::Idle]
         );
     }
 
