@@ -87,11 +87,47 @@ function formatAuthMethodLabel(method: AuthMethod): string {
   return "None";
 }
 
+function keyDisplayLabel(key: string): string {
+  switch (key) {
+    case "LAlt":
+      return "⌥ Left";
+    case "RAlt":
+      return "⌥ Right";
+    case "Alt":
+      return "⌥";
+    case "LShift":
+      return "⇧ Left";
+    case "RShift":
+      return "⇧ Right";
+    case "Shift":
+      return "⇧";
+    case "LCtrl":
+      return "⌃ Left";
+    case "RCtrl":
+      return "⌃ Right";
+    case "Ctrl":
+      return "⌃";
+    case "LMeta":
+    case "Cmd":
+      return "⌘";
+    case "RMeta":
+      return "⌘ Right";
+    case "Meta":
+      return "⌘";
+    case "Fn":
+      return "fn";
+    default:
+      return key;
+  }
+}
+
 const HOTKEY_PRESETS = [
   { label: "Alt+Space (Default)", value: "Alt+Space" },
+  { label: "Right Alt+Space", value: "RAlt+Space" },
   { label: "Ctrl+Space", value: "Ctrl+Space" },
   { label: "Shift+Space", value: "Shift+Space" },
   { label: "Meta+Space", value: "Cmd+Space" },
+  { label: "Fn+F5", value: "Fn+F5" },
   { label: "F5", value: "F5" },
   { label: "F6", value: "F6" },
   { label: "F7", value: "F7" },
@@ -492,7 +528,7 @@ export default function Settings() {
                     key={`${key}-${i}`}
                     className="inline-flex min-w-[28px] items-center justify-center rounded-[5px] border border-border/80 bg-background px-2 py-0.5 font-mono text-[11px] font-medium text-foreground shadow-[0_1px_0_1px_hsl(var(--border)/0.5)]"
                   >
-                    {key.trim()}
+                    {keyDisplayLabel(key.trim())}
                   </kbd>
                 ))
               ) : (
@@ -521,7 +557,7 @@ export default function Settings() {
               <span>
                 {isRecordingShortcut
                   ? "Press the key combination you want to use, then release."
-                  : "Fn cannot be captured on macOS (system intercepts it). Use F5–F7 or another combo. Right Alt/Option is captured as Alt."}
+                  : "Fn key requires Accessibility permission and the custom event tap backend. Right Alt/Option can now be distinguished from Left Alt."}
               </span>
             </p>
           </div>
