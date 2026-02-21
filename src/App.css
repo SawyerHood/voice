@@ -119,6 +119,108 @@ h1 {
   padding: 0.9rem;
 }
 
+.permissions-card {
+  border-radius: 12px;
+  border: 1px solid #c7d2e2;
+  background: linear-gradient(180deg, #ffffff 0%, #f7faff 100%);
+  padding: 0.9rem;
+  display: grid;
+  gap: 0.7rem;
+}
+
+.permissions-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.6rem;
+}
+
+.permissions-description {
+  margin: 0.35rem 0 0;
+  font-size: 0.84rem;
+  color: #465066;
+}
+
+.permissions-error {
+  margin: 0;
+  font-size: 0.8rem;
+  color: #8f3131;
+}
+
+.permissions-list {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.permission-row {
+  border: 1px solid #dae2ee;
+  border-radius: 10px;
+  background: #ffffff;
+  padding: 0.65rem;
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.permission-name {
+  margin: 0;
+  font-size: 0.87rem;
+  font-weight: 600;
+  color: #222835;
+}
+
+.permission-help {
+  margin: 0.25rem 0 0;
+  font-size: 0.78rem;
+  color: #5b6478;
+}
+
+.permission-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.permission-state {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  border: 1px solid #d2d8e4;
+  padding: 0.14rem 0.46rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+}
+
+.permission-granted {
+  border-color: #b9e0cb;
+  background: #eff9f3;
+  color: #24653d;
+}
+
+.permission-not_determined {
+  border-color: #d8cba0;
+  background: #fdf8e7;
+  color: #73591d;
+}
+
+.permission-denied {
+  border-color: #e3b7b7;
+  background: #fff1f1;
+  color: #863535;
+}
+
+.permission-action-button {
+  min-width: 108px;
+}
+
+.permissions-footer {
+  display: flex;
+  justify-content: flex-end;
+}
+
 .status-label {
   margin: 0;
   font-size: 0.95rem;
@@ -559,5 +661,16 @@ h1 {
   .field-row {
     flex-direction: column;
     align-items: stretch;
+  }
+
+  .permissions-header,
+  .permission-row,
+  .permission-row-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .permission-state {
+    justify-content: center;
   }
 }

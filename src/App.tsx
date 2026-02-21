@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import HistoryPanel from "./HistoryPanel";
@@ -7,8 +7,15 @@ import "./App.css";
 
 type AppStatus = "idle" | "listening" | "transcribing" | "error";
 type AppTab = "status" | "history" | "settings";
+type PermissionState = "not_determined" | "granted" | "denied";
+type PermissionType = "microphone" | "accessibility";
 type TranscriptReadyEvent = { text: string };
 type PipelineErrorEvent = { stage: string; message: string };
+type PermissionSnapshot = {
+  microphone: PermissionState;
+  accessibility: PermissionState;
+  allGranted: boolean;
+};
 
 const STATUS_LABEL: Record<AppStatus, string> = {
   idle: "Idle",
@@ -22,6 +29,57 @@ const TAB_LABEL: Record<AppTab, string> = {
   history: "History",
   settings: "Settings",
 };
+
+const PERMISSION_LABEL: Record<PermissionType, string> = {
+  microphone: "Microphone",
+  accessibility: "Accessibility",
+};
+
+const PERMISSION_HELP: Record<PermissionType, string> = {
+  microphone: "Required to capture speech audio.",
+  accessibility: "Required to type/paste into other apps.",
+};
+
+const PERMISSION_STATUS_LABEL: Record<PermissionState, string> = {
+  granted: "Granted",
+  denied: "Denied",
+  not_determined: "Needs Access",
+};
+
+const PERMISSION_CARD_DISMISSED_KEY = "voice.permissionsOnboardingDismissed.v1";
+
+function toErrorMessage(error: unknown, fallbackMessage: string): string {
+  if (typeof error === "string" && error.trim()) {
+    return error;
+  }
+
+  if (error instanceof Error && error.message.trim()) {
+    return error.message;
+  }
+
+  return fallbackMessage;
+}
+
+function readPermissionCardDismissed(): boolean {
+  try {
+    return window.localStorage.getItem(PERMISSION_CARD_DISMISSED_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function setPermissionCardDismissed(dismissed: boolean) {
+  try {
+    if (dismissed) {
+      window.localStorage.setItem(PERMISSION_CARD_DISMISSED_KEY, "1");
+      return;
+    }
+
+    window.localStorage.removeItem(PERMISSION_CARD_DISMISSED_KEY);
+  } catch {
+    // Ignore storage write errors in restricted environments.
+  }
+}
 
 function TabIcon({ tab }: { tab: AppTab }) {
   if (tab === "status") {
@@ -50,16 +108,139 @@ function TabIcon({ tab }: { tab: AppTab }) {
   );
 }
 
+type PermissionCardProps = {
+  errorMessage: string;
+  isRefreshing: boolean;
+  onDismiss: () => void;
+  onRefresh: () => void;
+  onRequestPermission: (permission: PermissionType) => void;
+  permissions: PermissionSnapshot | null;
+  requestingPermission: PermissionType | null;
+  showDismiss: boolean;
+};
+
+function PermissionOnboardingCard({
+  errorMessage,
+  isRefreshing,
+  onDismiss,
+  onRefresh,
+  onRequestPermission,
+  permissions,
+  requestingPermission,
+  showDismiss,
+}: PermissionCardProps) {
+  const permissionOrder: PermissionType[] = ["microphone", "accessibility"];
+
+  return (
+    <section className="permissions-card" aria-live="polite">
+      <div className="permissions-header">
+        <div>
+          <p className="card-title">Permissions</p>
+          <p className="permissions-description">
+            {permissions?.allGranted
+              ? "All required permissions are granted."
+              : "Voice needs these macOS permissions to record and insert text."}
+          </p>
+        </div>
+
+        {showDismiss ? (
+          <button type="button" className="utility-button" onClick={onDismiss}>
+            Dismiss
+          </button>
+        ) : null}
+      </div>
+
+      {errorMessage ? <p className="permissions-error">{errorMessage}</p> : null}
+
+      <div className="permissions-list">
+        {permissionOrder.map((permissionType) => {
+          const state = permissions?.[permissionType] ?? "not_determined";
+          const isGranted = state === "granted";
+          const isRequesting = requestingPermission === permissionType;
+
+          return (
+            <div className="permission-row" key={permissionType}>
+              <div>
+                <p className="permission-name">{PERMISSION_LABEL[permissionType]}</p>
+                <p className="permission-help">{PERMISSION_HELP[permissionType]}</p>
+              </div>
+
+              <div className="permission-row-actions">
+                <span className={`permission-state permission-${state}`}>
+                  {PERMISSION_STATUS_LABEL[state]}
+                </span>
+                <button
+                  type="button"
+                  className="secondary-button permission-action-button"
+                  disabled={isGranted || isRequesting}
+                  onClick={() => onRequestPermission(permissionType)}
+                >
+                  {isGranted ? "Granted" : isRequesting ? "Requesting..." : "Grant Access"}
+                </button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="permissions-footer">
+        <button
+          type="button"
+          className="utility-button"
+          onClick={onRefresh}
+          disabled={isRefreshing || requestingPermission !== null}
+        >
+          {isRefreshing ? "Refreshing..." : "Refresh Status"}
+        </button>
+      </div>
+    </section>
+  );
+}
+
 type StatusViewProps = {
   audioLevel: number;
+  isRefreshingPermissions: boolean;
   lastTranscript: string;
+  onDismissPermissions: () => void;
+  onRefreshPermissions: () => void;
+  onRequestPermission: (permission: PermissionType) => void;
+  permissionErrorMessage: string;
+  permissions: PermissionSnapshot | null;
+  requestingPermission: PermissionType | null;
+  showPermissionsCard: boolean;
   status: AppStatus;
   statusDescription: string;
 };
 
-function StatusView({ audioLevel, lastTranscript, status, statusDescription }: StatusViewProps) {
+function StatusView({
+  audioLevel,
+  isRefreshingPermissions,
+  lastTranscript,
+  onDismissPermissions,
+  onRefreshPermissions,
+  onRequestPermission,
+  permissionErrorMessage,
+  permissions,
+  requestingPermission,
+  showPermissionsCard,
+  status,
+  statusDescription,
+}: StatusViewProps) {
   return (
     <div className="status-layout">
+      {showPermissionsCard ? (
+        <PermissionOnboardingCard
+          errorMessage={permissionErrorMessage}
+          isRefreshing={isRefreshingPermissions}
+          onDismiss={onDismissPermissions}
+          onRefresh={onRefreshPermissions}
+          onRequestPermission={onRequestPermission}
+          permissions={permissions}
+          requestingPermission={requestingPermission}
+          showDismiss={Boolean(permissions?.allGranted)}
+        />
+      ) : null}
+
       <section className={`status-card status-${status}`}>
         <p className="status-label">{STATUS_LABEL[status]}</p>
         <p className="status-description">{statusDescription}</p>
@@ -98,15 +279,63 @@ function App() {
   const [lastTranscript, setLastTranscript] = useState("");
   const [backendSynced, setBackendSynced] = useState<boolean>(true);
 
+  const [permissions, setPermissions] = useState<PermissionSnapshot | null>(null);
+  const [permissionErrorMessage, setPermissionErrorMessage] = useState("");
+  const [requestingPermission, setRequestingPermission] = useState<PermissionType | null>(null);
+  const [isRefreshingPermissions, setIsRefreshingPermissions] = useState(false);
+  const [permissionCardDismissed, setPermissionCardDismissedState] = useState<boolean>(
+    () => readPermissionCardDismissed(),
+  );
+
+  const refreshPermissions = useCallback(async () => {
+    setIsRefreshingPermissions(true);
+
+    try {
+      const snapshot = await invoke<PermissionSnapshot>("check_permissions");
+      setPermissions(snapshot);
+      setPermissionErrorMessage("");
+    } catch (error) {
+      setPermissionErrorMessage(
+        toErrorMessage(error, "Unable to load permission status from the backend."),
+      );
+    } finally {
+      setIsRefreshingPermissions(false);
+    }
+  }, []);
+
+  const requestPermission = useCallback(async (permission: PermissionType) => {
+    setRequestingPermission(permission);
+    setPermissionErrorMessage("");
+
+    try {
+      const snapshot = await invoke<PermissionSnapshot>("request_permission", {
+        type: permission,
+      });
+      setPermissions(snapshot);
+    } catch (error) {
+      setPermissionErrorMessage(
+        toErrorMessage(error, "Unable to request macOS permission from the backend."),
+      );
+    } finally {
+      setRequestingPermission(null);
+    }
+  }, []);
+
+  const dismissPermissionCard = useCallback(() => {
+    setPermissionCardDismissedState(true);
+    setPermissionCardDismissed(true);
+  }, []);
+
   useEffect(() => {
     let isMounted = true;
     let unlistenFns: UnlistenFn[] = [];
 
     async function bindBackend() {
       try {
-        const [initialStatus, initialAudioLevel] = await Promise.all([
+        const [initialStatus, initialAudioLevel, initialPermissions] = await Promise.all([
           invoke<AppStatus>("get_status"),
           invoke<number>("get_audio_level"),
+          invoke<PermissionSnapshot>("check_permissions"),
         ]);
 
         if (!isMounted) {
@@ -115,9 +344,12 @@ function App() {
 
         setStatus(initialStatus);
         setAudioLevel(Number.isFinite(initialAudioLevel) ? initialAudioLevel : 0);
+        setPermissions(initialPermissions);
+        setPermissionErrorMessage("");
       } catch {
         if (isMounted) {
           setBackendSynced(false);
+          setPermissionErrorMessage("Unable to load permission status from the backend.");
         }
       }
 
@@ -164,6 +396,30 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    function handleWindowFocus() {
+      void refreshPermissions();
+    }
+
+    window.addEventListener("focus", handleWindowFocus);
+    return () => {
+      window.removeEventListener("focus", handleWindowFocus);
+    };
+  }, [refreshPermissions]);
+
+  const hasMissingPermissions = useMemo(
+    () => !permissions || !permissions.allGranted,
+    [permissions],
+  );
+
+  const showPermissionsCard = useMemo(() => {
+    if (!backendSynced) {
+      return false;
+    }
+
+    return hasMissingPermissions || !permissionCardDismissed;
+  }, [backendSynced, hasMissingPermissions, permissionCardDismissed]);
+
   const statusDescription = useMemo(() => {
     switch (status) {
       case "idle":
@@ -207,7 +463,17 @@ function App() {
         {activeTab === "status" ? (
           <StatusView
             audioLevel={audioLevel}
+            isRefreshingPermissions={isRefreshingPermissions}
             lastTranscript={lastTranscript}
+            onDismissPermissions={dismissPermissionCard}
+            onRefreshPermissions={() => {
+              void refreshPermissions();
+            }}
+            onRequestPermission={requestPermission}
+            permissionErrorMessage={permissionErrorMessage}
+            permissions={permissions}
+            requestingPermission={requestingPermission}
+            showPermissionsCard={showPermissionsCard}
             status={status}
             statusDescription={statusDescription}
           />

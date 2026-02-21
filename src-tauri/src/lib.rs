@@ -27,7 +27,7 @@ use audio_capture_service::{
 };
 use history_store::{HistoryEntry, HistoryStore};
 use hotkey_service::{HotkeyService, RecordingTransition};
-use permission_service::PermissionService;
+use permission_service::{PermissionService, PermissionSnapshot, PermissionState, PermissionType};
 use serde::Serialize;
 use settings_store::{SettingsStore, VoiceSettings, VoiceSettingsUpdate};
 use status_notifier::{AppStatus, StatusNotifier};
@@ -68,7 +68,7 @@ struct AppServices {
     text_insertion_service: TextInsertionService,
     settings_store: SettingsStore,
     api_key_store: ApiKeyStore,
-    _permission_service: PermissionService,
+    permission_service: PermissionService,
 }
 
 impl Default for AppServices {
@@ -82,7 +82,7 @@ impl Default for AppServices {
             text_insertion_service: TextInsertionService::new(),
             settings_store: SettingsStore::new(),
             api_key_store: ApiKeyStore::new(),
-            _permission_service: PermissionService::new(),
+            permission_service: PermissionService::new(),
         }
     }
 }
@@ -186,6 +186,7 @@ impl VoicePipelineDelegate for AppPipelineDelegate {
 
     fn start_recording(&self) -> Result<(), String> {
         let state = self.app.state::<AppState>();
+        ensure_microphone_permission_for_recording(&state)?;
         state
             .services
             .audio_capture_service
@@ -226,6 +227,7 @@ impl VoicePipelineDelegate for AppPipelineDelegate {
         }
 
         let state = self.app.state::<AppState>();
+        ensure_accessibility_permission_for_insertion(&state)?;
         state
             .services
             .text_insertion_service
@@ -309,6 +311,62 @@ fn set_launch_at_login_state(app: &AppHandle, enabled: bool) -> Result<(), Strin
     };
 
     result.map_err(|error| format!("Failed to set launch-at-login state: {error}"))
+}
+
+fn ensure_microphone_permission_for_recording(state: &AppState) -> Result<(), String> {
+    ensure_permission_for_action(
+        state.services.permission_service.microphone_permission(),
+        PermissionType::Microphone,
+        "start recording",
+    )
+}
+
+fn ensure_accessibility_permission_for_insertion(state: &AppState) -> Result<(), String> {
+    ensure_permission_for_action(
+        state.services.permission_service.accessibility_permission(),
+        PermissionType::Accessibility,
+        "insert text",
+    )
+}
+
+fn ensure_permission_for_action(
+    permission_state: PermissionState,
+    permission_type: PermissionType,
+    action: &str,
+) -> Result<(), String> {
+    if permission_state == PermissionState::Granted {
+        return Ok(());
+    }
+
+    Err(permission_preflight_error_message(
+        permission_type,
+        permission_state,
+        action,
+    ))
+}
+
+fn permission_preflight_error_message(
+    permission_type: PermissionType,
+    permission_state: PermissionState,
+    action: &str,
+) -> String {
+    match permission_type {
+        PermissionType::Microphone => match permission_state {
+            PermissionState::NotDetermined => format!(
+                "Microphone access has not been granted yet, so Voice cannot {action}. Click Grant Access in the app and allow Voice in System Settings > Privacy & Security > Microphone."
+            ),
+            PermissionState::Denied => format!(
+                "Microphone access is denied, so Voice cannot {action}. Enable Voice in System Settings > Privacy & Security > Microphone, then try again."
+            ),
+            PermissionState::Granted => String::new(),
+        },
+        PermissionType::Accessibility => match permission_state {
+            PermissionState::NotDetermined | PermissionState::Denied => format!(
+                "Accessibility access is required to {action}. Enable Voice in System Settings > Privacy & Security > Accessibility, then try again."
+            ),
+            PermissionState::Granted => String::new(),
+        },
+    }
 }
 
 fn handle_audio_input_stream_error_with_hooks<
@@ -532,11 +590,26 @@ fn list_microphones(state: tauri::State<'_, AppState>) -> Result<Vec<MicrophoneI
 }
 
 #[tauri::command]
+fn check_permissions(state: tauri::State<'_, AppState>) -> PermissionSnapshot {
+    state.services.permission_service.check_permissions()
+}
+
+#[tauri::command]
+fn request_permission(
+    r#type: PermissionType,
+    state: tauri::State<'_, AppState>,
+) -> Result<PermissionSnapshot, String> {
+    state.services.permission_service.request_permission(r#type)
+}
+
+#[tauri::command]
 fn start_recording(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
     microphone_id: Option<String>,
 ) -> Result<(), String> {
+    ensure_microphone_permission_for_recording(&state)?;
+
     let result = state
         .services
         .audio_capture_service
@@ -570,6 +643,7 @@ fn get_audio_level(state: tauri::State<'_, AppState>) -> f32 {
 
 #[tauri::command]
 fn insert_text(text: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    ensure_accessibility_permission_for_insertion(&state)?;
     state.services.text_insertion_service.insert_text(&text)
 }
 
@@ -774,6 +848,8 @@ pub fn run() {
             set_api_key,
             delete_api_key,
             list_microphones,
+            check_permissions,
+            request_permission,
             start_recording,
             stop_recording,
             get_audio_level,
@@ -811,9 +887,10 @@ mod tests {
     };
 
     use super::{
-        handle_audio_input_stream_error_with_hooks, spawn_pipeline_stage_error_reset,
-        PipelineRuntimeState,
+        handle_audio_input_stream_error_with_hooks, permission_preflight_error_message,
+        spawn_pipeline_stage_error_reset, PipelineRuntimeState,
     };
+    use crate::permission_service::{PermissionState, PermissionType};
 
     #[derive(Debug, Default)]
     struct SessionEventLog {
@@ -1333,5 +1410,29 @@ mod tests {
                 message: "command transcription failed".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn microphone_not_determined_preflight_error_mentions_system_settings_path() {
+        let message = permission_preflight_error_message(
+            PermissionType::Microphone,
+            PermissionState::NotDetermined,
+            "start recording",
+        );
+
+        assert!(message.contains("cannot start recording"));
+        assert!(message.contains("Privacy & Security > Microphone"));
+    }
+
+    #[test]
+    fn accessibility_preflight_error_mentions_accessibility_settings_path() {
+        let message = permission_preflight_error_message(
+            PermissionType::Accessibility,
+            PermissionState::Denied,
+            "insert text",
+        );
+
+        assert!(message.contains("Accessibility access is required"));
+        assert!(message.contains("Privacy & Security > Accessibility"));
     }
 }
