@@ -56,8 +56,15 @@ const EVENT_OVERLAY_AUDIO_LEVEL: &str = "voice://overlay-audio-level";
 const AUDIO_STREAM_ERROR_RESET_DELAY_MS: u64 = 1_500;
 const DEFAULT_HISTORY_PAGE_SIZE: usize = 50;
 const OVERLAY_WINDOW_LABEL: &str = "recording-overlay";
-const OVERLAY_WINDOW_WIDTH: f64 = 320.0;
-const OVERLAY_WINDOW_HEIGHT: f64 = 64.0;
+// Keep these values aligned with src/Overlay.css so the overlay shadow remains inside the window.
+const OVERLAY_PILL_WIDTH: f64 = 300.0;
+const OVERLAY_PILL_HEIGHT: f64 = 56.0;
+const OVERLAY_SHADOW_SAFE_TOP: f64 = 24.0;
+const OVERLAY_SHADOW_SAFE_SIDE: f64 = 36.0;
+const OVERLAY_SHADOW_SAFE_BOTTOM: f64 = 52.0;
+const OVERLAY_WINDOW_WIDTH: f64 = OVERLAY_PILL_WIDTH + (OVERLAY_SHADOW_SAFE_SIDE * 2.0);
+const OVERLAY_WINDOW_HEIGHT: f64 =
+    OVERLAY_PILL_HEIGHT + OVERLAY_SHADOW_SAFE_TOP + OVERLAY_SHADOW_SAFE_BOTTOM;
 const OVERLAY_WINDOW_TOP_MARGIN: f64 = 12.0;
 
 fn recording_mode_from_settings_value(value: &str) -> Result<RecordingMode, String> {
