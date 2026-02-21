@@ -40,6 +40,8 @@ tokio-tungstenite = { version = "0.28", default-features = false, features = ["c
 sha2 = "0.10"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+core-graphics = "0.24"
 core-foundation-sys = "0.8"
 coreaudio-rs = { version = "0.11", default-features = false, features = ["core_audio"] }
 objc = "0.2"
