@@ -26,7 +26,9 @@ use audio_capture_service::{
     AUDIO_INPUT_STREAM_ERROR_EVENT,
 };
 use history_store::{HistoryEntry, HistoryStore};
-use hotkey_service::{HotkeyConfig, HotkeyService, RecordingMode, RecordingTransition};
+use hotkey_service::{
+    HotkeyConfig, HotkeyService, RecordingMode, RecordingTransition, StopProcessingDecision,
+};
 use permission_service::{PermissionService, PermissionSnapshot, PermissionState, PermissionType};
 use serde::Serialize;
 use settings_store::{
@@ -593,6 +595,8 @@ fn register_pipeline_handlers(app: &AppHandle) {
             VoicePipeline::default()
                 .handle_hotkey_started(&delegate)
                 .await;
+
+            handle_pending_stop_transition(&app, &delegate).await;
         });
     });
 
@@ -602,18 +606,24 @@ fn register_pipeline_handlers(app: &AppHandle) {
         let runtime_state = app.state::<PipelineRuntimeState>().inner().clone();
         tauri::async_runtime::spawn(async move {
             let _guard = runtime_state.execution_lock.lock().await;
-            let session_id = runtime_state.begin_session();
-            let delegate = AppPipelineDelegate::for_session(app.clone(), session_id);
             let hotkey_service = app.state::<HotkeyService>();
+            let stop_decision = hotkey_service.stop_processing_decision();
+            drop(hotkey_service);
 
-            if !hotkey_service.is_recording() {
-                hotkey_service.acknowledge_transition(RecordingTransition::Stopped, false);
-                return;
+            match stop_decision {
+                StopProcessingDecision::Process => {
+                    let session_id = runtime_state.begin_session();
+                    let delegate = AppPipelineDelegate::for_session(app.clone(), session_id);
+                    VoicePipeline::default()
+                        .handle_hotkey_stopped(&delegate)
+                        .await;
+                }
+                StopProcessingDecision::AcknowledgeOnly => {
+                    let hotkey_service = app.state::<HotkeyService>();
+                    hotkey_service.acknowledge_transition(RecordingTransition::Stopped, false);
+                }
+                StopProcessingDecision::DeferUntilStarted | StopProcessingDecision::Ignore => {}
             }
-
-            VoicePipeline::default()
-                .handle_hotkey_stopped(&delegate)
-                .await;
         });
     });
 
@@ -622,6 +632,26 @@ fn register_pipeline_handlers(app: &AppHandle) {
         let message = parse_audio_stream_error_message(event.payload());
         handle_audio_input_stream_error(&stream_error_app, message);
     });
+}
+
+async fn handle_pending_stop_transition(app: &AppHandle, delegate: &AppPipelineDelegate) {
+    let stop_decision = {
+        let hotkey_service = app.state::<HotkeyService>();
+        hotkey_service.stop_processing_decision()
+    };
+
+    match stop_decision {
+        StopProcessingDecision::Process => {
+            VoicePipeline::default()
+                .handle_hotkey_stopped(delegate)
+                .await;
+        }
+        StopProcessingDecision::AcknowledgeOnly => {
+            let hotkey_service = app.state::<HotkeyService>();
+            hotkey_service.acknowledge_transition(RecordingTransition::Stopped, false);
+        }
+        StopProcessingDecision::DeferUntilStarted | StopProcessingDecision::Ignore => {}
+    }
 }
 
 #[tauri::command]
