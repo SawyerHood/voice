@@ -21,6 +21,9 @@ const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OAUTH_SCOPE: &str = "openid profile email offline_access";
 const JWT_AUTH_CLAIM_PATH: &str = "https://api.openai.com/auth";
 const CALLBACK_PATH: &str = "/auth/callback";
+const OAUTH_CALLBACK_BIND_HOST: &str = "127.0.0.1";
+const OAUTH_CALLBACK_BIND_PORT: u16 = 1455;
+const OAUTH_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 const OAUTH_TIMEOUT_SECS: u64 = 300;
 const CHATGPT_HOME_URL: &str = "https://chatgpt.com/";
 pub const CHATGPT_AUTH_WINDOW_LABEL: &str = "chatgpt-auth";
@@ -64,27 +67,33 @@ struct CallbackPayload {
 pub async fn start_chatgpt_login<R: Runtime>(
     app: &AppHandle<R>,
 ) -> Result<OAuthLoginResult, String> {
-    let listener = TcpListener::bind(("127.0.0.1", 0))
+    let listener = TcpListener::bind((OAUTH_CALLBACK_BIND_HOST, OAUTH_CALLBACK_BIND_PORT))
         .await
-        .map_err(|error| format!("Failed to bind local OAuth callback server: {error}"))?;
-    let port = listener
-        .local_addr()
-        .map_err(|error| format!("Failed to resolve OAuth callback address: {error}"))?
-        .port();
-    let redirect_uri = format!("http://localhost:{port}{CALLBACK_PATH}");
+        .map_err(|error| {
+            format!(
+                "Failed to bind local OAuth callback server on {}:{}: {error}",
+                OAUTH_CALLBACK_BIND_HOST, OAUTH_CALLBACK_BIND_PORT
+            )
+        })?;
+    let redirect_uri = OAUTH_REDIRECT_URI;
 
     let code_verifier = generate_code_verifier();
     let code_challenge = generate_code_challenge(&code_verifier);
     let state = generate_state();
 
-    let authorize_url = build_authorize_url(&redirect_uri, &state, &code_challenge)?;
-    info!(port, redirect_uri = %redirect_uri, "starting ChatGPT OAuth login flow");
+    let authorize_url = build_authorize_url(redirect_uri, &state, &code_challenge)?;
+    info!(
+        callback_bind_host = OAUTH_CALLBACK_BIND_HOST,
+        callback_bind_port = OAUTH_CALLBACK_BIND_PORT,
+        redirect_uri = %redirect_uri,
+        "starting ChatGPT OAuth login flow"
+    );
 
     open_authorize_url_in_system_browser(app, &authorize_url)?;
 
     let callback = wait_for_callback(listener, &state).await?;
     let token_response =
-        exchange_authorization_code(&callback.code, &code_verifier, &redirect_uri).await?;
+        exchange_authorization_code(&callback.code, &code_verifier, redirect_uri).await?;
 
     let refresh_token = normalize_required_string(token_response.refresh_token, "refresh_token")?;
     let account_id = extract_chatgpt_account_id(&token_response.access_token)
@@ -165,9 +174,9 @@ fn build_authorize_url(
         .append_pair("client_id", CLIENT_ID)
         .append_pair("redirect_uri", redirect_uri)
         .append_pair("scope", OAUTH_SCOPE)
-        .append_pair("state", state)
         .append_pair("code_challenge", code_challenge)
         .append_pair("code_challenge_method", "S256")
+        .append_pair("state", state)
         .append_pair("id_token_add_organizations", "true")
         .append_pair("codex_cli_simplified_flow", "true")
         .append_pair("originator", OAUTH_ORIGINATOR);
@@ -502,18 +511,21 @@ mod tests {
 
     #[test]
     fn authorize_url_contains_expected_openai_codex_query_parameters() {
-        let redirect_uri = "http://localhost:43210/auth/callback";
         let state = "state_123";
         let challenge = "challenge_123";
 
-        let url = build_authorize_url(redirect_uri, state, challenge).expect("authorize url");
+        let url = build_authorize_url(OAUTH_REDIRECT_URI, state, challenge).expect("authorize url");
         let query: HashMap<String, String> = url.query_pairs().into_owned().collect();
 
+        assert_eq!(
+            url.as_str(),
+            "https://auth.openai.com/oauth/authorize?response_type=code&client_id=app_EMoamEEZ73f0CkXaXp7hrann&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&scope=openid+profile+email+offline_access&code_challenge=challenge_123&code_challenge_method=S256&state=state_123&id_token_add_organizations=true&codex_cli_simplified_flow=true&originator=pi"
+        );
         assert_eq!(query.get("response_type").map(String::as_str), Some("code"));
         assert_eq!(query.get("client_id").map(String::as_str), Some(CLIENT_ID));
         assert_eq!(
             query.get("redirect_uri").map(String::as_str),
-            Some(redirect_uri)
+            Some(OAUTH_REDIRECT_URI)
         );
         assert_eq!(query.get("scope").map(String::as_str), Some(OAUTH_SCOPE));
         assert_eq!(query.get("state").map(String::as_str), Some(state));
