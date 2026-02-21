@@ -6,7 +6,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub type TranscriptionDeltaCallback = Arc<dyn Fn(String) + Send + Sync + 'static>;
+
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TranscriptionOptions {
     #[serde(default)]
@@ -15,6 +17,19 @@ pub struct TranscriptionOptions {
     pub prompt: Option<String>,
     #[serde(default)]
     pub context_hint: Option<String>,
+    #[serde(skip, default)]
+    pub on_delta: Option<TranscriptionDeltaCallback>,
+}
+
+impl fmt::Debug for TranscriptionOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TranscriptionOptions")
+            .field("language", &self.language)
+            .field("prompt", &self.prompt)
+            .field("context_hint", &self.context_hint)
+            .field("on_delta", &self.on_delta.is_some())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -187,6 +202,7 @@ mod tests {
                     language: Some("en".to_string()),
                     prompt: Some("dictation".to_string()),
                     context_hint: Some("short reply".to_string()),
+                    ..TranscriptionOptions::default()
                 },
             )
             .await
