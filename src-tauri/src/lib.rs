@@ -155,6 +155,24 @@ where
     }
 }
 
+fn load_startup_settings_with_fallback<FLoadSettings>(
+    mut load_settings: FLoadSettings,
+) -> VoiceSettings
+where
+    FLoadSettings: FnMut() -> Result<VoiceSettings, String>,
+{
+    match load_settings() {
+        Ok(settings) => {
+            info!("persisted settings loaded");
+            settings
+        }
+        Err(error) => {
+            warn!(%error, "failed to load persisted settings");
+            VoiceSettings::default()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TranscriptReadyEvent {
@@ -1215,16 +1233,9 @@ pub fn run() {
                 .microphone_permission();
             info!(?permission_state, "microphone permission check completed");
 
-            let settings = match app_state.services.settings_store.load(app.handle()) {
-                Ok(settings) => {
-                    info!("persisted settings loaded");
-                    settings
-                }
-                Err(error) => {
-                    warn!(%error, "failed to load persisted settings");
-                    VoiceSettings::default()
-                }
-            };
+            let settings = load_startup_settings_with_fallback(|| {
+                app_state.services.settings_store.load(app.handle())
+            });
             let launch_at_login = settings.launch_at_login;
 
             apply_hotkey_from_settings_with_fallback(
@@ -1342,8 +1353,9 @@ mod tests {
 
     use super::{
         apply_hotkey_from_settings_with_fallback, apply_settings_transaction_with_hooks,
-        handle_audio_input_stream_error_with_hooks, permission_preflight_error_message,
-        spawn_pipeline_stage_error_reset, PipelineRuntimeState,
+        handle_audio_input_stream_error_with_hooks, has_api_key,
+        load_startup_settings_with_fallback, permission_preflight_error_message,
+        spawn_pipeline_stage_error_reset, AppState, PipelineRuntimeState,
     };
     use crate::permission_service::{PermissionState, PermissionType};
 
@@ -1952,6 +1964,45 @@ mod tests {
     }
 
     #[test]
+    fn startup_restore_falls_back_to_default_when_persisted_shortcut_apply_fails() {
+        let settings = VoiceSettings {
+            hotkey_shortcut: "Cmd+Shift+Space".to_string(),
+            recording_mode: RECORDING_MODE_TOGGLE.to_string(),
+            ..VoiceSettings::default()
+        };
+        let mut apply_attempts = 0usize;
+        let mut default_fallback_calls = 0usize;
+
+        apply_hotkey_from_settings_with_fallback(
+            &settings,
+            |_config| {
+                apply_attempts += 1;
+                Err("shortcut already registered".to_string())
+            },
+            || {
+                default_fallback_calls += 1;
+                Ok(())
+            },
+        )
+        .expect("startup fallback should recover from persisted hotkey apply failure");
+
+        assert_eq!(apply_attempts, 1);
+        assert_eq!(default_fallback_calls, 1);
+    }
+
+    #[test]
+    fn startup_settings_load_falls_back_to_defaults_when_load_errors() {
+        let mut load_attempts = 0usize;
+        let settings = load_startup_settings_with_fallback(|| {
+            load_attempts += 1;
+            Err("Failed to parse settings file `/tmp/settings.json`: malformed".to_string())
+        });
+
+        assert_eq!(load_attempts, 1);
+        assert_eq!(settings, VoiceSettings::default());
+    }
+
+    #[test]
     fn apply_settings_rolls_back_hotkey_when_settings_persist_fails() {
         let previous_hotkey = HotkeyConfig {
             shortcut: "Alt+Space".to_string(),
@@ -1990,6 +2041,78 @@ mod tests {
     }
 
     #[test]
+    fn apply_settings_persists_effective_hotkey_configuration_from_apply_result() {
+        let previous_hotkey = HotkeyConfig {
+            shortcut: "Alt+Space".to_string(),
+            mode: RecordingMode::HoldToTalk,
+        };
+        let requested_hotkey = HotkeyConfig {
+            shortcut: " Ctrl+Space ".to_string(),
+            mode: RecordingMode::HoldToTalk,
+        };
+        let update = VoiceSettingsUpdate {
+            microphone_id: Some(Some("mic-42".to_string())),
+            auto_insert: Some(false),
+            ..VoiceSettingsUpdate::default()
+        };
+        let applied_hotkey = HotkeyConfig {
+            shortcut: "Ctrl+Space".to_string(),
+            mode: RecordingMode::Toggle,
+        };
+        let mut persisted_updates = Vec::new();
+        let mut rollback_attempts = 0usize;
+
+        let persisted = apply_settings_transaction_with_hooks(
+            update,
+            previous_hotkey,
+            requested_hotkey,
+            |_config| Ok(applied_hotkey.clone()),
+            |persist_update| {
+                persisted_updates.push(persist_update.clone());
+                Ok(VoiceSettings {
+                    hotkey_shortcut: persist_update
+                        .hotkey_shortcut
+                        .expect("effective shortcut should be persisted"),
+                    recording_mode: persist_update
+                        .recording_mode
+                        .expect("effective recording mode should be persisted"),
+                    microphone_id: persist_update.microphone_id.unwrap_or(None),
+                    auto_insert: persist_update.auto_insert.unwrap_or(true),
+                    ..VoiceSettings::default()
+                })
+            },
+            |_config| {
+                rollback_attempts += 1;
+                Err("rollback should not run for successful transaction".to_string())
+            },
+        )
+        .expect("settings transaction should persist applied hotkey config");
+
+        assert_eq!(persisted_updates.len(), 1);
+        let persisted_update = persisted_updates
+            .pop()
+            .expect("persist update should be captured");
+        assert_eq!(
+            persisted_update.hotkey_shortcut.as_deref(),
+            Some("Ctrl+Space")
+        );
+        assert_eq!(
+            persisted_update.recording_mode.as_deref(),
+            Some(RECORDING_MODE_TOGGLE)
+        );
+        assert_eq!(
+            persisted_update.microphone_id,
+            Some(Some("mic-42".to_string()))
+        );
+        assert_eq!(persisted_update.auto_insert, Some(false));
+        assert_eq!(persisted.hotkey_shortcut, "Ctrl+Space");
+        assert_eq!(persisted.recording_mode, RECORDING_MODE_TOGGLE);
+        assert_eq!(persisted.microphone_id.as_deref(), Some("mic-42"));
+        assert!(!persisted.auto_insert);
+        assert_eq!(rollback_attempts, 0);
+    }
+
+    #[test]
     fn apply_settings_reports_rollback_failure_after_persist_error() {
         let previous_hotkey = HotkeyConfig {
             shortcut: "Alt+Space".to_string(),
@@ -2013,5 +2136,10 @@ mod tests {
 
         assert!(error.contains("Failed to persist settings: disk full"));
         assert!(error.contains("Failed to roll back hotkey config"));
+    }
+
+    #[test]
+    fn has_api_key_command_contract_returns_boolean_presence_only() {
+        let _: for<'a> fn(String, tauri::State<'a, AppState>) -> Result<bool, String> = has_api_key;
     }
 }

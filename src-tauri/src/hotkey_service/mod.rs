@@ -891,6 +891,63 @@ mod tests {
     }
 
     #[test]
+    fn re_register_failure_with_successful_restore_keeps_previous_shortcut_state() {
+        let state = Arc::new(Mutex::new(HotkeyRuntimeState {
+            config: HotkeyConfig::default(),
+            registered_shortcut: Some(DEFAULT_SHORTCUT.to_string()),
+            is_recording: true,
+            desired_recording: true,
+            pending_transitions: VecDeque::from([RecordingTransition::Started]),
+        }));
+        let mut unregister_attempts = Vec::new();
+        let mut register_attempts = Vec::new();
+        let mut emitted_configs = Vec::new();
+
+        let result = apply_config_with_registrar(
+            &state,
+            HotkeyConfig {
+                shortcut: "Ctrl+Space".to_string(),
+                mode: RecordingMode::Toggle,
+            },
+            |shortcut| {
+                unregister_attempts.push(shortcut.to_string());
+                Ok(())
+            },
+            |shortcut| {
+                register_attempts.push(shortcut.to_string());
+                if shortcut == "Ctrl+Space" {
+                    Err("registration failed".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+            |config| emitted_configs.push(config.clone()),
+        );
+
+        let error = result.expect_err("re-register should fail");
+        assert!(error.contains("Failed to register global hotkey `Ctrl+Space`"));
+        assert!(error.contains("Previous hotkey `Alt+Space` remains registered"));
+        assert_eq!(unregister_attempts, vec![DEFAULT_SHORTCUT.to_string()]);
+        assert_eq!(
+            register_attempts,
+            vec!["Ctrl+Space".to_string(), DEFAULT_SHORTCUT.to_string()]
+        );
+        assert!(emitted_configs.is_empty());
+
+        let state = state
+            .lock()
+            .expect("hotkey state lock should not be poisoned");
+        assert_eq!(state.config, HotkeyConfig::default());
+        assert_eq!(state.registered_shortcut.as_deref(), Some(DEFAULT_SHORTCUT));
+        assert!(state.is_recording);
+        assert!(state.desired_recording);
+        assert_eq!(
+            state.pending_transitions,
+            VecDeque::from([RecordingTransition::Started])
+        );
+    }
+
+    #[test]
     fn clear_registered_shortcut_resets_runtime_flags() {
         let mut state = HotkeyRuntimeState {
             config: HotkeyConfig::default(),
