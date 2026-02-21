@@ -6,6 +6,8 @@ use reqwest::{
 use serde::Deserialize;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::api_key_store::ApiKeyStore;
+
 use super::{
     normalize_transcript_text, TranscriptionError, TranscriptionOptions, TranscriptionProvider,
     TranscriptionResult,
@@ -46,7 +48,6 @@ impl Default for OpenAiTranscriptionConfig {
 impl OpenAiTranscriptionConfig {
     pub fn from_env() -> Self {
         let mut config = Self::default();
-        config.api_key = read_non_empty_env("OPENAI_API_KEY");
 
         if let Some(model) = read_non_empty_env("OPENAI_TRANSCRIPTION_MODEL") {
             config.model = model;
@@ -102,13 +103,31 @@ impl OpenAiTranscriptionProvider {
         }
     }
 
-    fn api_key(&self) -> Result<&str, TranscriptionError> {
-        self.config
+    fn api_key(&self) -> Result<String, TranscriptionError> {
+        if let Some(explicit_key) = self
+            .config
             .api_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or(TranscriptionError::MissingApiKey)
+            .clone()
+            .and_then(|value| normalize_optional_string(Some(value)))
+        {
+            return Ok(explicit_key);
+        }
+
+        match ApiKeyStore::new().get_api_key(self.name()) {
+            Ok(Some(keychain_key)) => return Ok(keychain_key),
+            Ok(None) => {}
+            Err(error) => {
+                if let Some(env_key) = read_non_empty_env("OPENAI_API_KEY") {
+                    return Ok(env_key);
+                }
+
+                return Err(TranscriptionError::Provider(format!(
+                    "Unable to read API key from macOS keychain: {error}",
+                )));
+            }
+        }
+
+        read_non_empty_env("OPENAI_API_KEY").ok_or(TranscriptionError::MissingApiKey)
     }
 
     fn retry_delay(&self, attempt_index: u32, retry_after: Option<Duration>) -> Duration {
@@ -185,7 +204,7 @@ impl TranscriptionProvider for OpenAiTranscriptionProvider {
         audio_data: Vec<u8>,
         options: TranscriptionOptions,
     ) -> Result<TranscriptionResult, TranscriptionError> {
-        let api_key = self.api_key()?.to_string();
+        let api_key = self.api_key()?;
         let request_language = normalize_optional_string(options.language);
         let request_prompt = build_prompt(options.prompt, options.context_hint);
         let request_language_for_payload = request_language.clone();

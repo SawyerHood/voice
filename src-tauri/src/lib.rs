@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+mod api_key_store;
 mod audio_capture_service;
 mod history_store;
 mod hotkey_service;
@@ -18,6 +19,7 @@ use std::{
     time::Duration,
 };
 
+use api_key_store::ApiKeyStore;
 use async_trait::async_trait;
 use audio_capture_service::{
     AudioCaptureService, AudioInputStreamErrorEvent, MicrophoneInfo, RecordedAudio,
@@ -27,7 +29,7 @@ use history_store::{HistoryEntry, HistoryStore};
 use hotkey_service::{HotkeyService, RecordingTransition};
 use permission_service::PermissionService;
 use serde::Serialize;
-use settings_store::SettingsStore;
+use settings_store::{SettingsStore, VoiceSettings, VoiceSettingsUpdate};
 use status_notifier::{AppStatus, StatusNotifier};
 use tauri::{
     menu::{Menu, MenuItem},
@@ -63,7 +65,8 @@ struct AppServices {
     audio_capture_service: AudioCaptureService,
     transcription_orchestrator: TranscriptionOrchestrator,
     text_insertion_service: TextInsertionService,
-    _settings_store: SettingsStore,
+    settings_store: SettingsStore,
+    api_key_store: ApiKeyStore,
     _permission_service: PermissionService,
 }
 
@@ -76,7 +79,8 @@ impl Default for AppServices {
             audio_capture_service: AudioCaptureService::new(),
             transcription_orchestrator,
             text_insertion_service: TextInsertionService::new(),
-            _settings_store: SettingsStore::new(),
+            settings_store: SettingsStore::new(),
+            api_key_store: ApiKeyStore::new(),
             _permission_service: PermissionService::new(),
         }
     }
@@ -433,6 +437,48 @@ fn set_status(app: AppHandle, status: AppStatus, state: tauri::State<'_, AppStat
 }
 
 #[tauri::command]
+fn get_settings(state: tauri::State<'_, AppState>) -> VoiceSettings {
+    state.services.settings_store.current()
+}
+
+#[tauri::command]
+fn update_settings(
+    app: AppHandle,
+    update: VoiceSettingsUpdate,
+    state: tauri::State<'_, AppState>,
+) -> Result<VoiceSettings, String> {
+    state.services.settings_store.update(&app, update)
+}
+
+#[tauri::command]
+fn get_api_key(
+    provider: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    state.services.api_key_store.get_api_key(provider.as_str())
+}
+
+#[tauri::command]
+fn set_api_key(
+    provider: String,
+    key: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .services
+        .api_key_store
+        .set_api_key(provider.as_str(), key.as_str())
+}
+
+#[tauri::command]
+fn delete_api_key(provider: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state
+        .services
+        .api_key_store
+        .delete_api_key(provider.as_str())
+}
+
+#[tauri::command]
 fn list_microphones(state: tauri::State<'_, AppState>) -> Result<Vec<MicrophoneInfo>, String> {
     state.services.audio_capture_service.list_microphones()
 }
@@ -614,6 +660,11 @@ pub fn run() {
                 .register_default_shortcut(app.handle())
                 .map_err(std::io::Error::other)?;
 
+            let app_state = app.state::<AppState>();
+            if let Err(error) = app_state.services.settings_store.load(app.handle()) {
+                eprintln!("Failed to load persisted settings: {error}");
+            }
+
             register_pipeline_handlers(app.handle());
             set_status_for_app(app.handle(), AppStatus::Idle);
 
@@ -655,6 +706,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_status,
             set_status,
+            get_settings,
+            update_settings,
+            get_api_key,
+            set_api_key,
+            delete_api_key,
             list_microphones,
             start_recording,
             stop_recording,
