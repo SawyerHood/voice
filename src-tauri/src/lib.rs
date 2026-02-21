@@ -1652,6 +1652,97 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct InsertionFailureDelegate {
+        statuses: Mutex<Vec<AppStatus>>,
+        errors: Mutex<Vec<PipelineError>>,
+        transcripts: Mutex<Vec<String>>,
+        saved_history: Mutex<Vec<PipelineTranscript>>,
+    }
+
+    impl InsertionFailureDelegate {
+        fn statuses(&self) -> Vec<AppStatus> {
+            self.statuses
+                .lock()
+                .expect("status lock should not be poisoned")
+                .clone()
+        }
+
+        fn errors(&self) -> Vec<PipelineError> {
+            self.errors
+                .lock()
+                .expect("error lock should not be poisoned")
+                .clone()
+        }
+
+        fn transcripts(&self) -> Vec<String> {
+            self.transcripts
+                .lock()
+                .expect("transcript lock should not be poisoned")
+                .clone()
+        }
+
+        fn saved_history(&self) -> Vec<PipelineTranscript> {
+            self.saved_history
+                .lock()
+                .expect("saved-history lock should not be poisoned")
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl VoicePipelineDelegate for InsertionFailureDelegate {
+        fn set_status(&self, status: AppStatus) {
+            self.statuses
+                .lock()
+                .expect("status lock should not be poisoned")
+                .push(status);
+        }
+
+        fn emit_transcript(&self, transcript: &str) {
+            self.transcripts
+                .lock()
+                .expect("transcript lock should not be poisoned")
+                .push(transcript.to_string());
+        }
+
+        fn emit_error(&self, error: &PipelineError) {
+            self.errors
+                .lock()
+                .expect("error lock should not be poisoned")
+                .push(error.clone());
+        }
+
+        fn start_recording(&self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn stop_recording(&self) -> Result<Vec<u8>, String> {
+            Ok(vec![7, 8, 9])
+        }
+
+        async fn transcribe(&self, _wav_bytes: Vec<u8>) -> Result<PipelineTranscript, String> {
+            Ok(PipelineTranscript {
+                text: "hello world".to_string(),
+                duration_secs: Some(2.4),
+                language: Some("en".to_string()),
+                provider: "test".to_string(),
+            })
+        }
+
+        fn insert_text(&self, _transcript: &str) -> Result<(), String> {
+            Err("accessibility denied".to_string())
+        }
+
+        fn save_history_entry(&self, transcript: &PipelineTranscript) -> Result<(), String> {
+            self.saved_history
+                .lock()
+                .expect("saved-history lock should not be poisoned")
+                .push(transcript.clone());
+            Ok(())
+        }
+    }
+
     #[derive(Debug, Clone, Default)]
     struct SharedStageErrorDelegate {
         statuses: Arc<Mutex<Vec<AppStatus>>>,
@@ -1806,6 +1897,36 @@ mod tests {
         );
         assert!(delegate.transcripts().is_empty());
         assert!(delegate.insertions().is_empty());
+    }
+
+    #[tokio::test]
+    async fn insertion_failure_still_persists_history_entry() {
+        let pipeline = VoicePipeline::new(Duration::ZERO);
+        let delegate = InsertionFailureDelegate::default();
+
+        pipeline.handle_hotkey_stopped(&delegate).await;
+
+        assert_eq!(
+            delegate.statuses(),
+            vec![AppStatus::Transcribing, AppStatus::Error, AppStatus::Idle]
+        );
+        assert_eq!(
+            delegate.errors(),
+            vec![PipelineError {
+                stage: PipelineErrorStage::TextInsertion,
+                message: "accessibility denied".to_string(),
+            }]
+        );
+        assert_eq!(delegate.transcripts(), vec!["hello world".to_string()]);
+        assert_eq!(
+            delegate.saved_history(),
+            vec![PipelineTranscript {
+                text: "hello world".to_string(),
+                duration_secs: Some(2.4),
+                language: Some("en".to_string()),
+                provider: "test".to_string(),
+            }]
+        );
     }
 
     #[test]
