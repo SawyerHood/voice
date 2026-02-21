@@ -134,20 +134,19 @@ impl VoicePipeline {
             }
         };
 
-        let insert_result = delegate.insert_text(&transcript.text);
         delegate.emit_transcript(&transcript.text);
 
-        if let Err(message) = insert_result {
+        if let Err(message) = delegate.save_history_entry(&transcript) {
+            warn!(message = %message, "failed to persist transcript history entry");
+        }
+
+        if let Err(message) = delegate.insert_text(&transcript.text) {
             error!(message = %message, "pipeline text insertion failed");
             self.handle_error(delegate, PipelineErrorStage::TextInsertion, message)
                 .await;
             return;
         }
         info!("pipeline text insertion succeeded");
-
-        if let Err(message) = delegate.save_history_entry(&transcript) {
-            warn!(message = %message, "failed to persist transcript history entry");
-        }
 
         debug!("pipeline returning to idle status");
         delegate.set_status(AppStatus::Idle);
@@ -415,8 +414,8 @@ mod tests {
             vec![
                 "stop_recording",
                 "transcribe",
-                "insert_text",
-                "save_history_entry"
+                "save_history_entry",
+                "insert_text"
             ]
         );
         assert!(delegate.start_acknowledgements().is_empty());
@@ -509,8 +508,8 @@ mod tests {
             vec![
                 "stop_recording",
                 "transcribe",
-                "insert_text",
-                "save_history_entry"
+                "save_history_entry",
+                "insert_text"
             ]
         );
         assert_eq!(
@@ -532,10 +531,23 @@ mod tests {
 
         assert_eq!(
             delegate.call_order(),
-            vec!["stop_recording", "transcribe", "insert_text"]
+            vec![
+                "stop_recording",
+                "transcribe",
+                "save_history_entry",
+                "insert_text"
+            ]
         );
         assert_eq!(delegate.transcripts(), vec!["hello world".to_string()]);
-        assert!(delegate.saved_history().is_empty());
+        assert_eq!(
+            delegate.saved_history(),
+            vec![PipelineTranscript {
+                text: "hello world".to_string(),
+                duration_secs: Some(2.4),
+                language: Some("en".to_string()),
+                provider: "openai".to_string(),
+            }]
+        );
         assert_eq!(
             delegate.statuses(),
             vec![AppStatus::Transcribing, AppStatus::Error, AppStatus::Idle]

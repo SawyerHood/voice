@@ -21,6 +21,7 @@ use tracing::{debug, error, info, warn};
 pub const AUDIO_LEVEL_EVENT: &str = "audio-level";
 pub const AUDIO_INPUT_STREAM_ERROR_EVENT: &str = "voice://audio-input-stream-error";
 const LEVEL_EVENT_INTERVAL: Duration = Duration::from_millis(50);
+const WORKER_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -163,31 +164,12 @@ impl AudioCaptureService {
             );
         }));
 
-        let runtime = match ready_rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(Ok(runtime)) => runtime,
-            Ok(Err(err)) => {
-                if let Some(handle) = join_handle.take() {
-                    let _ = handle.join();
-                }
-                error!(error = %err, "microphone worker failed to initialize");
-                return Err(err);
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                let _ = stop_tx.send(());
-                if let Some(handle) = join_handle.take() {
-                    let _ = handle.join();
-                }
-                error!("microphone worker timed out while starting");
-                return Err("Timed out while starting microphone stream".to_string());
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                if let Some(handle) = join_handle.take() {
-                    let _ = handle.join();
-                }
-                error!("microphone worker disconnected during startup");
-                return Err("Microphone stream failed to initialize".to_string());
-            }
-        };
+        let runtime = await_worker_startup(
+            &ready_rx,
+            &stop_tx,
+            &mut join_handle,
+            WORKER_STARTUP_TIMEOUT,
+        )?;
 
         let join_handle =
             join_handle.ok_or_else(|| "Microphone worker was unavailable".to_string())?;
@@ -320,6 +302,39 @@ impl AudioCaptureService {
 
     pub fn get_audio_level(&self) -> f32 {
         f32::from_bits(self.audio_level_bits.load(Ordering::Relaxed))
+    }
+}
+
+fn await_worker_startup(
+    ready_rx: &Receiver<Result<RecordingRuntime, String>>,
+    stop_tx: &Sender<()>,
+    join_handle: &mut Option<JoinHandle<()>>,
+    timeout: Duration,
+) -> Result<RecordingRuntime, String> {
+    match ready_rx.recv_timeout(timeout) {
+        Ok(Ok(runtime)) => Ok(runtime),
+        Ok(Err(err)) => {
+            if let Some(handle) = join_handle.take() {
+                let _ = handle.join();
+            }
+            error!(error = %err, "microphone worker failed to initialize");
+            Err(err)
+        }
+        Err(RecvTimeoutError::Timeout) => {
+            let _ = stop_tx.send(());
+            if join_handle.take().is_some() {
+                warn!("detaching microphone worker after startup timeout");
+            }
+            error!("microphone worker timed out while starting");
+            Err("Timed out while starting microphone stream".to_string())
+        }
+        Err(RecvTimeoutError::Disconnected) => {
+            if let Some(handle) = join_handle.take() {
+                let _ = handle.join();
+            }
+            error!("microphone worker disconnected during startup");
+            Err("Microphone stream failed to initialize".to_string())
+        }
     }
 }
 
@@ -1010,12 +1025,17 @@ fn pcm16_to_wav_bytes(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::mpsc};
+    use std::{
+        collections::HashMap,
+        sync::mpsc,
+        thread,
+        time::{Duration, Instant},
+    };
 
     use super::{
-        build_microphone_device_id, ensure_unique_device_id, float_to_pcm16, legacy_device_slug,
-        pcm16_to_wav_bytes, quantize_audio_level_for_emit, run_recording_loop, slugify_device_name,
-        RecordingLoopExit,
+        await_worker_startup, build_microphone_device_id, ensure_unique_device_id, float_to_pcm16,
+        legacy_device_slug, pcm16_to_wav_bytes, quantize_audio_level_for_emit, run_recording_loop,
+        slugify_device_name, RecordingLoopExit, RecordingRuntime,
     };
 
     #[test]
@@ -1147,5 +1167,36 @@ mod tests {
         let exit = run_recording_loop(&stop_rx, &stream_error_rx, || {});
 
         assert_eq!(exit, RecordingLoopExit::StopRequested);
+    }
+
+    #[test]
+    fn startup_timeout_returns_promptly_without_waiting_for_worker_join() {
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<RecordingRuntime, String>>();
+        let (stop_tx, _stop_rx) = mpsc::channel::<()>();
+        let mut join_handle = Some(thread::spawn(move || {
+            let _keep_ready_sender_alive = ready_tx;
+            thread::sleep(Duration::from_millis(750));
+        }));
+
+        let started_at = Instant::now();
+        let result = await_worker_startup(
+            &ready_rx,
+            &stop_tx,
+            &mut join_handle,
+            Duration::from_millis(25),
+        );
+
+        let elapsed = started_at.elapsed();
+        assert!(
+            matches!(result, Err(message) if message == "Timed out while starting microphone stream")
+        );
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "startup timeout should return quickly without waiting for worker thread; elapsed: {elapsed:?}"
+        );
+        assert!(
+            join_handle.is_none(),
+            "worker handle should be detached on timeout"
+        );
     }
 }
