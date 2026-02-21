@@ -1,15 +1,14 @@
-# Voice
+# Voice Menubar Scaffold
 
-A personal voice-to-text desktop app — your own WhisperFlow / SuperWhisper / Monologue.
+Minimal Tauri v2 + React + TypeScript skeleton for a macOS menu bar utility.
 
-## Development
+## Scripts
 
-Work is coordinated via swarm agents:
-- **Worker agents** (`codex-app`) handle implementation in git worktrees under `~/worktrees`.
-- **Merger agent** merges completed branches into `main`.
+- `pnpm dev` starts the Vite frontend.
+- `pnpm build` creates the frontend production bundle.
+- `cargo tauri dev` runs the full desktop app with the tray/menubar scaffold.
 
-## Setup
+## Notes
 
-```bash
-# TODO: fill in once stack is chosen
-```
+- Target platform is macOS only.
+- Rust service modules are scaffolded under `src-tauri/src/` with stubs only.

@@ -1,0 +1,113 @@
+:root {
+  font-family: "SF Pro Text", "Segoe UI", sans-serif;
+  font-size: 16px;
+  line-height: 1.4;
+  font-weight: 400;
+  color: #151515;
+  background: #f2f2f2;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 100vw;
+  min-height: 100vh;
+  background: radial-gradient(circle at top, #ffffff 0%, #ececec 80%);
+}
+
+#root {
+  min-height: 100vh;
+}
+
+.app-shell {
+  min-height: 100vh;
+  padding: 1rem;
+  display: grid;
+  align-content: start;
+  gap: 1rem;
+}
+
+.eyebrow {
+  margin: 0;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #5e5e5e;
+}
+
+h1 {
+  margin: 0.25rem 0 0;
+  font-size: 1.4rem;
+}
+
+.status-card {
+  border-radius: 12px;
+  border: 1px solid #d8d8d8;
+  background: #ffffff;
+  padding: 0.9rem;
+}
+
+.status-label {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.status-description {
+  margin: 0.35rem 0 0;
+  color: #474747;
+  font-size: 0.88rem;
+}
+
+.status-idle {
+  border-color: #c9c9c9;
+}
+
+.status-listening {
+  border-color: #2f7fda;
+  box-shadow: 0 0 0 2px rgba(47, 127, 218, 0.18);
+}
+
+.status-transcribing {
+  border-color: #b8800e;
+  box-shadow: 0 0 0 2px rgba(184, 128, 14, 0.2);
+}
+
+.status-error {
+  border-color: #b13f3f;
+  box-shadow: 0 0 0 2px rgba(177, 63, 63, 0.2);
+}
+
+.controls {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.55rem;
+}
+
+button {
+  border: 1px solid #bcbcbc;
+  border-radius: 10px;
+  background: #fafafa;
+  color: #1b1b1b;
+  padding: 0.55rem 0.65rem;
+  font-size: 0.86rem;
+  font-weight: 550;
+  cursor: pointer;
+}
+
+button:hover {
+  border-color: #8a8a8a;
+}
+
+.backend-sync {
+  margin: 0;
+  font-size: 0.8rem;
+  color: #5c5c5c;
+}
