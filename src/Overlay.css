@@ -1,0 +1,110 @@
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  background: transparent;
+}
+
+body {
+  font-family: "SF Pro Text", "Avenir Next", "Segoe UI", sans-serif;
+}
+
+.overlay-root {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.overlay-pill {
+  width: 264px;
+  height: 50px;
+  margin: 0;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: linear-gradient(135deg, rgba(8, 10, 14, 0.88), rgba(19, 24, 32, 0.78));
+  box-shadow:
+    0 14px 36px rgba(0, 0, 0, 0.36),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(18px) saturate(1.2);
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 12px;
+  padding: 0 14px;
+}
+
+.overlay-pill.active {
+  border-color: rgba(255, 107, 107, 0.5);
+}
+
+.recording-indicator {
+  width: 12px;
+  display: flex;
+  justify-content: center;
+}
+
+.recording-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: #ff4f5e;
+  box-shadow: 0 0 0 0 rgba(255, 79, 94, 0.55);
+  animation: recording-pulse 1.45s ease-out infinite;
+}
+
+.overlay-waveform {
+  height: 24px;
+  display: grid;
+  align-items: end;
+  grid-auto-flow: column;
+  grid-auto-columns: 4px;
+  gap: 2px;
+}
+
+.overlay-waveform-bar {
+  --level: 0;
+  height: calc(4px + var(--level) * 20px);
+  border-radius: 999px;
+  opacity: calc(0.25 + var(--level) * 0.75);
+  background: linear-gradient(180deg, #ffb6b6, #ff5d6b);
+  transition:
+    height 90ms linear,
+    opacity 120ms ease;
+  transform-origin: bottom;
+}
+
+.overlay-elapsed {
+  margin: 0;
+  min-width: 38px;
+  text-align: right;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: rgba(243, 247, 255, 0.82);
+  font-variant-numeric: tabular-nums;
+}
+
+@keyframes recording-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(255, 79, 94, 0.55);
+  }
+
+  75% {
+    box-shadow: 0 0 0 8px rgba(255, 79, 94, 0);
+  }
+
+  100% {
+    box-shadow: 0 0 0 0 rgba(255, 79, 94, 0);
+  }
+}

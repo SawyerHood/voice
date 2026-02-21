@@ -22,7 +22,7 @@ use api_key_store::ApiKeyStore;
 use async_trait::async_trait;
 use audio_capture_service::{
     AudioCaptureService, AudioInputStreamErrorEvent, MicrophoneInfo, RecordedAudio,
-    AUDIO_INPUT_STREAM_ERROR_EVENT,
+    AUDIO_INPUT_STREAM_ERROR_EVENT, AUDIO_LEVEL_EVENT,
 };
 use history_store::{HistoryEntry, HistoryStore};
 use hotkey_service::{
@@ -39,7 +39,8 @@ use status_notifier::{AppStatus, StatusNotifier};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconEvent},
-    AppHandle, Emitter, Listener, Manager,
+    AppHandle, Emitter, EventTarget, Listener, LogicalPosition, Manager, Monitor, PhysicalPosition,
+    WebviewUrl, WebviewWindow, WebviewWindowBuilder,
 };
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt as AutostartManagerExt};
 use text_insertion_service::TextInsertionService;
@@ -51,8 +52,13 @@ use voice_pipeline::{PipelineError, PipelineTranscript, VoicePipeline, VoicePipe
 const EVENT_STATUS_CHANGED: &str = "voice://status-changed";
 const EVENT_TRANSCRIPT_READY: &str = "voice://transcript-ready";
 const EVENT_PIPELINE_ERROR: &str = "voice://pipeline-error";
+const EVENT_OVERLAY_AUDIO_LEVEL: &str = "voice://overlay-audio-level";
 const AUDIO_STREAM_ERROR_RESET_DELAY_MS: u64 = 1_500;
 const DEFAULT_HISTORY_PAGE_SIZE: usize = 50;
+const OVERLAY_WINDOW_LABEL: &str = "recording-overlay";
+const OVERLAY_WINDOW_WIDTH: f64 = 264.0;
+const OVERLAY_WINDOW_HEIGHT: f64 = 50.0;
+const OVERLAY_WINDOW_TOP_MARGIN: f64 = 12.0;
 
 fn recording_mode_from_settings_value(value: &str) -> Result<RecordingMode, String> {
     match value.trim().to_lowercase().as_str() {
@@ -539,6 +545,8 @@ fn set_status_for_state(app: &AppHandle, state: &AppState, status: AppStatus) {
         error!("status notifier lock poisoned while setting status");
     }
 
+    set_overlay_visible_for_status(app, status);
+
     if let Err(error) = app.emit(EVENT_STATUS_CHANGED, status) {
         warn!(?status, %error, "failed to emit status changed event");
     }
@@ -571,6 +579,131 @@ fn emit_pipeline_error_event(app: &AppHandle, error: &PipelineError) {
             "failed to emit pipeline error event"
         );
     }
+}
+
+fn should_show_overlay_for_status(status: AppStatus) -> bool {
+    status == AppStatus::Listening
+}
+
+fn overlay_position_from_work_area(
+    work_area_position: PhysicalPosition<i32>,
+    work_area_width: u32,
+    scale_factor: f64,
+) -> LogicalPosition<f64> {
+    let work_area_x = f64::from(work_area_position.x) / scale_factor;
+    let work_area_y = f64::from(work_area_position.y) / scale_factor;
+    let work_area_width = f64::from(work_area_width) / scale_factor;
+
+    LogicalPosition::new(
+        work_area_x + ((work_area_width - OVERLAY_WINDOW_WIDTH) / 2.0).max(0.0),
+        work_area_y + OVERLAY_WINDOW_TOP_MARGIN,
+    )
+}
+
+fn resolve_overlay_monitor(app: &AppHandle) -> Option<Monitor> {
+    if let Ok(cursor) = app.cursor_position() {
+        if let Ok(Some(cursor_monitor)) = app.monitor_from_point(cursor.x, cursor.y) {
+            return Some(cursor_monitor);
+        }
+    }
+
+    if let Some(main_window) = app.get_webview_window("main") {
+        if let Ok(Some(main_monitor)) = main_window.current_monitor() {
+            return Some(main_monitor);
+        }
+    }
+
+    app.primary_monitor().ok().flatten()
+}
+
+fn position_overlay_window(window: &WebviewWindow, app: &AppHandle) {
+    if let Some(monitor) = resolve_overlay_monitor(app) {
+        let position = overlay_position_from_work_area(
+            monitor.work_area().position,
+            monitor.work_area().size.width,
+            monitor.scale_factor(),
+        );
+        if let Err(error) = window.set_position(position) {
+            warn!(%error, "failed to position recording overlay");
+        }
+    }
+}
+
+fn create_recording_overlay_window(app: &AppHandle) -> Result<WebviewWindow, String> {
+    let window = WebviewWindowBuilder::new(
+        app,
+        OVERLAY_WINDOW_LABEL,
+        WebviewUrl::App("overlay.html".into()),
+    )
+    .title("Voice Recording Overlay")
+    .inner_size(OVERLAY_WINDOW_WIDTH, OVERLAY_WINDOW_HEIGHT)
+    .min_inner_size(OVERLAY_WINDOW_WIDTH, OVERLAY_WINDOW_HEIGHT)
+    .max_inner_size(OVERLAY_WINDOW_WIDTH, OVERLAY_WINDOW_HEIGHT)
+    .resizable(false)
+    .decorations(false)
+    .shadow(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .visible_on_all_workspaces(true)
+    .focusable(false)
+    .focused(false)
+    .visible(false)
+    .transparent(true)
+    .build()
+    .map_err(|error| format!("failed to create recording overlay window: {error}"))?;
+
+    if let Err(error) = window.set_focusable(false) {
+        warn!(%error, "failed to set recording overlay as non-focusable");
+    }
+    if let Err(error) = window.set_ignore_cursor_events(true) {
+        warn!(%error, "failed to make recording overlay click-through");
+    }
+
+    position_overlay_window(&window, app);
+    Ok(window)
+}
+
+fn setup_recording_overlay_window(app: &AppHandle) {
+    if app.get_webview_window(OVERLAY_WINDOW_LABEL).is_some() {
+        return;
+    }
+
+    match create_recording_overlay_window(app) {
+        Ok(_) => info!("recording overlay window initialized"),
+        Err(error) => warn!(%error, "recording overlay window initialization failed"),
+    }
+}
+
+fn set_overlay_visible_for_status(app: &AppHandle, status: AppStatus) {
+    let Some(window) = app.get_webview_window(OVERLAY_WINDOW_LABEL) else {
+        return;
+    };
+
+    if should_show_overlay_for_status(status) {
+        position_overlay_window(&window, app);
+        if let Err(error) = window.show() {
+            warn!(%error, "failed to show recording overlay window");
+        }
+    } else if let Err(error) = window.hide() {
+        warn!(%error, "failed to hide recording overlay window");
+    }
+}
+
+fn register_overlay_audio_forwarder(app: &AppHandle) {
+    let overlay_app = app.clone();
+    app.listen(AUDIO_LEVEL_EVENT, move |event| {
+        let level = serde_json::from_str::<f32>(event.payload()).unwrap_or_else(|error| {
+            warn!(%error, payload = event.payload(), "invalid audio-level payload");
+            0.0
+        });
+        if let Err(error) = overlay_app.emit_to(
+            EventTarget::webview_window(OVERLAY_WINDOW_LABEL),
+            EVENT_OVERLAY_AUDIO_LEVEL,
+            level,
+        ) {
+            warn!(%error, "failed to forward audio level to recording overlay");
+        }
+    });
 }
 
 fn parse_audio_stream_error_message(payload: &str) -> String {
@@ -1308,9 +1441,11 @@ pub fn run() {
                 warn!(%error, "failed to apply launch-at-login preference");
             }
 
+            setup_recording_overlay_window(app.handle());
+            register_overlay_audio_forwarder(app.handle());
             register_pipeline_handlers(app.handle());
             set_status_for_app(app.handle(), AppStatus::Idle);
-            info!("pipeline handlers registered and status initialized");
+            info!("overlay, pipeline handlers, and initial status configured");
 
             let show_item =
                 MenuItem::with_id(app, "show_window", "Open Voice", true, None::<&str>)?;
@@ -1346,9 +1481,9 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                info!("main window close requested; hiding instead");
+                info!(window = %window.label(), "window close requested; hiding instead");
                 if let Err(error) = window.hide() {
-                    warn!(%error, "failed to hide main window on close request");
+                    warn!(%error, window = %window.label(), "failed to hide window on close request");
                 }
             }
         })
@@ -1393,6 +1528,7 @@ mod tests {
     };
 
     use async_trait::async_trait;
+    use tauri::PhysicalPosition;
     use tokio::sync::{oneshot, Notify};
 
     use crate::{
@@ -1408,8 +1544,10 @@ mod tests {
     use super::{
         apply_hotkey_from_settings_with_fallback, apply_settings_transaction_with_hooks,
         handle_audio_input_stream_error_with_hooks, has_api_key,
-        load_startup_settings_with_fallback, permission_preflight_error_message,
+        load_startup_settings_with_fallback, overlay_position_from_work_area,
+        permission_preflight_error_message, should_show_overlay_for_status,
         spawn_pipeline_stage_error_reset, AppState, PipelineRuntimeState,
+        OVERLAY_WINDOW_TOP_MARGIN, OVERLAY_WINDOW_WIDTH,
     };
     use crate::permission_service::{PermissionState, PermissionType};
 
@@ -2382,6 +2520,25 @@ mod tests {
         assert!(error.contains("Failed to persist settings: disk full"));
         assert!(error.contains("Failed to roll back launch-at-login state"));
         assert!(error.contains("Failed to roll back hotkey config"));
+    }
+
+    #[test]
+    fn overlay_is_only_visible_while_listening() {
+        assert!(should_show_overlay_for_status(AppStatus::Listening));
+        assert!(!should_show_overlay_for_status(AppStatus::Idle));
+        assert!(!should_show_overlay_for_status(AppStatus::Transcribing));
+        assert!(!should_show_overlay_for_status(AppStatus::Error));
+    }
+
+    #[test]
+    fn overlay_position_is_top_centered_in_work_area() {
+        let position = overlay_position_from_work_area(PhysicalPosition::new(100, 32), 1600, 2.0);
+
+        let expected_x = (100.0 / 2.0) + ((1600.0 / 2.0 - OVERLAY_WINDOW_WIDTH) / 2.0);
+        let expected_y = (32.0 / 2.0) + OVERLAY_WINDOW_TOP_MARGIN;
+
+        assert!((position.x - expected_x).abs() < f64::EPSILON);
+        assert!((position.y - expected_y).abs() < f64::EPSILON);
     }
 
     #[test]
