@@ -1673,8 +1673,11 @@ pub fn run() {
             let quit_item = MenuItem::with_id(app, "quit", "Quit Voice", true, None::<&str>)?;
             let tray_menu = Menu::with_items(app, &[&show_item, &hide_item, &quit_item])?;
 
+            let tray_icon_image = tauri::image::Image::from_bytes(include_bytes!("../icons/tray-icon.png"))
+                .expect("failed to decode tray icon PNG");
+
             tauri::tray::TrayIconBuilder::with_id("voice-tray")
-                .icon(app.default_window_icon().cloned().expect("default icon"))
+                .icon(tray_icon_image)
                 .icon_as_template(true)
                 .menu(&tray_menu)
                 .show_menu_on_left_click(false)
