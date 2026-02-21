@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import Settings from "./Settings";
 import "./App.css";
 
 type AppStatus = "idle" | "listening" | "transcribing" | "error";
+type AppView = "status" | "settings";
 type TranscriptReadyEvent = { text: string };
 type PipelineErrorEvent = { stage: string; message: string };
 
@@ -15,6 +17,7 @@ const STATUS_LABEL: Record<AppStatus, string> = {
 };
 
 function App() {
+  const [activeView, setActiveView] = useState<AppView>("status");
   const [status, setStatus] = useState<AppStatus>("idle");
   const [errorMessage, setErrorMessage] = useState("");
   const [audioLevel, setAudioLevel] = useState(0);
@@ -104,41 +107,65 @@ function App() {
 
   return (
     <main className="app-shell">
-      <header>
-        <p className="eyebrow">Voice Utility</p>
-        <h1>Status</h1>
+      <header className="app-header">
+        <div>
+          <p className="eyebrow">Voice Utility</p>
+          <h1>{activeView === "status" ? "Status" : "Settings"}</h1>
+        </div>
+        <nav className="view-nav" aria-label="View navigation">
+          <button
+            type="button"
+            className={`view-nav-button ${activeView === "status" ? "active" : ""}`}
+            onClick={() => setActiveView("status")}
+          >
+            Status
+          </button>
+          <button
+            type="button"
+            className={`view-nav-button ${activeView === "settings" ? "active" : ""}`}
+            onClick={() => setActiveView("settings")}
+          >
+            Settings
+          </button>
+        </nav>
       </header>
 
-      <section className={`status-card status-${status}`}>
-        <p className="status-label">{STATUS_LABEL[status]}</p>
-        <p className="status-description">{statusDescription}</p>
-      </section>
+      {activeView === "status" ? (
+        <>
+          <section className={`status-card status-${status}`}>
+            <p className="status-label">{STATUS_LABEL[status]}</p>
+            <p className="status-description">{statusDescription}</p>
+          </section>
 
-      <section className="audio-level-card">
-        <p className="card-title">Audio Level</p>
-        <div className="audio-meter-track">
-          <div
-            className={`audio-meter-fill ${status === "listening" ? "active" : ""}`}
-            style={{ width: `${Math.round(audioLevel * 100)}%` }}
-          />
-        </div>
-        <p className="audio-meter-value">
-          {status === "listening"
-            ? `${Math.round(audioLevel * 100)}% input`
-            : "Waiting for recording"}
-        </p>
-      </section>
+          <section className="audio-level-card">
+            <p className="card-title">Audio Level</p>
+            <div className="audio-meter-track">
+              <div
+                className={`audio-meter-fill ${status === "listening" ? "active" : ""}`}
+                style={{ width: `${Math.round(audioLevel * 100)}%` }}
+              />
+            </div>
+            <p className="audio-meter-value">
+              {status === "listening"
+                ? `${Math.round(audioLevel * 100)}% input`
+                : "Waiting for recording"}
+            </p>
+          </section>
 
-      <section className="transcript-card">
-        <p className="card-title">Last Transcript</p>
-        <p className={lastTranscript ? "transcript-value" : "transcript-placeholder"}>
-          {lastTranscript || "No transcript captured yet."}
-        </p>
-      </section>
+          <section className="transcript-card">
+            <p className="card-title">Last Transcript</p>
+            <p className={lastTranscript ? "transcript-value" : "transcript-placeholder"}>
+              {lastTranscript || "No transcript captured yet."}
+            </p>
+          </section>
 
-      <p className="backend-sync">
-        Backend sync: {backendSynced ? "connected" : "frontend-only fallback"}
-      </p>
+          <p className="backend-sync">
+            Backend sync: {backendSynced ? "connected" : "frontend-only fallback"}
+          </p>
+        </>
+      ) : (
+        <Settings />
+      )}
     </main>
   );
 }
