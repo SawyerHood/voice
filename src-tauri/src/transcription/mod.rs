@@ -1,4 +1,5 @@
 pub mod openai;
+pub mod realtime;
 
 use std::{fmt, sync::Arc};
 

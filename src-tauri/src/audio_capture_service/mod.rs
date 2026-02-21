@@ -44,6 +44,14 @@ pub struct RecordedAudio {
     pub device_name: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct AudioInputChunk {
+    pub pcm16_mono_samples: Vec<i16>,
+    pub sample_rate_hz: u32,
+}
+
+pub type AudioInputChunkCallback = Arc<dyn Fn(AudioInputChunk) + Send + Sync + 'static>;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AudioInputStreamErrorEvent {
@@ -132,6 +140,7 @@ impl AudioCaptureService {
         &self,
         app_handle: AppHandle,
         preferred_device_id: Option<&str>,
+        on_input_chunk: Option<AudioInputChunkCallback>,
     ) -> Result<(), String> {
         info!(
             preferred_device_id = ?preferred_device_id,
@@ -155,6 +164,7 @@ impl AudioCaptureService {
         let worker_level_bits = Arc::clone(&self.audio_level_bits);
         let worker_app_handle = app_handle.clone();
         let worker_preferred_device_id = preferred_device_id.map(str::to_string);
+        let worker_chunk_callback = on_input_chunk;
 
         let (ready_tx, ready_rx) = mpsc::channel::<Result<RecordingRuntime, String>>();
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
@@ -165,6 +175,7 @@ impl AudioCaptureService {
                 worker_samples,
                 worker_level_bits,
                 worker_app_handle,
+                worker_chunk_callback,
                 ready_tx,
                 stop_rx,
             );
@@ -349,6 +360,7 @@ fn recording_thread_main(
     samples: Arc<Mutex<Vec<i16>>>,
     audio_level_bits: Arc<AtomicU32>,
     app_handle: AppHandle,
+    on_input_chunk: Option<AudioInputChunkCallback>,
     ready_tx: Sender<Result<RecordingRuntime, String>>,
     stop_rx: Receiver<()>,
 ) {
@@ -360,6 +372,7 @@ fn recording_thread_main(
         preferred_device_id.as_deref(),
         Arc::clone(&samples),
         Arc::clone(&audio_level_bits),
+        on_input_chunk,
     );
 
     let (stream, runtime, stream_error_rx) = match startup_result {
@@ -408,6 +421,7 @@ fn start_recording_worker(
     preferred_device_id: Option<&str>,
     samples: Arc<Mutex<Vec<i16>>>,
     audio_level_bits: Arc<AtomicU32>,
+    on_input_chunk: Option<AudioInputChunkCallback>,
 ) -> Result<(Stream, RecordingRuntime, Receiver<String>), String> {
     let host = cpal::default_host();
     let devices = enumerate_input_devices(&host)?;
@@ -449,8 +463,10 @@ fn start_recording_worker(
         &stream_config,
         sample_format,
         input_channels,
+        sample_rate_hz,
         samples,
         audio_level_bits,
+        on_input_chunk,
         stream_error_tx,
     )?;
 
@@ -878,14 +894,17 @@ fn build_input_stream(
     stream_config: &StreamConfig,
     sample_format: SampleFormat,
     input_channels: usize,
+    sample_rate_hz: u32,
     samples: Arc<Mutex<Vec<i16>>>,
     audio_level_bits: Arc<AtomicU32>,
+    on_input_chunk: Option<AudioInputChunkCallback>,
     stream_error_tx: Sender<String>,
 ) -> Result<Stream, String> {
     match sample_format {
         SampleFormat::F32 => {
             let samples = Arc::clone(&samples);
             let level_bits = Arc::clone(&audio_level_bits);
+            let on_input_chunk = on_input_chunk.clone();
             let stream_error_tx = stream_error_tx.clone();
             device
                 .build_input_stream(
@@ -897,6 +916,8 @@ fn build_input_stream(
                             |sample| sample,
                             &samples,
                             &level_bits,
+                            sample_rate_hz,
+                            on_input_chunk.as_ref(),
                         );
                     },
                     move |err| {
@@ -909,6 +930,7 @@ fn build_input_stream(
         SampleFormat::I16 => {
             let samples = Arc::clone(&samples);
             let level_bits = Arc::clone(&audio_level_bits);
+            let on_input_chunk = on_input_chunk.clone();
             let stream_error_tx = stream_error_tx.clone();
             device
                 .build_input_stream(
@@ -920,6 +942,8 @@ fn build_input_stream(
                             |sample| sample as f32 / i16::MAX as f32,
                             &samples,
                             &level_bits,
+                            sample_rate_hz,
+                            on_input_chunk.as_ref(),
                         );
                     },
                     move |err| {
@@ -932,6 +956,7 @@ fn build_input_stream(
         SampleFormat::U16 => {
             let samples = Arc::clone(&samples);
             let level_bits = Arc::clone(&audio_level_bits);
+            let on_input_chunk = on_input_chunk.clone();
             let stream_error_tx = stream_error_tx.clone();
             device
                 .build_input_stream(
@@ -943,6 +968,8 @@ fn build_input_stream(
                             |sample| (sample as f32 / u16::MAX as f32) * 2.0 - 1.0,
                             &samples,
                             &level_bits,
+                            sample_rate_hz,
+                            on_input_chunk.as_ref(),
                         );
                     },
                     move |err| {
@@ -964,6 +991,8 @@ fn process_input_frames<T, F>(
     to_f32: F,
     samples: &Arc<Mutex<Vec<i16>>>,
     audio_level_bits: &Arc<AtomicU32>,
+    sample_rate_hz: u32,
+    on_input_chunk: Option<&AudioInputChunkCallback>,
 ) where
     T: Copy,
     F: Fn(T) -> f32,
@@ -975,6 +1004,12 @@ fn process_input_frames<T, F>(
     let mut peak = 0.0_f32;
     let mut sum_squares = 0.0_f64;
     let mut frame_count = 0usize;
+    let should_emit_chunks = on_input_chunk.is_some();
+    let mut mono_chunk = if should_emit_chunks {
+        Some(Vec::with_capacity(data.len() / channels))
+    } else {
+        None
+    };
 
     if let Ok(mut sample_buffer) = samples.lock() {
         sample_buffer.reserve(data.len() / channels);
@@ -986,7 +1021,11 @@ fn process_input_frames<T, F>(
             }
 
             let normalized = (mixed / channels as f32).clamp(-1.0, 1.0);
-            sample_buffer.push(float_to_pcm16(normalized));
+            let mono_pcm16 = float_to_pcm16(normalized);
+            sample_buffer.push(mono_pcm16);
+            if let Some(chunk) = mono_chunk.as_mut() {
+                chunk.push(mono_pcm16);
+            }
 
             let abs = normalized.abs();
             if abs > peak {
@@ -1006,6 +1045,15 @@ fn process_input_frames<T, F>(
     };
     let level = peak.max(rms);
     audio_level_bits.store(level.to_bits(), Ordering::Relaxed);
+
+    if let (Some(callback), Some(pcm16_mono_samples)) = (on_input_chunk, mono_chunk) {
+        if !pcm16_mono_samples.is_empty() {
+            callback(AudioInputChunk {
+                pcm16_mono_samples,
+                sample_rate_hz,
+            });
+        }
+    }
 }
 
 fn quantize_audio_level_for_emit(level: f32) -> f32 {

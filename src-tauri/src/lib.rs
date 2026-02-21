@@ -22,8 +22,8 @@ use std::{
 use api_key_store::ApiKeyStore;
 use async_trait::async_trait;
 use audio_capture_service::{
-    AudioCaptureService, AudioInputStreamErrorEvent, MicrophoneInfo, RecordedAudio,
-    AUDIO_INPUT_STREAM_ERROR_EVENT, AUDIO_LEVEL_EVENT,
+    AudioCaptureService, AudioInputChunk, AudioInputChunkCallback, AudioInputStreamErrorEvent,
+    MicrophoneInfo, RecordedAudio, AUDIO_INPUT_STREAM_ERROR_EVENT, AUDIO_LEVEL_EVENT,
 };
 use history_store::{HistoryEntry, HistoryStore};
 use hotkey_service::{
@@ -47,6 +47,10 @@ use tauri_plugin_autostart::{MacosLauncher, ManagerExt as AutostartManagerExt};
 use text_insertion_service::TextInsertionService;
 use tracing::{debug, error, info, warn};
 use transcription::openai::{OpenAiTranscriptionConfig, OpenAiTranscriptionProvider};
+use transcription::realtime::{
+    OpenAiRealtimeTranscriptionClient, OpenAiRealtimeTranscriptionConfig,
+    RealtimeTranscriptionSession,
+};
 use transcription::{TranscriptionOptions, TranscriptionOrchestrator};
 use voice_pipeline::{PipelineError, PipelineTranscript, VoicePipeline, VoicePipelineDelegate};
 
@@ -250,6 +254,7 @@ struct PipelineErrorEvent {
 struct AppServices {
     audio_capture_service: AudioCaptureService,
     transcription_orchestrator: TranscriptionOrchestrator,
+    realtime_transcription_client: OpenAiRealtimeTranscriptionClient,
     text_insertion_service: TextInsertionService,
     settings_store: SettingsStore,
     api_key_store: ApiKeyStore,
@@ -260,13 +265,21 @@ impl AppServices {
     fn new(app_data_dir: PathBuf) -> Self {
         let mut openai_config = OpenAiTranscriptionConfig::from_env();
         openai_config.api_key_store_app_data_dir = Some(app_data_dir.clone());
-        let provider = OpenAiTranscriptionProvider::new(openai_config);
+        let provider = OpenAiTranscriptionProvider::new(openai_config.clone());
         let transcription_orchestrator = TranscriptionOrchestrator::new(Arc::new(provider));
+        let mut realtime_config = OpenAiRealtimeTranscriptionConfig::from_env();
+        if realtime_config.model.trim().is_empty() {
+            realtime_config.model = openai_config.model.clone();
+        }
+        realtime_config.api_key = openai_config.api_key.clone();
+        realtime_config.api_key_store_app_data_dir = Some(app_data_dir.clone());
+        let realtime_transcription_client = OpenAiRealtimeTranscriptionClient::new(realtime_config);
         info!("initializing app services");
 
         Self {
             audio_capture_service: AudioCaptureService::new(),
             transcription_orchestrator,
+            realtime_transcription_client,
             text_insertion_service: TextInsertionService::new(),
             settings_store: SettingsStore::new(),
             api_key_store: ApiKeyStore::new(app_data_dir),
@@ -324,6 +337,7 @@ impl PipelineRuntimeState {
 struct AppPipelineDelegate {
     app: AppHandle,
     session_id: Option<u64>,
+    realtime_session: Arc<Mutex<Option<RealtimeTranscriptionSession>>>,
 }
 
 impl AppPipelineDelegate {
@@ -331,6 +345,7 @@ impl AppPipelineDelegate {
         Self {
             app,
             session_id: None,
+            realtime_session: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -338,6 +353,7 @@ impl AppPipelineDelegate {
         Self {
             app,
             session_id: Some(session_id),
+            realtime_session: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -354,6 +370,50 @@ impl AppPipelineDelegate {
     fn current_settings(&self) -> VoiceSettings {
         let state = self.app.state::<AppState>();
         state.services.settings_store.current()
+    }
+
+    fn build_delta_callback(&self) -> transcription::TranscriptionDeltaCallback {
+        let app_for_delta = self.app.clone();
+        let session_id_for_delta = self.session_id;
+        Arc::new(move |delta| {
+            if let Some(session_id) = session_id_for_delta {
+                let runtime_state = app_for_delta.state::<PipelineRuntimeState>();
+                if !runtime_state.is_session_active(session_id) {
+                    return;
+                }
+            }
+            emit_transcription_delta_event(&app_for_delta, &delta);
+        })
+    }
+
+    fn store_realtime_session(&self, session: Option<RealtimeTranscriptionSession>) {
+        if let Ok(mut guard) = self.realtime_session.lock() {
+            *guard = session;
+        } else {
+            warn!(
+                session_id = ?self.session_id,
+                "failed to store realtime session because session lock was poisoned"
+            );
+        }
+    }
+
+    fn take_realtime_session(&self) -> Option<RealtimeTranscriptionSession> {
+        match self.realtime_session.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(_) => {
+                warn!(
+                    session_id = ?self.session_id,
+                    "failed to access realtime session because session lock was poisoned"
+                );
+                None
+            }
+        }
+    }
+
+    fn clear_realtime_session(&self) {
+        if let Some(session) = self.take_realtime_session() {
+            session.close();
+        }
     }
 }
 
@@ -414,6 +474,9 @@ impl VoicePipelineDelegate for AppPipelineDelegate {
 
     fn on_recording_stopped(&self, success: bool) {
         debug!(session_id = ?self.session_id, success, "recording stop acknowledged");
+        if !success {
+            self.clear_realtime_session();
+        }
         let hotkey_service = self.app.state::<HotkeyService>();
         hotkey_service.acknowledge_transition(RecordingTransition::Stopped, success);
     }
@@ -427,38 +490,95 @@ impl VoicePipelineDelegate for AppPipelineDelegate {
         );
         let state = self.app.state::<AppState>();
         ensure_microphone_permission_for_recording(&state)?;
-        state
+
+        self.clear_realtime_session();
+
+        let realtime_session = if state
             .services
-            .audio_capture_service
-            .start_recording(self.app.clone(), settings.microphone_id.as_deref())
+            .realtime_transcription_client
+            .model_supports_realtime()
+        {
+            let options = TranscriptionOptions {
+                language: settings.language.clone(),
+                on_delta: Some(self.build_delta_callback()),
+                ..TranscriptionOptions::default()
+            };
+            match state
+                .services
+                .realtime_transcription_client
+                .begin_session(options)
+            {
+                Ok(session) => {
+                    info!(
+                        session_id = ?self.session_id,
+                        model = %state.services.realtime_transcription_client.model(),
+                        "realtime transcription session prepared"
+                    );
+                    Some(session)
+                }
+                Err(error) => {
+                    warn!(
+                        session_id = ?self.session_id,
+                        error = %error,
+                        "unable to start realtime transcription session; will fall back to REST upload"
+                    );
+                    None
+                }
+            }
+        } else {
+            debug!(
+                session_id = ?self.session_id,
+                model = %state.services.realtime_transcription_client.model(),
+                "configured model does not support realtime transcription; using REST upload fallback"
+            );
+            None
+        };
+
+        let chunk_callback: Option<AudioInputChunkCallback> =
+            realtime_session.as_ref().map(|session| {
+                let audio_sender = session.audio_sender();
+                Arc::new(move |chunk: AudioInputChunk| {
+                    let _ = audio_sender
+                        .append_pcm16_mono(chunk.pcm16_mono_samples, chunk.sample_rate_hz);
+                }) as AudioInputChunkCallback
+            });
+
+        let start_result = state.services.audio_capture_service.start_recording(
+            self.app.clone(),
+            settings.microphone_id.as_deref(),
+            chunk_callback,
+        );
+
+        if start_result.is_ok() {
+            self.store_realtime_session(realtime_session);
+            start_result
+        } else {
+            if let Some(session) = realtime_session {
+                session.close();
+            }
+            start_result
+        }
     }
 
     fn stop_recording(&self) -> Result<Vec<u8>, String> {
         info!(session_id = ?self.session_id, "pipeline requested recording stop");
         let state = self.app.state::<AppState>();
-        state
+        let result = state
             .services
             .audio_capture_service
             .stop_recording(self.app.clone())
-            .map(|recorded| recorded.wav_bytes)
+            .map(|recorded| recorded.wav_bytes);
+        if result.is_err() {
+            self.clear_realtime_session();
+        }
+        result
     }
 
     async fn transcribe(&self, wav_bytes: Vec<u8>) -> Result<PipelineTranscript, String> {
         let settings = self.current_settings();
-        let app_for_delta = self.app.clone();
-        let session_id_for_delta = self.session_id;
         let options = TranscriptionOptions {
             language: settings.language,
-            on_delta: Some(Arc::new(move |delta| {
-                if let Some(session_id) = session_id_for_delta {
-                    let runtime_state = app_for_delta.state::<PipelineRuntimeState>();
-                    if !runtime_state.is_session_active(session_id) {
-                        return;
-                    }
-                }
-
-                emit_transcription_delta_event(&app_for_delta, &delta);
-            })),
+            on_delta: Some(self.build_delta_callback()),
             ..TranscriptionOptions::default()
         };
         let orchestrator = {
@@ -467,11 +587,46 @@ impl VoicePipelineDelegate for AppPipelineDelegate {
         };
         let provider_name = orchestrator.active_provider_name().to_string();
         let provider_name_for_error = provider_name.clone();
+
+        if let Some(realtime_session) = self.take_realtime_session() {
+            info!(
+                session_id = ?self.session_id,
+                provider = "openai-realtime",
+                "awaiting realtime transcription completion"
+            );
+
+            match realtime_session.commit_and_wait().await {
+                Ok(transcription) => {
+                    let transcript = PipelineTranscript {
+                        text: transcription.text,
+                        duration_secs: transcription.duration_secs,
+                        language: transcription.language,
+                        provider: "openai-realtime".to_string(),
+                    };
+                    info!(
+                        session_id = ?self.session_id,
+                        provider = %transcript.provider,
+                        transcript_chars = transcript.text.chars().count(),
+                        "realtime transcription completed"
+                    );
+                    return Ok(transcript);
+                }
+                Err(error) => {
+                    warn!(
+                        session_id = ?self.session_id,
+                        error = %error,
+                        provider = "openai-realtime",
+                        "realtime transcription failed; falling back to REST upload"
+                    );
+                }
+            }
+        }
+
         info!(
             session_id = ?self.session_id,
             provider = %provider_name,
             audio_bytes = wav_bytes.len(),
-            "starting transcription request"
+            "starting REST transcription fallback request"
         );
 
         orchestrator
@@ -1199,10 +1354,11 @@ fn start_recording(
     );
     ensure_microphone_permission_for_recording(&state)?;
 
-    let result = state
-        .services
-        .audio_capture_service
-        .start_recording(app.clone(), microphone_id.as_deref());
+    let result = state.services.audio_capture_service.start_recording(
+        app.clone(),
+        microphone_id.as_deref(),
+        None,
+    );
 
     if result.is_ok() {
         set_status_for_state(&app, &state, AppStatus::Listening);
