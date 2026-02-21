@@ -5,6 +5,7 @@ use reqwest::{
 };
 use serde::Deserialize;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tracing::{debug, error, info, warn};
 
 use crate::api_key_store::ApiKeyStore;
 
@@ -79,6 +80,15 @@ impl OpenAiTranscriptionConfig {
             config.retry_initial_backoff_ms = config.retry_max_backoff_ms;
         }
 
+        debug!(
+            endpoint = %config.endpoint,
+            model = %config.model,
+            request_timeout_secs = config.request_timeout_secs,
+            max_retries = config.max_retries,
+            retry_initial_backoff_ms = config.retry_initial_backoff_ms,
+            retry_max_backoff_ms = config.retry_max_backoff_ms,
+            "loaded OpenAI transcription config"
+        );
         config
     }
 }
@@ -96,6 +106,13 @@ impl OpenAiTranscriptionProvider {
     }
 
     fn new_with_jitter_seed(config: OpenAiTranscriptionConfig, jitter_seed: u64) -> Self {
+        info!(
+            endpoint = %config.endpoint,
+            model = %config.model,
+            request_timeout_secs = config.request_timeout_secs,
+            max_retries = config.max_retries,
+            "OpenAI transcription provider initialized"
+        );
         Self {
             client: build_client(&config),
             config,
@@ -110,14 +127,22 @@ impl OpenAiTranscriptionProvider {
             .clone()
             .and_then(|value| normalize_optional_string(Some(value)))
         {
+            debug!("using OpenAI API key from explicit provider configuration");
             return Ok(explicit_key);
         }
 
         match ApiKeyStore::new().get_api_key(self.name()) {
-            Ok(Some(keychain_key)) => return Ok(keychain_key),
+            Ok(Some(keychain_key)) => {
+                debug!("using OpenAI API key from keychain");
+                return Ok(keychain_key);
+            }
             Ok(None) => {}
             Err(error) => {
                 if let Some(env_key) = read_non_empty_env("OPENAI_API_KEY") {
+                    warn!(
+                        error = %error,
+                        "falling back to OPENAI_API_KEY environment variable after keychain read failure"
+                    );
                     return Ok(env_key);
                 }
 
@@ -127,7 +152,9 @@ impl OpenAiTranscriptionProvider {
             }
         }
 
-        read_non_empty_env("OPENAI_API_KEY").ok_or(TranscriptionError::MissingApiKey)
+        read_non_empty_env("OPENAI_API_KEY")
+            .inspect(|_| debug!("using OpenAI API key from environment"))
+            .ok_or(TranscriptionError::MissingApiKey)
     }
 
     fn retry_delay(&self, attempt_index: u32, retry_after: Option<Duration>) -> Duration {
@@ -209,8 +236,20 @@ impl TranscriptionProvider for OpenAiTranscriptionProvider {
         let request_prompt = build_prompt(options.prompt, options.context_hint);
         let request_language_for_payload = request_language.clone();
         let mut attempt_index = 0;
+        info!(
+            endpoint = %self.config.endpoint,
+            model = %self.config.model,
+            audio_bytes = audio_data.len(),
+            language = ?request_language,
+            has_prompt = request_prompt.is_some(),
+            "starting OpenAI transcription request"
+        );
 
         loop {
+            debug!(
+                attempt = attempt_index + 1,
+                "sending OpenAI transcription request"
+            );
             let form = self.build_form(
                 audio_data.clone(),
                 request_language.as_deref(),
@@ -231,15 +270,30 @@ impl TranscriptionProvider for OpenAiTranscriptionProvider {
                     let transport_error = map_transport_error(error);
                     if transport_error.retryable && attempt_index < self.config.max_retries {
                         let delay = self.retry_delay(attempt_index, None);
+                        warn!(
+                            attempt = attempt_index + 1,
+                            delay_ms = delay.as_millis() as u64,
+                            error = %transport_error.error,
+                            "retrying OpenAI transcription request after transport error"
+                        );
                         tokio::time::sleep(delay).await;
                         attempt_index += 1;
                         continue;
                     }
+                    error!(
+                        attempt = attempt_index + 1,
+                        error = %transport_error.error,
+                        "OpenAI transcription request failed without retry"
+                    );
                     return Err(transport_error.error);
                 }
             };
 
             if response.status().is_success() {
+                info!(
+                    attempt = attempt_index + 1,
+                    "OpenAI transcription request succeeded"
+                );
                 let response_payload: OpenAiTranscriptionResponse = response
                     .json()
                     .await
@@ -260,11 +314,22 @@ impl TranscriptionProvider for OpenAiTranscriptionProvider {
             let http_error = map_http_error(response).await;
             if http_error.retryable && attempt_index < self.config.max_retries {
                 let delay = self.retry_delay(attempt_index, http_error.retry_after);
+                warn!(
+                    attempt = attempt_index + 1,
+                    delay_ms = delay.as_millis() as u64,
+                    error = %http_error.error,
+                    "retrying OpenAI transcription request after HTTP error"
+                );
                 tokio::time::sleep(delay).await;
                 attempt_index += 1;
                 continue;
             }
 
+            error!(
+                attempt = attempt_index + 1,
+                error = %http_error.error,
+                "OpenAI transcription request failed without retry"
+            );
             return Err(http_error.error);
         }
     }
@@ -349,6 +414,11 @@ async fn map_http_error(response: reqwest::Response) -> RetryableError {
     let response_body = response.text().await.unwrap_or_default();
     let fallback_message = format!("OpenAI request failed with status {}", status.as_u16());
     let error_message = parse_openai_error_message(&response_body).unwrap_or(fallback_message);
+    debug!(
+        status = status.as_u16(),
+        retry_after_ms = retry_after.map(|d| d.as_millis() as u64),
+        "mapped OpenAI HTTP error response"
+    );
 
     let mapped = match status {
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
@@ -450,6 +520,10 @@ fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
 
 fn build_client(config: &OpenAiTranscriptionConfig) -> Client {
     let timeout = Duration::from_secs(config.request_timeout_secs.max(1));
+    debug!(
+        timeout_secs = timeout.as_secs(),
+        "building OpenAI HTTP client"
+    );
     Client::builder()
         .timeout(timeout)
         .build()

@@ -6,6 +6,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Runtime, State};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
+use tracing::{debug, error, info, warn};
 
 pub const DEFAULT_SHORTCUT: &str = "Alt+Space";
 pub const EVENT_HOTKEY_CONFIG_CHANGED: &str = "voice://hotkey-config-changed";
@@ -192,12 +193,17 @@ impl Default for HotkeyService {
 
 impl HotkeyService {
     pub fn new() -> Self {
+        debug!("hotkey service initialized");
         Self {
             state: Arc::new(Mutex::new(HotkeyRuntimeState::default())),
         }
     }
 
     pub fn register_default_shortcut<R: Runtime>(&self, app: &AppHandle<R>) -> Result<(), String> {
+        info!(
+            shortcut = DEFAULT_SHORTCUT,
+            "registering default hotkey shortcut"
+        );
         self.apply_config(app, HotkeyConfig::default()).map(|_| ())
     }
 
@@ -217,7 +223,10 @@ impl HotkeyService {
 
     pub fn acknowledge_transition(&self, transition: RecordingTransition, success: bool) {
         if let Ok(mut state) = self.state.lock() {
+            debug!(?transition, success, "acknowledging hotkey transition");
             state.acknowledge_transition(transition, success);
+        } else {
+            error!("hotkey state lock poisoned while acknowledging transition");
         }
     }
 
@@ -232,7 +241,10 @@ impl HotkeyService {
         let payload = {
             let mut state = match self.state.lock() {
                 Ok(state) => state,
-                Err(_) => return false,
+                Err(_) => {
+                    error!("hotkey state lock poisoned while forcing stop");
+                    return false;
+                }
             };
 
             let was_active = state.is_recording
@@ -240,6 +252,7 @@ impl HotkeyService {
                 || !state.pending_transitions.is_empty();
 
             if !was_active {
+                debug!("force stop requested while not recording");
                 return false;
             }
 
@@ -256,7 +269,14 @@ impl HotkeyService {
             }
         };
 
-        let _ = app.emit(EVENT_RECORDING_STATE_CHANGED, &payload);
+        info!(
+            mode = ?payload.mode,
+            shortcut = %payload.shortcut,
+            "forced hotkey recording stop"
+        );
+        if let Err(error) = app.emit(EVENT_RECORDING_STATE_CHANGED, &payload) {
+            warn!(%error, "failed to emit recording state change after force stop");
+        }
         true
     }
 
@@ -265,6 +285,11 @@ impl HotkeyService {
         app: &AppHandle<R>,
         config: HotkeyConfig,
     ) -> Result<HotkeyConfig, String> {
+        info!(
+            shortcut = %config.shortcut,
+            mode = ?config.mode,
+            "applying hotkey configuration"
+        );
         let service = self.clone();
         apply_config_with_registrar(
             &self.state,
@@ -290,12 +315,21 @@ impl HotkeyService {
         let event_payload = {
             let mut state = match self.state.lock() {
                 Ok(state) => state,
-                Err(_) => return,
+                Err(_) => {
+                    error!("hotkey state lock poisoned while handling shortcut event");
+                    return;
+                }
             };
 
             let transition = match state.apply_shortcut_event(shortcut_state) {
                 Some(transition) => transition,
-                None => return,
+                None => {
+                    debug!(
+                        ?shortcut_state,
+                        "ignoring shortcut event with no state transition"
+                    );
+                    return;
+                }
             };
 
             RecordingStateChangedEvent {
@@ -307,14 +341,28 @@ impl HotkeyService {
             }
         };
 
-        let _ = app.emit(EVENT_RECORDING_STATE_CHANGED, &event_payload);
+        info!(
+            transition = ?event_payload.transition,
+            trigger = ?event_payload.trigger,
+            mode = ?event_payload.mode,
+            is_recording = event_payload.is_recording,
+            shortcut = %event_payload.shortcut,
+            "hotkey transition emitted"
+        );
+        if let Err(error) = app.emit(EVENT_RECORDING_STATE_CHANGED, &event_payload) {
+            warn!(%error, "failed to emit recording state change event");
+        }
 
         match event_payload.transition {
             RecordingTransition::Started => {
-                let _ = app.emit(EVENT_RECORDING_STARTED, &event_payload);
+                if let Err(error) = app.emit(EVENT_RECORDING_STARTED, &event_payload) {
+                    warn!(%error, "failed to emit recording started event");
+                }
             }
             RecordingTransition::Stopped => {
-                let _ = app.emit(EVENT_RECORDING_STOPPED, &event_payload);
+                if let Err(error) = app.emit(EVENT_RECORDING_STOPPED, &event_payload) {
+                    warn!(%error, "failed to emit recording stopped event");
+                }
             }
         }
     }
@@ -333,6 +381,11 @@ where
     FE: FnMut(&HotkeyConfig),
 {
     let next_config = normalize_config(config);
+    debug!(
+        shortcut = %next_config.shortcut,
+        mode = ?next_config.mode,
+        "normalized hotkey configuration"
+    );
     validate_shortcut(&next_config.shortcut)?;
 
     let current_shortcut = {
@@ -344,6 +397,10 @@ where
         .as_deref()
         .is_some_and(|registered| shortcuts_match(registered, next_config.shortcut.as_str()))
     {
+        debug!(
+            shortcut = %next_config.shortcut,
+            "hotkey already registered; updating mode only"
+        );
         let mut state = state.lock().map_err(|_| lock_error())?;
         state.config = next_config.clone();
         drop(state);
@@ -354,12 +411,18 @@ where
     let previous_shortcut = current_shortcut.clone();
 
     if let Some(registered_shortcut) = current_shortcut {
+        debug!(shortcut = %registered_shortcut, "unregistering previous hotkey shortcut");
         unregister_shortcut(registered_shortcut.as_str()).map_err(|error| {
             format!("Failed to unregister hotkey `{registered_shortcut}`: {error}")
         })?;
     }
 
     if let Err(error) = register_shortcut(next_config.shortcut.as_str()) {
+        warn!(
+            shortcut = %next_config.shortcut,
+            %error,
+            "failed to register new hotkey shortcut; attempting rollback"
+        );
         let register_error = error;
         let mut restore_error: Option<String> = None;
 
@@ -395,6 +458,11 @@ where
         state.pending_transitions.clear();
     }
 
+    info!(
+        shortcut = %next_config.shortcut,
+        mode = ?next_config.mode,
+        "hotkey configuration applied"
+    );
     emit_config_changed(&next_config);
     Ok(next_config)
 }
@@ -489,7 +557,9 @@ fn format_registration_failure(
 }
 
 fn emit_hotkey_config_changed<R: Runtime>(app: &AppHandle<R>, config: &HotkeyConfig) {
-    let _ = app.emit(EVENT_HOTKEY_CONFIG_CHANGED, config);
+    if let Err(error) = app.emit(EVENT_HOTKEY_CONFIG_CHANGED, config) {
+        warn!(%error, "failed to emit hotkey config changed event");
+    }
 }
 
 fn lock_error() -> String {

@@ -6,6 +6,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, Runtime};
+use tracing::{debug, info};
 
 pub const DEFAULT_HOTKEY_SHORTCUT: &str = "Alt+Space";
 pub const RECORDING_MODE_HOLD_TO_TALK: &str = "hold_to_talk";
@@ -105,6 +106,7 @@ pub struct SettingsStore {
 
 impl SettingsStore {
     pub fn new() -> Self {
+        debug!("settings store initialized");
         Self {
             settings: RwLock::new(VoiceSettings::default()),
         }
@@ -119,6 +121,7 @@ impl SettingsStore {
 
     pub fn load<R: Runtime>(&self, app: &AppHandle<R>) -> Result<VoiceSettings, String> {
         let settings_path = self.settings_path(app)?;
+        debug!(path = %settings_path.display(), "loading settings from disk");
         self.load_from_path(&settings_path)
     }
 
@@ -128,6 +131,7 @@ impl SettingsStore {
         update: VoiceSettingsUpdate,
     ) -> Result<VoiceSettings, String> {
         let settings_path = self.settings_path(app)?;
+        debug!(path = %settings_path.display(), "updating settings on disk");
         self.update_at_path(&settings_path, update)
     }
 
@@ -164,6 +168,7 @@ impl SettingsStore {
 
 fn read_settings_file(settings_path: &Path) -> Result<VoiceSettings, String> {
     if !settings_path.exists() {
+        info!(path = %settings_path.display(), "settings file missing; using defaults");
         return Ok(VoiceSettings::default());
     }
 
@@ -203,6 +208,12 @@ fn write_settings_file(settings_path: &Path, settings: &VoiceSettings) -> Result
         )
     })?;
 
+    info!(
+        path = %settings_path.display(),
+        recording_mode = %settings.recording_mode,
+        auto_insert = settings.auto_insert,
+        "settings file written"
+    );
     Ok(())
 }
 

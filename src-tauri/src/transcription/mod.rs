@@ -4,6 +4,7 @@ use std::{fmt, sync::Arc};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -79,6 +80,10 @@ impl fmt::Debug for TranscriptionOrchestrator {
 
 impl TranscriptionOrchestrator {
     pub fn new(active_provider: Arc<dyn TranscriptionProvider>) -> Self {
+        info!(
+            provider = active_provider.name(),
+            "transcription orchestrator initialized"
+        );
         Self { active_provider }
     }
 
@@ -92,13 +97,36 @@ impl TranscriptionOrchestrator {
         options: TranscriptionOptions,
     ) -> Result<TranscriptionResult, TranscriptionError> {
         if audio_data.is_empty() {
+            warn!("rejecting empty transcription payload");
             return Err(TranscriptionError::Provider(
                 "Audio payload is empty".to_string(),
             ));
         }
 
-        let mut result = self.active_provider.transcribe(audio_data, options).await?;
+        debug!(
+            provider = self.active_provider.name(),
+            audio_bytes = audio_data.len(),
+            "dispatching transcription request"
+        );
+        let mut result = self
+            .active_provider
+            .transcribe(audio_data, options)
+            .await
+            .map_err(|error| {
+                error!(
+                    provider = self.active_provider.name(),
+                    error = %error,
+                    "transcription provider call failed"
+                );
+                error
+            })?;
         result.text = normalize_transcript_text(&result.text);
+        info!(
+            provider = self.active_provider.name(),
+            transcript_chars = result.text.chars().count(),
+            language = ?result.language,
+            "transcription request completed"
+        );
         Ok(result)
     }
 }

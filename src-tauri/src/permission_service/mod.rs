@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 
 const MICROPHONE_SETTINGS_URL: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
@@ -49,6 +50,7 @@ pub struct PermissionService;
 
 impl PermissionService {
     pub fn new() -> Self {
+        debug!("permission service initialized");
         Self
     }
 
@@ -59,6 +61,8 @@ impl PermissionService {
     }
 
     pub fn microphone_permission(&self) -> PermissionState {
+        debug!("microphone permission check requested");
+
         #[cfg(target_os = "macos")]
         {
             return macos::microphone_permission();
@@ -71,6 +75,8 @@ impl PermissionService {
     }
 
     pub fn accessibility_permission(&self) -> PermissionState {
+        debug!("accessibility permission check requested");
+
         #[cfg(target_os = "macos")]
         {
             return macos::accessibility_permission();
@@ -86,6 +92,8 @@ impl PermissionService {
         &self,
         permission_type: PermissionType,
     ) -> Result<PermissionSnapshot, String> {
+        debug!(?permission_type, "permission request initiated");
+
         #[cfg(target_os = "macos")]
         {
             match permission_type {

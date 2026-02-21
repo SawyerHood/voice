@@ -7,6 +7,7 @@ use std::{
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
+use tracing::{debug, info};
 use uuid::Uuid;
 
 const HISTORY_FILE_NAME: &str = "transcript_history.json";
@@ -55,7 +56,9 @@ impl HistoryStore {
             .app_data_dir()
             .map_err(|error| format!("Failed to resolve app data directory: {error}"))?;
 
-        Self::new_with_file_path(app_data_dir.join(HISTORY_FILE_NAME))
+        let file_path = app_data_dir.join(HISTORY_FILE_NAME);
+        debug!(path = %file_path.display(), "initializing history store");
+        Self::new_with_file_path(file_path)
     }
 
     pub fn new_with_file_path(file_path: PathBuf) -> Result<Self, String> {
@@ -68,6 +71,12 @@ impl HistoryStore {
 
     pub fn add_entry(&self, entry: HistoryEntry) -> Result<(), String> {
         validate_entry(&entry)?;
+        debug!(
+            entry_id = %entry.id,
+            provider = %entry.provider,
+            chars = entry.text.chars().count(),
+            "adding history entry"
+        );
 
         let _guard = self
             .io_lock
@@ -85,6 +94,7 @@ impl HistoryStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        debug!(limit, offset, "listing history entries");
 
         let _guard = self
             .io_lock
@@ -97,6 +107,7 @@ impl HistoryStore {
     }
 
     pub fn get_entry(&self, id: &str) -> Result<Option<HistoryEntry>, String> {
+        debug!(id, "fetching history entry");
         let _guard = self
             .io_lock
             .lock()
@@ -107,6 +118,7 @@ impl HistoryStore {
     }
 
     pub fn delete_entry(&self, id: &str) -> Result<bool, String> {
+        info!(id, "deleting history entry");
         let _guard = self
             .io_lock
             .lock()
@@ -125,6 +137,7 @@ impl HistoryStore {
     }
 
     pub fn clear_history(&self) -> Result<(), String> {
+        info!("clearing history entries");
         let _guard = self
             .io_lock
             .lock()
@@ -171,6 +184,7 @@ fn ensure_history_file(file_path: &Path) -> Result<(), String> {
     if !file_path.exists() {
         fs::write(file_path, "[]")
             .map_err(|error| format!("Failed to initialize history file: {error}"))?;
+        info!(path = %file_path.display(), "created history file");
     }
 
     Ok(())
