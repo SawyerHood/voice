@@ -556,6 +556,11 @@ fn resolve_realtime_endpoint(endpoint: &str, model: &str) -> Result<String, Tran
         url.query_pairs_mut().append_pair("model", model);
     }
 
+    let has_intent = url.query_pairs().any(|(key, _)| key == "intent");
+    if !has_intent {
+        url.query_pairs_mut().append_pair("intent", "transcription");
+    }
+
     Ok(url.to_string())
 }
 
@@ -848,7 +853,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_realtime_endpoint_appends_model_query_parameter() {
+    fn resolve_realtime_endpoint_appends_model_and_intent_query_parameters() {
         let endpoint = "wss://api.openai.com/v1/realtime";
         let resolved = resolve_realtime_endpoint(endpoint, "gpt-realtime")
             .expect("endpoint should parse and include model query");
@@ -858,6 +863,24 @@ mod tests {
             .find(|(key, _)| key == "model")
             .map(|(_, value)| value.to_string());
         assert_eq!(model.as_deref(), Some("gpt-realtime"));
+        let intent = parsed
+            .query_pairs()
+            .find(|(key, _)| key == "intent")
+            .map(|(_, value)| value.to_string());
+        assert_eq!(intent.as_deref(), Some("transcription"));
+    }
+
+    #[test]
+    fn resolve_realtime_endpoint_preserves_existing_intent() {
+        let endpoint = "wss://api.openai.com/v1/realtime?intent=conversation";
+        let resolved = resolve_realtime_endpoint(endpoint, "gpt-realtime")
+            .expect("endpoint should parse");
+        let parsed = Url::parse(&resolved).expect("resolved endpoint should be valid URL");
+        let intent = parsed
+            .query_pairs()
+            .find(|(key, _)| key == "intent")
+            .map(|(_, value)| value.to_string());
+        assert_eq!(intent.as_deref(), Some("conversation"));
     }
 
     #[test]
