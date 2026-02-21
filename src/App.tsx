@@ -242,8 +242,16 @@ function StatusView({
       ) : null}
 
       <section className={`status-card status-${status}`}>
-        <p className="status-label">{STATUS_LABEL[status]}</p>
-        <p className="status-description">{statusDescription}</p>
+        <div className="status-dot" />
+        <div className="status-text-group">
+          <p className="status-label">{STATUS_LABEL[status]}</p>
+          <p className="status-description">{statusDescription}</p>
+          {status === "transcribing" ? (
+            <div className="transcribing-bar">
+              <div className="transcribing-bar-fill" />
+            </div>
+          ) : null}
+        </div>
       </section>
 
       <section className="audio-level-card">
@@ -506,8 +514,8 @@ function App() {
         {activeTab === "settings" ? <Settings /> : null}
       </section>
 
-      <p className="backend-sync">
-        Backend sync: {backendSynced ? "connected" : "frontend-only fallback"}
+      <p className={`backend-sync ${backendSynced ? "backend-sync-ok" : ""}`}>
+        {backendSynced ? "" : "Backend: frontend-only fallback"}
       </p>
     </main>
   );

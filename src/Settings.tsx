@@ -399,7 +399,12 @@ export default function Settings() {
               autoComplete="off"
               spellCheck={false}
             />
+            <p className="field-description">
+              Leave blank for auto-detection, or enter an ISO code (e.g. en, ja, fr).
+            </p>
           </label>
+
+          <hr className="settings-section-separator" />
 
           <label className="settings-field checkbox-field">
             <span className="field-label">Auto Insert</span>
@@ -418,6 +423,8 @@ export default function Settings() {
               onChange={(event) => setLaunchAtLogin(event.currentTarget.checked)}
             />
           </label>
+
+          <hr className="settings-section-separator" />
 
           <div className="settings-field">
             <span className="field-label">OpenAI API Key</span>

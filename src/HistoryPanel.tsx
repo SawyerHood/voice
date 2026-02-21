@@ -222,9 +222,10 @@ function HistoryPanel({ refreshSignal = 0 }: HistoryPanelProps) {
       <div className="history-list" role="list">
         {!isLoading && entries.length === 0 ? (
           <div className="history-empty">
-            <p className="history-empty-title">No transcript history yet</p>
+            <div className="history-empty-icon" aria-hidden="true">📝</div>
+            <p className="history-empty-title">No transcripts yet</p>
             <p className="history-empty-description">
-              Once you capture audio, transcripts will appear here for quick reuse.
+              Press your hotkey to record — transcripts will appear here.
             </p>
           </div>
         ) : null}
