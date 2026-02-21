@@ -319,12 +319,12 @@ export default function Settings() {
           <div className="space-y-1.5">
             <Label className="text-xs">Microphone</Label>
             <div className="flex gap-2">
-              <Select value={microphoneId} onValueChange={setMicrophoneId}>
+              <Select value={microphoneId || "__default__"} onValueChange={(v) => setMicrophoneId(v === "__default__" ? "" : v)}>
                 <SelectTrigger className="h-8 flex-1 text-xs">
                   <SelectValue placeholder="System Default" />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="">System Default</SelectItem>
+                  <SelectItem value="__default__">System Default</SelectItem>
                   {microphones.map((device) => (
                     <SelectItem key={device.id} value={device.id}>
                       {formatMicrophoneLabel(device)}
