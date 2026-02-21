@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import HistoryPanel from "./HistoryPanel";
+import Settings from "./Settings";
 import "./App.css";
 
 type AppStatus = "idle" | "listening" | "transcribing" | "error";
@@ -86,17 +87,6 @@ function StatusView({ audioLevel, lastTranscript, status, statusDescription }: S
         </p>
       </section>
     </div>
-  );
-}
-
-function SettingsPlaceholder() {
-  return (
-    <section className="settings-placeholder-card">
-      <p className="card-title">Settings</p>
-      <p className="settings-placeholder-text">
-        Settings controls are being wired into this tab.
-      </p>
-    </section>
   );
 }
 
@@ -223,7 +213,7 @@ function App() {
           />
         ) : null}
         {activeTab === "history" ? <HistoryPanel /> : null}
-        {activeTab === "settings" ? <SettingsPlaceholder /> : null}
+        {activeTab === "settings" ? <Settings /> : null}
       </section>
 
       <p className="backend-sync">
