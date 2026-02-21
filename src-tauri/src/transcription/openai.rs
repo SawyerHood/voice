@@ -1,6 +1,10 @@
 use async_trait::async_trait;
-use reqwest::{multipart, Client, StatusCode};
+use reqwest::{
+    header::{HeaderMap, RETRY_AFTER},
+    multipart, Client, StatusCode,
+};
 use serde::Deserialize;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{
     normalize_transcript_text, TranscriptionError, TranscriptionOptions, TranscriptionProvider,
@@ -9,12 +13,20 @@ use super::{
 
 const DEFAULT_OPENAI_ENDPOINT: &str = "https://api.openai.com/v1/audio/transcriptions";
 const DEFAULT_OPENAI_MODEL: &str = "whisper-1";
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_MAX_RETRIES: u32 = 3;
+const DEFAULT_INITIAL_BACKOFF_MS: u64 = 500;
+const DEFAULT_MAX_BACKOFF_MS: u64 = 5_000;
 
 #[derive(Debug, Clone)]
 pub struct OpenAiTranscriptionConfig {
     pub api_key: Option<String>,
     pub endpoint: String,
     pub model: String,
+    pub request_timeout_secs: u64,
+    pub max_retries: u32,
+    pub retry_initial_backoff_ms: u64,
+    pub retry_max_backoff_ms: u64,
 }
 
 impl Default for OpenAiTranscriptionConfig {
@@ -23,6 +35,10 @@ impl Default for OpenAiTranscriptionConfig {
             api_key: None,
             endpoint: DEFAULT_OPENAI_ENDPOINT.to_string(),
             model: DEFAULT_OPENAI_MODEL.to_string(),
+            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+            max_retries: DEFAULT_MAX_RETRIES,
+            retry_initial_backoff_ms: DEFAULT_INITIAL_BACKOFF_MS,
+            retry_max_backoff_ms: DEFAULT_MAX_BACKOFF_MS,
         }
     }
 }
@@ -40,6 +56,28 @@ impl OpenAiTranscriptionConfig {
             config.endpoint = endpoint;
         }
 
+        if let Some(timeout_secs) = read_u64_env("OPENAI_TRANSCRIPTION_TIMEOUT_SECS") {
+            config.request_timeout_secs = timeout_secs.max(1);
+        }
+
+        if let Some(max_retries) = read_u32_env("OPENAI_TRANSCRIPTION_MAX_RETRIES") {
+            config.max_retries = max_retries;
+        }
+
+        if let Some(initial_backoff_ms) =
+            read_u64_env("OPENAI_TRANSCRIPTION_RETRY_INITIAL_BACKOFF_MS")
+        {
+            config.retry_initial_backoff_ms = initial_backoff_ms.max(1);
+        }
+
+        if let Some(max_backoff_ms) = read_u64_env("OPENAI_TRANSCRIPTION_RETRY_MAX_BACKOFF_MS") {
+            config.retry_max_backoff_ms = max_backoff_ms.max(1);
+        }
+
+        if config.retry_initial_backoff_ms > config.retry_max_backoff_ms {
+            config.retry_initial_backoff_ms = config.retry_max_backoff_ms;
+        }
+
         config
     }
 }
@@ -48,13 +86,19 @@ impl OpenAiTranscriptionConfig {
 pub struct OpenAiTranscriptionProvider {
     client: Client,
     config: OpenAiTranscriptionConfig,
+    jitter_seed: u64,
 }
 
 impl OpenAiTranscriptionProvider {
     pub fn new(config: OpenAiTranscriptionConfig) -> Self {
+        Self::new_with_jitter_seed(config, seed_from_clock())
+    }
+
+    fn new_with_jitter_seed(config: OpenAiTranscriptionConfig, jitter_seed: u64) -> Self {
         Self {
-            client: Client::new(),
+            client: build_client(&config),
             config,
+            jitter_seed,
         }
     }
 
@@ -65,6 +109,68 @@ impl OpenAiTranscriptionProvider {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or(TranscriptionError::MissingApiKey)
+    }
+
+    fn retry_delay(&self, attempt_index: u32, retry_after: Option<Duration>) -> Duration {
+        if let Some(delay) = retry_after {
+            return delay;
+        }
+
+        let growth_factor = 1_u64.checked_shl(attempt_index.min(20)).unwrap_or(u64::MAX);
+        let uncapped_ms = self
+            .config
+            .retry_initial_backoff_ms
+            .saturating_mul(growth_factor);
+        let capped_ms = uncapped_ms.min(self.config.retry_max_backoff_ms).max(1);
+
+        // Equal jitter: spread retries in [base/2, base] to reduce thundering herd while
+        // retaining monotonic growth.
+        let half_ms = capped_ms / 2;
+        let jitter_span_ms = capped_ms.saturating_sub(half_ms);
+        let jitter_offset = if jitter_span_ms == 0 {
+            0
+        } else {
+            self.pseudo_random(attempt_index) % (jitter_span_ms + 1)
+        };
+
+        Duration::from_millis(half_ms.saturating_add(jitter_offset).max(1))
+    }
+
+    fn pseudo_random(&self, attempt_index: u32) -> u64 {
+        let mut state =
+            self.jitter_seed ^ (attempt_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn build_form(
+        &self,
+        audio_data: Vec<u8>,
+        language: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Result<multipart::Form, TranscriptionError> {
+        let mut form = multipart::Form::new()
+            .text("model", self.config.model.clone())
+            .text("response_format", "verbose_json".to_string());
+
+        if let Some(language) = language {
+            form = form.text("language", language.to_string());
+        }
+
+        if let Some(prompt) = prompt {
+            form = form.text("prompt", prompt.to_string());
+        }
+
+        let file_part = multipart::Part::bytes(audio_data)
+            .file_name("audio.wav")
+            .mime_str("audio/wav")
+            .map_err(|error| {
+                TranscriptionError::Provider(format!("Unable to prepare audio upload: {error}"))
+            })?;
+
+        Ok(form.part("file", file_part))
     }
 }
 
@@ -80,57 +186,68 @@ impl TranscriptionProvider for OpenAiTranscriptionProvider {
         options: TranscriptionOptions,
     ) -> Result<TranscriptionResult, TranscriptionError> {
         let api_key = self.api_key()?.to_string();
-        let request_language = normalize_optional_string(options.language.clone());
+        let request_language = normalize_optional_string(options.language);
         let request_prompt = build_prompt(options.prompt, options.context_hint);
+        let request_language_for_payload = request_language.clone();
+        let mut attempt_index = 0;
 
-        let mut form = multipart::Form::new()
-            .text("model", self.config.model.clone())
-            .text("response_format", "verbose_json".to_string());
+        loop {
+            let form = self.build_form(
+                audio_data.clone(),
+                request_language.as_deref(),
+                request_prompt.as_deref(),
+            )?;
 
-        if let Some(language) = request_language.clone() {
-            form = form.text("language", language);
+            let response = self
+                .client
+                .post(&self.config.endpoint)
+                .bearer_auth(&api_key)
+                .multipart(form)
+                .send()
+                .await;
+
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    let transport_error = map_transport_error(error);
+                    if transport_error.retryable && attempt_index < self.config.max_retries {
+                        let delay = self.retry_delay(attempt_index, None);
+                        tokio::time::sleep(delay).await;
+                        attempt_index += 1;
+                        continue;
+                    }
+                    return Err(transport_error.error);
+                }
+            };
+
+            if response.status().is_success() {
+                let response_payload: OpenAiTranscriptionResponse = response
+                    .json()
+                    .await
+                    .map_err(|error| TranscriptionError::InvalidResponse(error.to_string()))?;
+
+                return Ok(TranscriptionResult {
+                    text: normalize_transcript_text(&response_payload.text),
+                    language: response_payload
+                        .language
+                        .or(request_language_for_payload.clone()),
+                    duration_secs: response_payload.duration,
+                    confidence: response_payload
+                        .confidence
+                        .or_else(|| derive_confidence_from_segments(&response_payload.segments)),
+                });
+            }
+
+            let http_error = map_http_error(response).await;
+            if http_error.retryable && attempt_index < self.config.max_retries {
+                let delay = self.retry_delay(attempt_index, http_error.retry_after);
+                tokio::time::sleep(delay).await;
+                attempt_index += 1;
+                continue;
+            }
+
+            return Err(http_error.error);
         }
-
-        if let Some(prompt) = request_prompt {
-            form = form.text("prompt", prompt);
-        }
-
-        let file_part = multipart::Part::bytes(audio_data)
-            .file_name("audio.wav")
-            .mime_str("audio/wav")
-            .map_err(|error| {
-                TranscriptionError::Provider(format!("Unable to prepare audio upload: {error}"))
-            })?;
-
-        form = form.part("file", file_part);
-
-        let response = self
-            .client
-            .post(&self.config.endpoint)
-            .bearer_auth(api_key)
-            .multipart(form)
-            .send()
-            .await
-            .map_err(map_transport_error)?;
-
-        let status = response.status();
-        if !status.is_success() {
-            return Err(map_http_error(status, response).await);
-        }
-
-        let response_payload: OpenAiTranscriptionResponse = response
-            .json()
-            .await
-            .map_err(|error| TranscriptionError::InvalidResponse(error.to_string()))?;
-
-        Ok(TranscriptionResult {
-            text: normalize_transcript_text(&response_payload.text),
-            language: response_payload.language.or(request_language),
-            duration_secs: response_payload.duration,
-            confidence: response_payload
-                .confidence
-                .or_else(|| derive_confidence_from_segments(&response_payload.segments)),
-        })
     }
 }
 
@@ -181,29 +298,55 @@ fn derive_confidence_from_segments(segments: &[OpenAiSegment]) -> Option<f32> {
     Some(avg as f32)
 }
 
-fn map_transport_error(error: reqwest::Error) -> TranscriptionError {
-    if error.is_timeout() || error.is_connect() {
-        return TranscriptionError::Network(error.to_string());
-    }
-
-    TranscriptionError::Provider(error.to_string())
+#[derive(Debug)]
+struct RetryableError {
+    error: TranscriptionError,
+    retryable: bool,
+    retry_after: Option<Duration>,
 }
 
-async fn map_http_error(status: StatusCode, response: reqwest::Response) -> TranscriptionError {
+fn map_transport_error(error: reqwest::Error) -> RetryableError {
+    let retryable = error.is_timeout() || error.is_connect();
+    let mapped = if retryable {
+        TranscriptionError::Network(error.to_string())
+    } else {
+        TranscriptionError::Provider(error.to_string())
+    };
+
+    RetryableError {
+        error: mapped,
+        retryable,
+        retry_after: None,
+    }
+}
+
+async fn map_http_error(response: reqwest::Response) -> RetryableError {
+    let status = response.status();
+    let retry_after = if status == StatusCode::TOO_MANY_REQUESTS {
+        parse_retry_after(response.headers())
+    } else {
+        None
+    };
     let response_body = response.text().await.unwrap_or_default();
     let fallback_message = format!("OpenAI request failed with status {}", status.as_u16());
     let error_message = parse_openai_error_message(&response_body).unwrap_or(fallback_message);
 
-    match status {
+    let mapped = match status {
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
             TranscriptionError::Authentication(error_message)
         }
         StatusCode::TOO_MANY_REQUESTS => TranscriptionError::RateLimited(error_message),
-        StatusCode::REQUEST_TIMEOUT
-        | StatusCode::BAD_GATEWAY
-        | StatusCode::SERVICE_UNAVAILABLE
-        | StatusCode::GATEWAY_TIMEOUT => TranscriptionError::Network(error_message),
+        StatusCode::REQUEST_TIMEOUT => TranscriptionError::Network(error_message),
+        _ if status.is_server_error() => TranscriptionError::Network(error_message),
         _ => TranscriptionError::Provider(error_message),
+    };
+
+    RetryableError {
+        retryable: status == StatusCode::TOO_MANY_REQUESTS
+            || status == StatusCode::REQUEST_TIMEOUT
+            || status.is_server_error(),
+        error: mapped,
+        retry_after,
     }
 }
 
@@ -251,18 +394,81 @@ fn read_non_empty_env(name: &str) -> Option<String> {
     })
 }
 
+fn read_u64_env(name: &str) -> Option<u64> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn read_u32_env(name: &str) -> Option<u32> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<u32>().ok())
+}
+
+fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let header_value = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
+    if header_value.is_empty() {
+        return None;
+    }
+
+    if let Ok(seconds) = header_value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+
+    let retry_at = httpdate::parse_http_date(header_value).ok()?;
+    let now = SystemTime::now();
+    Some(
+        retry_at
+            .duration_since(now)
+            .unwrap_or(Duration::from_secs(0)),
+    )
+}
+
+fn build_client(config: &OpenAiTranscriptionConfig) -> Client {
+    let timeout = Duration::from_secs(config.request_timeout_secs.max(1));
+    Client::builder()
+        .timeout(timeout)
+        .build()
+        .expect("OpenAI client construction should succeed")
+}
+
+fn seed_from_clock() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0xA5A5_A5A5_A5A5_A5A5)
+}
+
 #[cfg(test)]
 mod tests {
     use mockito::Server;
+    use std::time::{Duration, Instant};
 
     use super::*;
 
-    fn provider_for_test(server: &Server, api_key: Option<&str>) -> OpenAiTranscriptionProvider {
-        OpenAiTranscriptionProvider::new(OpenAiTranscriptionConfig {
+    fn config_for_test(server: &Server, api_key: Option<&str>) -> OpenAiTranscriptionConfig {
+        OpenAiTranscriptionConfig {
             api_key: api_key.map(ToString::to_string),
             endpoint: format!("{}/v1/audio/transcriptions", server.url()),
             model: "whisper-1".to_string(),
-        })
+            request_timeout_secs: 5,
+            max_retries: 3,
+            retry_initial_backoff_ms: 10,
+            retry_max_backoff_ms: 50,
+        }
+    }
+
+    fn provider_with_config(config: OpenAiTranscriptionConfig) -> OpenAiTranscriptionProvider {
+        OpenAiTranscriptionProvider::new_with_jitter_seed(config, 42)
+    }
+
+    fn provider_for_test(server: &Server, api_key: Option<&str>) -> OpenAiTranscriptionProvider {
+        provider_with_config(config_for_test(server, api_key))
     }
 
     #[tokio::test]
@@ -333,26 +539,123 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn returns_rate_limit_error_for_429_response() {
+    async fn retries_server_errors_then_returns_success() {
         let mut server = Server::new_async().await;
-        let request_mock = server
+        let server_error_mock = server
             .mock("POST", "/v1/audio/transcriptions")
+            .expect(1)
+            .with_status(500)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":{"message":"Service unavailable"}} "#)
+            .create_async()
+            .await;
+        let success_mock = server
+            .mock("POST", "/v1/audio/transcriptions")
+            .expect(1)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"text":"hello retry"}"#)
+            .create_async()
+            .await;
+
+        let mut config = config_for_test(&server, Some("test-key"));
+        config.max_retries = 2;
+        config.retry_initial_backoff_ms = 80;
+        config.retry_max_backoff_ms = 80;
+        let provider = provider_with_config(config);
+
+        let started_at = Instant::now();
+        let result = provider
+            .transcribe(vec![1, 2, 3], TranscriptionOptions::default())
+            .await
+            .expect("request should succeed");
+        let elapsed = started_at.elapsed();
+
+        server_error_mock.assert_async().await;
+        success_mock.assert_async().await;
+        assert_eq!(result.text, "hello retry");
+        assert!(
+            elapsed >= Duration::from_millis(35),
+            "elapsed {elapsed:?} should include retry backoff",
+        );
+    }
+
+    #[tokio::test]
+    async fn retries_rate_limited_responses_until_retry_limit() {
+        let mut server = Server::new_async().await;
+        let rate_limited_mock = server
+            .mock("POST", "/v1/audio/transcriptions")
+            .expect(3)
             .with_status(429)
             .with_header("content-type", "application/json")
             .with_body(r#"{"error":{"message":"Rate limit exceeded"}} "#)
             .create_async()
             .await;
 
-        let provider = provider_for_test(&server, Some("test-key"));
+        let mut config = config_for_test(&server, Some("test-key"));
+        config.max_retries = 2;
+        config.retry_initial_backoff_ms = 80;
+        config.retry_max_backoff_ms = 80;
+        let provider = provider_with_config(config);
+
+        let started_at = Instant::now();
         let error = provider
             .transcribe(vec![1, 2, 3], TranscriptionOptions::default())
             .await
             .expect_err("request should fail");
+        let elapsed = started_at.elapsed();
 
-        request_mock.assert_async().await;
+        rate_limited_mock.assert_async().await;
         assert_eq!(
             error,
             TranscriptionError::RateLimited("Rate limit exceeded".to_string())
+        );
+        assert!(
+            elapsed >= Duration::from_millis(70),
+            "elapsed {elapsed:?} should include two retry delays",
+        );
+    }
+
+    #[tokio::test]
+    async fn honors_retry_after_header_for_rate_limit_responses() {
+        let mut server = Server::new_async().await;
+        let rate_limited_mock = server
+            .mock("POST", "/v1/audio/transcriptions")
+            .expect(1)
+            .with_status(429)
+            .with_header("retry-after", "1")
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":{"message":"Rate limit exceeded"}} "#)
+            .create_async()
+            .await;
+        let success_mock = server
+            .mock("POST", "/v1/audio/transcriptions")
+            .expect(1)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"text":"retry-after honored"}"#)
+            .create_async()
+            .await;
+
+        let mut config = config_for_test(&server, Some("test-key"));
+        config.max_retries = 1;
+        config.retry_initial_backoff_ms = 1;
+        config.retry_max_backoff_ms = 1;
+        let provider = provider_with_config(config);
+
+        let started_at = Instant::now();
+        let result = provider
+            .transcribe(vec![1, 2, 3], TranscriptionOptions::default())
+            .await
+            .expect("request should succeed after retry");
+        let elapsed = started_at.elapsed();
+
+        rate_limited_mock.assert_async().await;
+        success_mock.assert_async().await;
+        assert_eq!(result.text, "retry-after honored");
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "elapsed {elapsed:?} should include retry-after delay",
         );
     }
 
