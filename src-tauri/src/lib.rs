@@ -23,7 +23,7 @@ use audio_capture_service::{
     AudioCaptureService, AudioInputStreamErrorEvent, MicrophoneInfo, RecordedAudio,
     AUDIO_INPUT_STREAM_ERROR_EVENT,
 };
-use history_store::HistoryStore;
+use history_store::{HistoryEntry, HistoryStore};
 use hotkey_service::{HotkeyService, RecordingTransition};
 use permission_service::PermissionService;
 use serde::Serialize;
@@ -37,12 +37,13 @@ use tauri::{
 use text_insertion_service::TextInsertionService;
 use transcription::openai::{OpenAiTranscriptionConfig, OpenAiTranscriptionProvider};
 use transcription::{TranscriptionOptions, TranscriptionOrchestrator};
-use voice_pipeline::{PipelineError, VoicePipeline, VoicePipelineDelegate};
+use voice_pipeline::{PipelineError, PipelineTranscript, VoicePipeline, VoicePipelineDelegate};
 
 const EVENT_STATUS_CHANGED: &str = "voice://status-changed";
 const EVENT_TRANSCRIPT_READY: &str = "voice://transcript-ready";
 const EVENT_PIPELINE_ERROR: &str = "voice://pipeline-error";
 const AUDIO_STREAM_ERROR_RESET_DELAY_MS: u64 = 1_500;
+const DEFAULT_HISTORY_PAGE_SIZE: usize = 50;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -63,7 +64,6 @@ struct AppServices {
     transcription_orchestrator: TranscriptionOrchestrator,
     text_insertion_service: TextInsertionService,
     _settings_store: SettingsStore,
-    _history_store: HistoryStore,
     _permission_service: PermissionService,
 }
 
@@ -77,7 +77,6 @@ impl Default for AppServices {
             transcription_orchestrator,
             text_insertion_service: TextInsertionService::new(),
             _settings_store: SettingsStore::new(),
-            _history_store: HistoryStore::new(),
             _permission_service: PermissionService::new(),
         }
     }
@@ -197,16 +196,22 @@ impl VoicePipelineDelegate for AppPipelineDelegate {
             .map(|recorded| recorded.wav_bytes)
     }
 
-    async fn transcribe(&self, wav_bytes: Vec<u8>) -> Result<String, String> {
+    async fn transcribe(&self, wav_bytes: Vec<u8>) -> Result<PipelineTranscript, String> {
         let orchestrator = {
             let state = self.app.state::<AppState>();
             state.services.transcription_orchestrator.clone()
         };
+        let provider_name = orchestrator.active_provider_name().to_string();
 
         orchestrator
             .transcribe(wav_bytes, TranscriptionOptions::default())
             .await
-            .map(|transcription| transcription.text)
+            .map(|transcription| PipelineTranscript {
+                text: transcription.text,
+                duration_secs: transcription.duration_secs,
+                language: transcription.language,
+                provider: provider_name,
+            })
             .map_err(|error| error.to_string())
     }
 
@@ -220,6 +225,22 @@ impl VoicePipelineDelegate for AppPipelineDelegate {
             .services
             .text_insertion_service
             .insert_text(transcript)
+    }
+
+    fn save_history_entry(&self, transcript: &PipelineTranscript) -> Result<(), String> {
+        if !self.is_session_active() {
+            return Ok(());
+        }
+
+        let history_store = self.app.state::<HistoryStore>();
+        let entry = HistoryEntry::new(
+            transcript.text.clone(),
+            transcript.duration_secs,
+            transcript.language.clone(),
+            transcript.provider.clone(),
+        );
+
+        history_store.add_entry(entry)
     }
 }
 
@@ -450,6 +471,39 @@ async fn transcribe_audio(
     }
 }
 
+#[tauri::command]
+fn list_history(
+    history_store: tauri::State<'_, HistoryStore>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> Result<Vec<HistoryEntry>, String> {
+    history_store.list_entries(
+        limit.unwrap_or(DEFAULT_HISTORY_PAGE_SIZE),
+        offset.unwrap_or(0),
+    )
+}
+
+#[tauri::command]
+fn get_history_entry(
+    history_store: tauri::State<'_, HistoryStore>,
+    id: String,
+) -> Result<Option<HistoryEntry>, String> {
+    history_store.get_entry(&id)
+}
+
+#[tauri::command]
+fn delete_history_entry(
+    history_store: tauri::State<'_, HistoryStore>,
+    id: String,
+) -> Result<bool, String> {
+    history_store.delete_entry(&id)
+}
+
+#[tauri::command]
+fn clear_history(history_store: tauri::State<'_, HistoryStore>) -> Result<(), String> {
+    history_store.clear_history()
+}
+
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
@@ -496,6 +550,9 @@ pub fn run() {
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
+            let history_store = HistoryStore::new(app.handle()).map_err(std::io::Error::other)?;
+            app.manage(history_store);
 
             app.handle()
                 .plugin(tauri_plugin_global_shortcut::Builder::new().build())?;
@@ -553,6 +610,10 @@ pub fn run() {
             insert_text,
             copy_to_clipboard,
             transcribe_audio,
+            list_history,
+            get_history_entry,
+            delete_history_entry,
+            clear_history,
             hotkey_service::get_hotkey_config,
             hotkey_service::get_hotkey_recording_state,
             hotkey_service::set_hotkey_config

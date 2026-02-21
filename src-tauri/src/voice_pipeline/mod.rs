@@ -33,6 +33,14 @@ pub struct PipelineError {
     pub message: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct PipelineTranscript {
+    pub text: String,
+    pub duration_secs: Option<f64>,
+    pub language: Option<String>,
+    pub provider: String,
+}
+
 #[async_trait]
 pub trait VoicePipelineDelegate: Send + Sync {
     fn set_status(&self, status: AppStatus);
@@ -42,8 +50,11 @@ pub trait VoicePipelineDelegate: Send + Sync {
     fn on_recording_stopped(&self, _success: bool) {}
     fn start_recording(&self) -> Result<(), String>;
     fn stop_recording(&self) -> Result<Vec<u8>, String>;
-    async fn transcribe(&self, wav_bytes: Vec<u8>) -> Result<String, String>;
+    async fn transcribe(&self, wav_bytes: Vec<u8>) -> Result<PipelineTranscript, String>;
     fn insert_text(&self, transcript: &str) -> Result<(), String>;
+    fn save_history_entry(&self, _transcript: &PipelineTranscript) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -103,12 +114,16 @@ impl VoicePipeline {
             }
         };
 
-        delegate.emit_transcript(&transcript);
+        delegate.emit_transcript(&transcript.text);
 
-        if let Err(message) = delegate.insert_text(&transcript) {
+        if let Err(message) = delegate.insert_text(&transcript.text) {
             self.handle_error(delegate, PipelineErrorStage::TextInsertion, message)
                 .await;
             return;
+        }
+
+        if let Err(message) = delegate.save_history_entry(&transcript) {
+            eprintln!("Failed to persist transcript history entry: {message}");
         }
 
         delegate.set_status(AppStatus::Idle);
@@ -147,12 +162,14 @@ mod tests {
     struct MockDelegate {
         start_result: Result<(), String>,
         stop_result: Result<Vec<u8>, String>,
-        transcribe_result: Result<String, String>,
+        transcribe_result: Result<PipelineTranscript, String>,
         insert_result: Result<(), String>,
+        save_history_result: Result<(), String>,
         start_acknowledgements: Mutex<Vec<bool>>,
         stop_acknowledgements: Mutex<Vec<bool>>,
         statuses: Mutex<Vec<AppStatus>>,
         transcripts: Mutex<Vec<String>>,
+        saved_history: Mutex<Vec<PipelineTranscript>>,
         errors: Mutex<Vec<PipelineError>>,
         call_order: Mutex<Vec<&'static str>>,
     }
@@ -162,12 +179,19 @@ mod tests {
             Self {
                 start_result: Ok(()),
                 stop_result: Ok(vec![1, 2, 3]),
-                transcribe_result: Ok("hello world".to_string()),
+                transcribe_result: Ok(PipelineTranscript {
+                    text: "hello world".to_string(),
+                    duration_secs: Some(2.4),
+                    language: Some("en".to_string()),
+                    provider: "openai".to_string(),
+                }),
                 insert_result: Ok(()),
+                save_history_result: Ok(()),
                 start_acknowledgements: Mutex::new(Vec::new()),
                 stop_acknowledgements: Mutex::new(Vec::new()),
                 statuses: Mutex::new(Vec::new()),
                 transcripts: Mutex::new(Vec::new()),
+                saved_history: Mutex::new(Vec::new()),
                 errors: Mutex::new(Vec::new()),
                 call_order: Mutex::new(Vec::new()),
             }
@@ -193,6 +217,13 @@ mod tests {
             self.errors
                 .lock()
                 .expect("error lock should not be poisoned")
+                .clone()
+        }
+
+        fn saved_history(&self) -> Vec<PipelineTranscript> {
+            self.saved_history
+                .lock()
+                .expect("saved-history lock should not be poisoned")
                 .clone()
         }
 
@@ -271,7 +302,7 @@ mod tests {
             self.stop_result.clone()
         }
 
-        async fn transcribe(&self, _wav_bytes: Vec<u8>) -> Result<String, String> {
+        async fn transcribe(&self, _wav_bytes: Vec<u8>) -> Result<PipelineTranscript, String> {
             self.call_order
                 .lock()
                 .expect("call-order lock should not be poisoned")
@@ -285,6 +316,18 @@ mod tests {
                 .expect("call-order lock should not be poisoned")
                 .push("insert_text");
             self.insert_result.clone()
+        }
+
+        fn save_history_entry(&self, transcript: &PipelineTranscript) -> Result<(), String> {
+            self.call_order
+                .lock()
+                .expect("call-order lock should not be poisoned")
+                .push("save_history_entry");
+            self.saved_history
+                .lock()
+                .expect("saved-history lock should not be poisoned")
+                .push(transcript.clone());
+            self.save_history_result.clone()
         }
     }
 
@@ -334,7 +377,12 @@ mod tests {
 
         assert_eq!(
             delegate.call_order(),
-            vec!["stop_recording", "transcribe", "insert_text"]
+            vec![
+                "stop_recording",
+                "transcribe",
+                "insert_text",
+                "save_history_entry"
+            ]
         );
         assert!(delegate.start_acknowledgements().is_empty());
         assert_eq!(delegate.stop_acknowledgements(), vec![true]);
@@ -343,6 +391,15 @@ mod tests {
             vec![AppStatus::Transcribing, AppStatus::Idle]
         );
         assert_eq!(delegate.transcripts(), vec!["hello world".to_string()]);
+        assert_eq!(
+            delegate.saved_history(),
+            vec![PipelineTranscript {
+                text: "hello world".to_string(),
+                duration_secs: Some(2.4),
+                language: Some("en".to_string()),
+                provider: "openai".to_string(),
+            }]
+        );
         assert!(delegate.errors().is_empty());
     }
 
@@ -371,6 +428,7 @@ mod tests {
             }]
         );
         assert!(delegate.transcripts().is_empty());
+        assert!(delegate.saved_history().is_empty());
     }
 
     #[tokio::test]
@@ -398,6 +456,33 @@ mod tests {
             }]
         );
         assert!(delegate.transcripts().is_empty());
+        assert!(delegate.saved_history().is_empty());
+    }
+
+    #[tokio::test]
+    async fn hotkey_stop_history_persist_failure_does_not_fail_pipeline() {
+        let pipeline = VoicePipeline::new(Duration::ZERO);
+        let delegate = MockDelegate {
+            save_history_result: Err("disk full".to_string()),
+            ..MockDelegate::default()
+        };
+
+        pipeline.handle_hotkey_stopped(&delegate).await;
+
+        assert_eq!(
+            delegate.call_order(),
+            vec![
+                "stop_recording",
+                "transcribe",
+                "insert_text",
+                "save_history_entry"
+            ]
+        );
+        assert_eq!(
+            delegate.statuses(),
+            vec![AppStatus::Transcribing, AppStatus::Idle]
+        );
+        assert!(delegate.errors().is_empty());
     }
 
     #[tokio::test]

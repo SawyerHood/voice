@@ -28,6 +28,8 @@ async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 tokio = { version = "1", features = ["sync", "time"] }
 httpdate = "1"
+chrono = "0.4"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 mockito = "1"
