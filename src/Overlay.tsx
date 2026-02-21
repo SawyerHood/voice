@@ -45,14 +45,27 @@ function Overlay() {
     };
 
     const applyStatus = (nextStatus: AppStatus) => {
+      const previousStatus = statusRef.current;
       statusRef.current = nextStatus;
       setStatus(nextStatus);
 
       if (nextStatus === "listening") {
+        if (previousStatus !== "listening") {
+          resetHistory();
+        }
+
         if (startedAtRef.current === null) {
           startedAtRef.current = Date.now();
           setElapsedMs(0);
         }
+        return;
+      }
+
+      if (nextStatus === "transcribing") {
+        if (startedAtRef.current !== null) {
+          setElapsedMs(Date.now() - startedAtRef.current);
+        }
+        resetHistory();
         return;
       }
 
@@ -131,22 +144,40 @@ function Overlay() {
     };
   }, [status]);
 
+  const isListening = status === "listening";
+  const isTranscribing = status === "transcribing";
+
   return (
     <main className="overlay-root">
-      <section className={`overlay-pill ${status === "listening" ? "active" : ""}`}>
+      <section
+        className={`overlay-pill ${isListening ? "active" : ""} ${
+          isTranscribing ? "transcribing" : ""
+        }`}
+      >
         <span className="recording-indicator" aria-hidden="true">
           <span className="recording-dot" />
         </span>
 
-        <div className="overlay-waveform" aria-hidden="true">
-          {audioHistory.map((level, index) => (
-            <span
-              key={index}
-              className="overlay-waveform-bar"
-              style={{ "--level": level } as CSSProperties}
-            />
-          ))}
-        </div>
+        {isTranscribing ? (
+          <div className="overlay-loading" role="status" aria-live="polite">
+            <span className="overlay-loading-label">Transcribing</span>
+            <span className="overlay-loading-dots" aria-hidden="true">
+              <span />
+              <span />
+              <span />
+            </span>
+          </div>
+        ) : (
+          <div className="overlay-waveform" aria-hidden="true">
+            {audioHistory.map((level, index) => (
+              <span
+                key={index}
+                className="overlay-waveform-bar"
+                style={{ "--level": level } as CSSProperties}
+              />
+            ))}
+          </div>
+        )}
 
         <p className="overlay-elapsed">{formatElapsedLabel(elapsedMs)}</p>
       </section>

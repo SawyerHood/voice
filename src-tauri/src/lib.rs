@@ -589,7 +589,7 @@ fn emit_pipeline_error_event(app: &AppHandle, error: &PipelineError) {
 }
 
 fn should_show_overlay_for_status(status: AppStatus) -> bool {
-    status == AppStatus::Listening
+    matches!(status, AppStatus::Listening | AppStatus::Transcribing)
 }
 
 fn overlay_position_from_work_area(
@@ -2532,10 +2532,10 @@ mod tests {
     }
 
     #[test]
-    fn overlay_is_only_visible_while_listening() {
+    fn overlay_is_visible_while_listening_or_transcribing() {
         assert!(should_show_overlay_for_status(AppStatus::Listening));
+        assert!(should_show_overlay_for_status(AppStatus::Transcribing));
         assert!(!should_show_overlay_for_status(AppStatus::Idle));
-        assert!(!should_show_overlay_for_status(AppStatus::Transcribing));
         assert!(!should_show_overlay_for_status(AppStatus::Error));
     }
 
