@@ -80,7 +80,6 @@ export default function Settings() {
   const [isSavingSettings, setIsSavingSettings] = useState(false);
   const [isSavingApiKey, setIsSavingApiKey] = useState(false);
   const [isRefreshingMics, setIsRefreshingMics] = useState(false);
-  const [isUpdatingLaunchAtLogin, setIsUpdatingLaunchAtLogin] = useState(false);
   const [isExportingLogs, setIsExportingLogs] = useState(false);
   const [feedback, setFeedback] = useState<SaveFeedback | null>(null);
 
@@ -220,29 +219,6 @@ export default function Settings() {
     setIsRefreshingMics(true);
     await loadMicrophones(true);
     setIsRefreshingMics(false);
-  }
-
-  async function handleLaunchAtLoginToggle(enabled: boolean) {
-    const previous = launchAtLogin;
-    setLaunchAtLogin(enabled);
-    setIsUpdatingLaunchAtLogin(true);
-
-    try {
-      const nextValue = await invoke<boolean>("set_launch_at_login", { enabled });
-      setLaunchAtLogin(nextValue);
-      setFeedback({
-        kind: "success",
-        message: nextValue ? "Launch at login enabled." : "Launch at login disabled.",
-      });
-    } catch (error) {
-      setLaunchAtLogin(previous);
-      setFeedback({
-        kind: "error",
-        message: toErrorMessage(error, "Unable to update launch at login."),
-      });
-    } finally {
-      setIsUpdatingLaunchAtLogin(false);
-    }
   }
 
   async function handleSaveApiKey() {
@@ -439,10 +415,7 @@ export default function Settings() {
             <input
               type="checkbox"
               checked={launchAtLogin}
-              onChange={(event) => {
-                void handleLaunchAtLoginToggle(event.currentTarget.checked);
-              }}
-              disabled={isUpdatingLaunchAtLogin}
+              onChange={(event) => setLaunchAtLogin(event.currentTarget.checked)}
             />
           </label>
 
