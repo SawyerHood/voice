@@ -217,72 +217,25 @@ impl HotkeyService {
         app: &AppHandle<R>,
         config: HotkeyConfig,
     ) -> Result<HotkeyConfig, String> {
-        let next_config = normalize_config(config);
-        validate_shortcut(&next_config.shortcut)?;
-
-        let current_shortcut = {
-            let state = self.state.lock().map_err(|_| lock_error())?;
-            state.registered_shortcut.clone()
-        };
-
-        if current_shortcut
-            .as_deref()
-            .is_some_and(|registered| shortcuts_match(registered, next_config.shortcut.as_str()))
-        {
-            let mut state = self.state.lock().map_err(|_| lock_error())?;
-            state.config = next_config.clone();
-            drop(state);
-            emit_hotkey_config_changed(app, &next_config);
-            return Ok(next_config);
-        }
-
-        let previous_shortcut = current_shortcut.clone();
-
-        if let Some(registered_shortcut) = current_shortcut {
-            app.global_shortcut()
-                .unregister(registered_shortcut.as_str())
-                .map_err(|error| {
-                    format!("Failed to unregister hotkey `{registered_shortcut}`: {error}")
-                })?;
-        }
-
         let service = self.clone();
-        let shortcut_to_register = next_config.shortcut.clone();
-
-        let register_result = app.global_shortcut().on_shortcut(
-            shortcut_to_register.as_str(),
-            move |app, _shortcut, event| {
-                service.handle_shortcut_event(app, event.state);
+        apply_config_with_registrar(
+            &self.state,
+            config,
+            |shortcut| {
+                app.global_shortcut()
+                    .unregister(shortcut)
+                    .map_err(|error| error.to_string())
             },
-        );
-
-        if let Err(error) = register_result {
-            if let Some(previous_shortcut) = previous_shortcut {
-                let restore_service = self.clone();
-                let _ = app.global_shortcut().on_shortcut(
-                    previous_shortcut.as_str(),
-                    move |app, _shortcut, event| {
-                        restore_service.handle_shortcut_event(app, event.state);
-                    },
-                );
-            }
-
-            return Err(format!(
-                "Failed to register global hotkey `{shortcut_to_register}`: {error}"
-            ));
-        }
-
-        {
-            let mut state = self.state.lock().map_err(|_| lock_error())?;
-            state.config = next_config.clone();
-            state.registered_shortcut = Some(next_config.shortcut.clone());
-            state.is_recording = false;
-            state.desired_recording = false;
-            state.pending_transitions.clear();
-        }
-
-        emit_hotkey_config_changed(app, &next_config);
-        Ok(next_config)
+            |shortcut| {
+                let callback_service = service.clone();
+                app.global_shortcut()
+                    .on_shortcut(shortcut, move |app, _shortcut, event| {
+                        callback_service.handle_shortcut_event(app, event.state);
+                    })
+                    .map_err(|error| error.to_string())
+            },
+            |config| emit_hotkey_config_changed(app, config),
+        )
     }
 
     fn handle_shortcut_event<R: Runtime>(&self, app: &AppHandle<R>, shortcut_state: ShortcutState) {
@@ -317,6 +270,78 @@ impl HotkeyService {
             }
         }
     }
+}
+
+fn apply_config_with_registrar<FU, FR, FE>(
+    state: &Arc<Mutex<HotkeyRuntimeState>>,
+    config: HotkeyConfig,
+    mut unregister_shortcut: FU,
+    mut register_shortcut: FR,
+    mut emit_config_changed: FE,
+) -> Result<HotkeyConfig, String>
+where
+    FU: FnMut(&str) -> Result<(), String>,
+    FR: FnMut(&str) -> Result<(), String>,
+    FE: FnMut(&HotkeyConfig),
+{
+    let next_config = normalize_config(config);
+    validate_shortcut(&next_config.shortcut)?;
+
+    let current_shortcut = {
+        let state = state.lock().map_err(|_| lock_error())?;
+        state.registered_shortcut.clone()
+    };
+
+    if current_shortcut
+        .as_deref()
+        .is_some_and(|registered| shortcuts_match(registered, next_config.shortcut.as_str()))
+    {
+        let mut state = state.lock().map_err(|_| lock_error())?;
+        state.config = next_config.clone();
+        drop(state);
+        emit_config_changed(&next_config);
+        return Ok(next_config);
+    }
+
+    let previous_shortcut = current_shortcut.clone();
+
+    if let Some(registered_shortcut) = current_shortcut {
+        unregister_shortcut(registered_shortcut.as_str()).map_err(|error| {
+            format!("Failed to unregister hotkey `{registered_shortcut}`: {error}")
+        })?;
+    }
+
+    if let Err(error) = register_shortcut(next_config.shortcut.as_str()) {
+        let restored_previous = previous_shortcut
+            .as_deref()
+            .is_some_and(|shortcut| register_shortcut(shortcut).is_ok());
+
+        if !restored_previous {
+            if let Ok(mut state) = state.lock() {
+                state.registered_shortcut = None;
+                state.is_recording = false;
+                state.desired_recording = false;
+                state.pending_transitions.clear();
+            }
+        }
+
+        return Err(format!(
+            "Failed to register global hotkey `{}`: {error}",
+            next_config.shortcut
+        ));
+    }
+
+    {
+        let mut state = state.lock().map_err(|_| lock_error())?;
+        state.config = next_config.clone();
+        state.registered_shortcut = Some(next_config.shortcut.clone());
+        state.is_recording = false;
+        state.desired_recording = false;
+        state.pending_transitions.clear();
+    }
+
+    emit_config_changed(&next_config);
+    Ok(next_config)
 }
 
 #[tauri::command]
@@ -392,7 +417,93 @@ fn lock_error() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::{sync::Mutex, time::Duration};
+
+    use async_trait::async_trait;
+
+    use crate::{
+        status_notifier::AppStatus,
+        voice_pipeline::{PipelineError, PipelineErrorStage, VoicePipeline, VoicePipelineDelegate},
+    };
+
     use super::*;
+
+    #[derive(Debug)]
+    struct StartFailurePipelineDelegate {
+        hotkey_state: Mutex<HotkeyRuntimeState>,
+        statuses: Mutex<Vec<AppStatus>>,
+        errors: Mutex<Vec<PipelineError>>,
+    }
+
+    impl StartFailurePipelineDelegate {
+        fn new_with_pending_start() -> Self {
+            let mut hotkey_state = HotkeyRuntimeState::default();
+            hotkey_state.apply_shortcut_event(ShortcutState::Pressed);
+
+            Self {
+                hotkey_state: Mutex::new(hotkey_state),
+                statuses: Mutex::new(Vec::new()),
+                errors: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn statuses(&self) -> Vec<AppStatus> {
+            self.statuses
+                .lock()
+                .expect("status lock should not be poisoned")
+                .clone()
+        }
+
+        fn errors(&self) -> Vec<PipelineError> {
+            self.errors
+                .lock()
+                .expect("error lock should not be poisoned")
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl VoicePipelineDelegate for StartFailurePipelineDelegate {
+        fn set_status(&self, status: AppStatus) {
+            self.statuses
+                .lock()
+                .expect("status lock should not be poisoned")
+                .push(status);
+        }
+
+        fn emit_transcript(&self, _transcript: &str) {}
+
+        fn emit_error(&self, error: &PipelineError) {
+            self.errors
+                .lock()
+                .expect("error lock should not be poisoned")
+                .push(error.clone());
+        }
+
+        fn on_recording_started(&self, success: bool) {
+            let mut hotkey_state = self
+                .hotkey_state
+                .lock()
+                .expect("hotkey state lock should not be poisoned");
+            hotkey_state.acknowledge_transition(RecordingTransition::Started, success);
+        }
+
+        fn start_recording(&self) -> Result<(), String> {
+            Err("microphone unavailable".to_string())
+        }
+
+        fn stop_recording(&self) -> Result<Vec<u8>, String> {
+            panic!("stop should not be called for start failure scenario");
+        }
+
+        async fn transcribe(&self, _wav_bytes: Vec<u8>) -> Result<String, String> {
+            panic!("transcribe should not be called for start failure scenario");
+        }
+
+        fn insert_text(&self, _transcript: &str) -> Result<(), String> {
+            panic!("insert_text should not be called for start failure scenario");
+        }
+    }
 
     #[test]
     fn default_config_is_hold_to_talk_with_option_space() {
@@ -505,5 +616,79 @@ mod tests {
             state.pending_transitions,
             VecDeque::from([RecordingTransition::Stopped])
         );
+    }
+
+    #[tokio::test]
+    async fn pipeline_start_failure_rolls_back_hotkey_state_and_reports_ui_error() {
+        let delegate = StartFailurePipelineDelegate::new_with_pending_start();
+        VoicePipeline::new(Duration::ZERO)
+            .handle_hotkey_started(&delegate)
+            .await;
+
+        let state = delegate
+            .hotkey_state
+            .lock()
+            .expect("hotkey state lock should not be poisoned");
+        assert!(!state.is_recording);
+        assert!(!state.desired_recording);
+        assert!(state.pending_transitions.is_empty());
+
+        assert_eq!(delegate.statuses(), vec![AppStatus::Error, AppStatus::Idle]);
+        assert_eq!(
+            delegate.errors(),
+            vec![PipelineError {
+                stage: PipelineErrorStage::RecordingStart,
+                message: "microphone unavailable".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn re_register_failure_with_restore_failure_clears_shortcut_state() {
+        let state = Arc::new(Mutex::new(HotkeyRuntimeState {
+            config: HotkeyConfig::default(),
+            registered_shortcut: Some(DEFAULT_SHORTCUT.to_string()),
+            is_recording: true,
+            desired_recording: true,
+            pending_transitions: VecDeque::from([RecordingTransition::Started]),
+        }));
+        let mut unregister_attempts = Vec::new();
+        let mut register_attempts = Vec::new();
+        let mut emitted_configs = Vec::new();
+
+        let result = apply_config_with_registrar(
+            &state,
+            HotkeyConfig {
+                shortcut: "Ctrl+Space".to_string(),
+                mode: RecordingMode::Toggle,
+            },
+            |shortcut| {
+                unregister_attempts.push(shortcut.to_string());
+                Ok(())
+            },
+            |shortcut| {
+                register_attempts.push(shortcut.to_string());
+                Err("registration failed".to_string())
+            },
+            |config| emitted_configs.push(config.clone()),
+        );
+
+        let error = result.expect_err("re-register should fail");
+        assert!(error.contains("Failed to register global hotkey `Ctrl+Space`"));
+        assert_eq!(unregister_attempts, vec![DEFAULT_SHORTCUT.to_string()]);
+        assert_eq!(
+            register_attempts,
+            vec!["Ctrl+Space".to_string(), DEFAULT_SHORTCUT.to_string()]
+        );
+        assert!(emitted_configs.is_empty());
+
+        let state = state
+            .lock()
+            .expect("hotkey state lock should not be poisoned");
+        assert_eq!(state.config, HotkeyConfig::default());
+        assert_eq!(state.registered_shortcut, None);
+        assert!(!state.is_recording);
+        assert!(!state.desired_recording);
+        assert!(state.pending_transitions.is_empty());
     }
 }

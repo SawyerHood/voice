@@ -268,19 +268,33 @@ fn parse_audio_stream_error_message(payload: &str) -> String {
         .unwrap_or_else(|| "Microphone stream failed unexpectedly".to_string())
 }
 
-fn handle_audio_input_stream_error(app: &AppHandle, message: String) {
-    let runtime_state = app.state::<PipelineRuntimeState>();
-    runtime_state.begin_session();
+fn handle_audio_input_stream_error_with_hooks<
+    BeginSession,
+    ForceStopRecording,
+    AbortRecording,
+    EmitPipelineError,
+    SetStatus,
+    ScheduleReset,
+>(
+    message: String,
+    mut begin_session: BeginSession,
+    mut force_stop_recording: ForceStopRecording,
+    mut abort_recording: AbortRecording,
+    mut emit_pipeline_error: EmitPipelineError,
+    mut set_status: SetStatus,
+    schedule_reset: ScheduleReset,
+) where
+    BeginSession: FnMut(),
+    ForceStopRecording: FnMut(),
+    AbortRecording: FnMut() -> Result<(), String>,
+    EmitPipelineError: FnMut(&PipelineError),
+    SetStatus: FnMut(AppStatus),
+    ScheduleReset: FnOnce(),
+{
+    begin_session();
+    force_stop_recording();
 
-    let hotkey_service = app.state::<HotkeyService>();
-    hotkey_service.force_stop_recording(app);
-
-    let state = app.state::<AppState>();
-    if let Err(error) = state
-        .services
-        .audio_capture_service
-        .abort_recording(app.clone())
-    {
+    if let Err(error) = abort_recording() {
         eprintln!("Failed to abort recording after stream error: {error}");
     }
 
@@ -288,17 +302,60 @@ fn handle_audio_input_stream_error(app: &AppHandle, message: String) {
         stage: voice_pipeline::PipelineErrorStage::RecordingRuntime,
         message,
     };
-    emit_pipeline_error_event(app, &pipeline_error);
-    set_status_for_state(app, &state, AppStatus::Error);
+    emit_pipeline_error(&pipeline_error);
+    set_status(AppStatus::Error);
+    schedule_reset();
+}
 
+fn handle_audio_input_stream_error(app: &AppHandle, message: String) {
     let reset_app = app.clone();
+    handle_audio_input_stream_error_with_hooks(
+        message,
+        || {
+            let runtime_state = app.state::<PipelineRuntimeState>();
+            runtime_state.begin_session();
+        },
+        || {
+            let hotkey_service = app.state::<HotkeyService>();
+            hotkey_service.force_stop_recording(app);
+        },
+        || {
+            let state = app.state::<AppState>();
+            state
+                .services
+                .audio_capture_service
+                .abort_recording(app.clone())
+                .map(|_| ())
+        },
+        |error| emit_pipeline_error_event(app, error),
+        |status| {
+            let state = app.state::<AppState>();
+            set_status_for_state(app, &state, status);
+        },
+        move || {
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(AUDIO_STREAM_ERROR_RESET_DELAY_MS)).await;
+                let state = reset_app.state::<AppState>();
+                if get_status_from_state(&state) == AppStatus::Error {
+                    set_status_for_state(&reset_app, &state, AppStatus::Idle);
+                }
+            });
+        },
+    );
+}
+
+fn spawn_pipeline_stage_error_reset<D>(
+    pipeline: VoicePipeline,
+    delegate: D,
+    stage: voice_pipeline::PipelineErrorStage,
+    message: String,
+) -> tauri::async_runtime::JoinHandle<()>
+where
+    D: VoicePipelineDelegate + Send + Sync + 'static,
+{
     tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(AUDIO_STREAM_ERROR_RESET_DELAY_MS)).await;
-        let state = reset_app.state::<AppState>();
-        if get_status_from_state(&state) == AppStatus::Error {
-            set_status_for_state(&reset_app, &state, AppStatus::Idle);
-        }
-    });
+        pipeline.handle_stage_error(&delegate, stage, message).await;
+    })
 }
 
 fn register_pipeline_handlers(app: &AppHandle) {
@@ -433,17 +490,12 @@ async fn transcribe_audio(
         Err(error) => {
             let message = error.to_string();
             let delegate = AppPipelineDelegate::new(app.clone());
-            let pipeline_message = message.clone();
-
-            tauri::async_runtime::spawn(async move {
-                VoicePipeline::default()
-                    .handle_stage_error(
-                        &delegate,
-                        voice_pipeline::PipelineErrorStage::Transcription,
-                        pipeline_message,
-                    )
-                    .await;
-            });
+            let _ = spawn_pipeline_stage_error_reset(
+                VoicePipeline::default(),
+                delegate,
+                voice_pipeline::PipelineErrorStage::Transcription,
+                message.clone(),
+            );
 
             Err(message)
         }
@@ -563,7 +615,314 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::PipelineRuntimeState;
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+
+    use async_trait::async_trait;
+    use tokio::sync::{oneshot, Notify};
+
+    use crate::{
+        status_notifier::AppStatus,
+        voice_pipeline::{PipelineError, PipelineErrorStage, VoicePipeline, VoicePipelineDelegate},
+    };
+
+    use super::{
+        handle_audio_input_stream_error_with_hooks, spawn_pipeline_stage_error_reset,
+        PipelineRuntimeState,
+    };
+
+    #[derive(Debug, Default)]
+    struct SessionEventLog {
+        statuses: Mutex<Vec<(u64, AppStatus)>>,
+        transcripts: Mutex<Vec<(u64, String)>>,
+        insertions: Mutex<Vec<(u64, String)>>,
+        errors: Mutex<Vec<(u64, PipelineError)>>,
+    }
+
+    impl SessionEventLog {
+        fn statuses_for(&self, session_id: u64) -> Vec<AppStatus> {
+            self.statuses
+                .lock()
+                .expect("status lock should not be poisoned")
+                .iter()
+                .filter_map(|(id, status)| (*id == session_id).then_some(*status))
+                .collect()
+        }
+
+        fn transcripts(&self) -> Vec<(u64, String)> {
+            self.transcripts
+                .lock()
+                .expect("transcript lock should not be poisoned")
+                .clone()
+        }
+
+        fn insertions(&self) -> Vec<(u64, String)> {
+            self.insertions
+                .lock()
+                .expect("insertion lock should not be poisoned")
+                .clone()
+        }
+
+        fn errors(&self) -> Vec<(u64, PipelineError)> {
+            self.errors
+                .lock()
+                .expect("error lock should not be poisoned")
+                .clone()
+        }
+    }
+
+    #[derive(Debug)]
+    struct SessionAwareDelegate {
+        runtime: PipelineRuntimeState,
+        session_id: u64,
+        event_log: Arc<SessionEventLog>,
+        transcript: String,
+        transcribe_started_tx: Mutex<Option<oneshot::Sender<()>>>,
+        transcribe_blocker: Option<Arc<Notify>>,
+    }
+
+    impl SessionAwareDelegate {
+        fn new(
+            runtime: PipelineRuntimeState,
+            session_id: u64,
+            event_log: Arc<SessionEventLog>,
+            transcript: &str,
+        ) -> Self {
+            Self {
+                runtime,
+                session_id,
+                event_log,
+                transcript: transcript.to_string(),
+                transcribe_started_tx: Mutex::new(None),
+                transcribe_blocker: None,
+            }
+        }
+
+        fn with_transcription_gate(
+            mut self,
+            started_tx: oneshot::Sender<()>,
+            blocker: Arc<Notify>,
+        ) -> Self {
+            self.transcribe_started_tx = Mutex::new(Some(started_tx));
+            self.transcribe_blocker = Some(blocker);
+            self
+        }
+
+        fn is_active(&self) -> bool {
+            self.runtime.is_session_active(self.session_id)
+        }
+    }
+
+    #[async_trait]
+    impl VoicePipelineDelegate for SessionAwareDelegate {
+        fn set_status(&self, status: AppStatus) {
+            if self.is_active() {
+                self.event_log
+                    .statuses
+                    .lock()
+                    .expect("status lock should not be poisoned")
+                    .push((self.session_id, status));
+            }
+        }
+
+        fn emit_transcript(&self, transcript: &str) {
+            if self.is_active() {
+                self.event_log
+                    .transcripts
+                    .lock()
+                    .expect("transcript lock should not be poisoned")
+                    .push((self.session_id, transcript.to_string()));
+            }
+        }
+
+        fn emit_error(&self, error: &PipelineError) {
+            if self.is_active() {
+                self.event_log
+                    .errors
+                    .lock()
+                    .expect("error lock should not be poisoned")
+                    .push((self.session_id, error.clone()));
+            }
+        }
+
+        fn start_recording(&self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn stop_recording(&self) -> Result<Vec<u8>, String> {
+            Ok(vec![1, 2, 3])
+        }
+
+        async fn transcribe(&self, _wav_bytes: Vec<u8>) -> Result<String, String> {
+            if let Some(started_tx) = self
+                .transcribe_started_tx
+                .lock()
+                .expect("transcription gate lock should not be poisoned")
+                .take()
+            {
+                let _ = started_tx.send(());
+            }
+
+            if let Some(blocker) = &self.transcribe_blocker {
+                blocker.notified().await;
+            }
+
+            Ok(self.transcript.clone())
+        }
+
+        fn insert_text(&self, transcript: &str) -> Result<(), String> {
+            if self.is_active() {
+                self.event_log
+                    .insertions
+                    .lock()
+                    .expect("insertion lock should not be poisoned")
+                    .push((self.session_id, transcript.to_string()));
+            }
+
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct TranscriptionFailureDelegate {
+        statuses: Mutex<Vec<AppStatus>>,
+        errors: Mutex<Vec<PipelineError>>,
+        transcripts: Mutex<Vec<String>>,
+        insertions: Mutex<Vec<String>>,
+    }
+
+    impl TranscriptionFailureDelegate {
+        fn statuses(&self) -> Vec<AppStatus> {
+            self.statuses
+                .lock()
+                .expect("status lock should not be poisoned")
+                .clone()
+        }
+
+        fn errors(&self) -> Vec<PipelineError> {
+            self.errors
+                .lock()
+                .expect("error lock should not be poisoned")
+                .clone()
+        }
+
+        fn transcripts(&self) -> Vec<String> {
+            self.transcripts
+                .lock()
+                .expect("transcript lock should not be poisoned")
+                .clone()
+        }
+
+        fn insertions(&self) -> Vec<String> {
+            self.insertions
+                .lock()
+                .expect("insertion lock should not be poisoned")
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl VoicePipelineDelegate for TranscriptionFailureDelegate {
+        fn set_status(&self, status: AppStatus) {
+            self.statuses
+                .lock()
+                .expect("status lock should not be poisoned")
+                .push(status);
+        }
+
+        fn emit_transcript(&self, transcript: &str) {
+            self.transcripts
+                .lock()
+                .expect("transcript lock should not be poisoned")
+                .push(transcript.to_string());
+        }
+
+        fn emit_error(&self, error: &PipelineError) {
+            self.errors
+                .lock()
+                .expect("error lock should not be poisoned")
+                .push(error.clone());
+        }
+
+        fn start_recording(&self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn stop_recording(&self) -> Result<Vec<u8>, String> {
+            Ok(vec![4, 5, 6])
+        }
+
+        async fn transcribe(&self, _wav_bytes: Vec<u8>) -> Result<String, String> {
+            Err("provider unavailable".to_string())
+        }
+
+        fn insert_text(&self, transcript: &str) -> Result<(), String> {
+            self.insertions
+                .lock()
+                .expect("insertion lock should not be poisoned")
+                .push(transcript.to_string());
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct SharedStageErrorDelegate {
+        statuses: Arc<Mutex<Vec<AppStatus>>>,
+        errors: Arc<Mutex<Vec<PipelineError>>>,
+    }
+
+    impl SharedStageErrorDelegate {
+        fn statuses(&self) -> Vec<AppStatus> {
+            self.statuses
+                .lock()
+                .expect("status lock should not be poisoned")
+                .clone()
+        }
+
+        fn errors(&self) -> Vec<PipelineError> {
+            self.errors
+                .lock()
+                .expect("error lock should not be poisoned")
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl VoicePipelineDelegate for SharedStageErrorDelegate {
+        fn set_status(&self, status: AppStatus) {
+            self.statuses
+                .lock()
+                .expect("status lock should not be poisoned")
+                .push(status);
+        }
+
+        fn emit_transcript(&self, _transcript: &str) {}
+
+        fn emit_error(&self, error: &PipelineError) {
+            self.errors
+                .lock()
+                .expect("error lock should not be poisoned")
+                .push(error.clone());
+        }
+
+        fn start_recording(&self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn stop_recording(&self) -> Result<Vec<u8>, String> {
+            Ok(Vec::new())
+        }
+
+        async fn transcribe(&self, _wav_bytes: Vec<u8>) -> Result<String, String> {
+            Ok(String::new())
+        }
+
+        fn insert_text(&self, _transcript: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn later_session_invalidates_previous_session() {
@@ -574,5 +933,213 @@ mod tests {
 
         assert!(!runtime.is_session_active(first));
         assert!(runtime.is_session_active(second));
+    }
+
+    #[tokio::test]
+    async fn overlapping_pipeline_sessions_ignore_stale_mutations() {
+        let runtime = PipelineRuntimeState::default();
+        let pipeline = VoicePipeline::new(Duration::ZERO);
+        let event_log = Arc::new(SessionEventLog::default());
+
+        let first_session_id = runtime.begin_session();
+        let (first_started_tx, first_started_rx) = oneshot::channel();
+        let first_blocker = Arc::new(Notify::new());
+        let first_delegate = SessionAwareDelegate::new(
+            runtime.clone(),
+            first_session_id,
+            Arc::clone(&event_log),
+            "first transcript",
+        )
+        .with_transcription_gate(first_started_tx, Arc::clone(&first_blocker));
+
+        let first_task = {
+            let pipeline = pipeline.clone();
+            tokio::spawn(async move {
+                pipeline.handle_hotkey_stopped(&first_delegate).await;
+            })
+        };
+
+        first_started_rx
+            .await
+            .expect("first pipeline should reach transcription");
+
+        let second_session_id = runtime.begin_session();
+        let second_delegate = SessionAwareDelegate::new(
+            runtime.clone(),
+            second_session_id,
+            Arc::clone(&event_log),
+            "second transcript",
+        );
+
+        pipeline.handle_hotkey_stopped(&second_delegate).await;
+        first_blocker.notify_waiters();
+        first_task
+            .await
+            .expect("first pipeline task should finish cleanly");
+
+        assert_eq!(
+            event_log.statuses_for(first_session_id),
+            vec![AppStatus::Transcribing]
+        );
+        assert_eq!(
+            event_log.statuses_for(second_session_id),
+            vec![AppStatus::Transcribing, AppStatus::Idle]
+        );
+        assert_eq!(
+            event_log.transcripts(),
+            vec![(second_session_id, "second transcript".to_string())]
+        );
+        assert_eq!(
+            event_log.insertions(),
+            vec![(second_session_id, "second transcript".to_string())]
+        );
+        assert!(event_log.errors().is_empty());
+    }
+
+    #[tokio::test]
+    async fn transcription_failure_emits_error_resets_idle_and_skips_insertion() {
+        let pipeline = VoicePipeline::new(Duration::ZERO);
+        let delegate = TranscriptionFailureDelegate::default();
+
+        pipeline.handle_hotkey_stopped(&delegate).await;
+
+        assert_eq!(
+            delegate.statuses(),
+            vec![AppStatus::Transcribing, AppStatus::Error, AppStatus::Idle]
+        );
+        assert_eq!(
+            delegate.errors(),
+            vec![PipelineError {
+                stage: PipelineErrorStage::Transcription,
+                message: "provider unavailable".to_string(),
+            }]
+        );
+        assert!(delegate.transcripts().is_empty());
+        assert!(delegate.insertions().is_empty());
+    }
+
+    #[test]
+    fn stream_error_propagation_aborts_recording_emits_error_and_resets_status() {
+        let call_order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let statuses: Arc<Mutex<Vec<AppStatus>>> = Arc::new(Mutex::new(Vec::new()));
+        let errors: Arc<Mutex<Vec<PipelineError>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let begin_call_order = Arc::clone(&call_order);
+        let stop_call_order = Arc::clone(&call_order);
+        let abort_call_order = Arc::clone(&call_order);
+        let emit_call_order = Arc::clone(&call_order);
+        let status_call_order = Arc::clone(&call_order);
+        let reset_call_order = Arc::clone(&call_order);
+        let status_log = Arc::clone(&statuses);
+        let reset_status_log = Arc::clone(&statuses);
+        let error_log = Arc::clone(&errors);
+
+        handle_audio_input_stream_error_with_hooks(
+            "stream disconnected".to_string(),
+            move || {
+                begin_call_order
+                    .lock()
+                    .expect("call-order lock should not be poisoned")
+                    .push("begin_session");
+            },
+            move || {
+                stop_call_order
+                    .lock()
+                    .expect("call-order lock should not be poisoned")
+                    .push("force_stop_recording");
+            },
+            move || {
+                abort_call_order
+                    .lock()
+                    .expect("call-order lock should not be poisoned")
+                    .push("abort_recording");
+                Ok(())
+            },
+            move |error| {
+                emit_call_order
+                    .lock()
+                    .expect("call-order lock should not be poisoned")
+                    .push("emit_pipeline_error");
+                error_log
+                    .lock()
+                    .expect("error lock should not be poisoned")
+                    .push(error.clone());
+            },
+            move |status| {
+                status_call_order
+                    .lock()
+                    .expect("call-order lock should not be poisoned")
+                    .push("set_status");
+                status_log
+                    .lock()
+                    .expect("status lock should not be poisoned")
+                    .push(status);
+            },
+            move || {
+                reset_call_order
+                    .lock()
+                    .expect("call-order lock should not be poisoned")
+                    .push("schedule_reset");
+                reset_status_log
+                    .lock()
+                    .expect("status lock should not be poisoned")
+                    .push(AppStatus::Idle);
+            },
+        );
+
+        assert_eq!(
+            call_order
+                .lock()
+                .expect("call-order lock should not be poisoned")
+                .clone(),
+            vec![
+                "begin_session",
+                "force_stop_recording",
+                "abort_recording",
+                "emit_pipeline_error",
+                "set_status",
+                "schedule_reset"
+            ]
+        );
+        assert_eq!(
+            statuses
+                .lock()
+                .expect("status lock should not be poisoned")
+                .clone(),
+            vec![AppStatus::Error, AppStatus::Idle]
+        );
+        assert_eq!(
+            errors
+                .lock()
+                .expect("error lock should not be poisoned")
+                .clone(),
+            vec![PipelineError {
+                stage: PipelineErrorStage::RecordingRuntime,
+                message: "stream disconnected".to_string(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn command_path_stage_error_recovery_resets_status_to_idle() {
+        let delegate = SharedStageErrorDelegate::default();
+        let observer = delegate.clone();
+
+        let task = spawn_pipeline_stage_error_reset(
+            VoicePipeline::new(Duration::ZERO),
+            delegate,
+            PipelineErrorStage::Transcription,
+            "command transcription failed".to_string(),
+        );
+        task.await.expect("stage-error task should complete");
+
+        assert_eq!(observer.statuses(), vec![AppStatus::Error, AppStatus::Idle]);
+        assert_eq!(
+            observer.errors(),
+            vec![PipelineError {
+                stage: PipelineErrorStage::Transcription,
+                message: "command transcription failed".to_string(),
+            }]
+        );
     }
 }
