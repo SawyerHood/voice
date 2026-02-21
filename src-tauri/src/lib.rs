@@ -56,8 +56,8 @@ const EVENT_OVERLAY_AUDIO_LEVEL: &str = "voice://overlay-audio-level";
 const AUDIO_STREAM_ERROR_RESET_DELAY_MS: u64 = 1_500;
 const DEFAULT_HISTORY_PAGE_SIZE: usize = 50;
 const OVERLAY_WINDOW_LABEL: &str = "recording-overlay";
-const OVERLAY_WINDOW_WIDTH: f64 = 264.0;
-const OVERLAY_WINDOW_HEIGHT: f64 = 50.0;
+const OVERLAY_WINDOW_WIDTH: f64 = 320.0;
+const OVERLAY_WINDOW_HEIGHT: f64 = 64.0;
 const OVERLAY_WINDOW_TOP_MARGIN: f64 = 12.0;
 
 fn recording_mode_from_settings_value(value: &str) -> Result<RecordingMode, String> {

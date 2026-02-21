@@ -478,7 +478,7 @@ function App() {
   }, [errorMessage, status]);
 
   return (
-    <main className="flex h-screen flex-col overflow-hidden p-3">
+    <main className="flex h-screen flex-col p-3">
       {/* Header */}
       <header className="mb-2 shrink-0">
         <p className="text-[10px] font-medium uppercase tracking-widest text-muted-foreground">
@@ -510,7 +510,7 @@ function App() {
           </TabsTrigger>
         </TabsList>
 
-        <TabsContent value="status" className="mt-0 min-h-0 flex-1 overflow-y-auto">
+        <TabsContent value="status" className="mt-0 flex-1 overflow-y-auto pr-1">
           <StatusView
             audioLevel={audioLevel}
             isRefreshingPermissions={isRefreshingPermissions}
@@ -527,11 +527,11 @@ function App() {
           />
         </TabsContent>
 
-        <TabsContent value="history" className="mt-0 min-h-0 flex-1 overflow-y-auto">
+        <TabsContent value="history" className="mt-0 flex-1 overflow-y-auto pr-1">
           <HistoryPanel refreshSignal={historyRefreshSignal} />
         </TabsContent>
 
-        <TabsContent value="settings" className="mt-0 min-h-0 flex-1 overflow-y-auto">
+        <TabsContent value="settings" className="mt-0 flex-1 overflow-y-auto pr-1">
           <Settings />
         </TabsContent>
       </Tabs>

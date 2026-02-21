@@ -3,7 +3,11 @@ export function clampAudioLevel(value: number): number {
     return 0;
   }
 
-  return Math.max(0, Math.min(1, value));
+  // Raw mic levels are typically 0.0–0.15 for normal speech.
+  // Amplify with gain + sqrt curve so bars are visually responsive.
+  const clamped = Math.max(0, Math.min(1, value));
+  const gained = Math.min(1, clamped * 6);
+  return Math.sqrt(gained);
 }
 
 export function pushAudioLevelHistory(

@@ -27,9 +27,9 @@ body {
 }
 
 .overlay-pill {
-  width: 264px;
-  height: 50px;
-  margin: 0;
+  width: 300px;
+  height: 56px;
+  margin: 4px;
   border-radius: 999px;
   border: 1px solid rgba(255, 255, 255, 0.14);
   background: linear-gradient(135deg, rgba(8, 10, 14, 0.88), rgba(19, 24, 32, 0.78));
@@ -41,7 +41,8 @@ body {
   grid-template-columns: auto 1fr auto;
   align-items: center;
   gap: 12px;
-  padding: 0 14px;
+  padding: 0 18px;
+  box-sizing: border-box;
 }
 
 .overlay-pill.active {
@@ -64,24 +65,25 @@ body {
 }
 
 .overlay-waveform {
-  height: 24px;
+  height: 32px;
   display: grid;
-  align-items: end;
+  align-items: center;
   grid-auto-flow: column;
-  grid-auto-columns: 4px;
+  grid-auto-columns: 3px;
   gap: 2px;
+  overflow: hidden;
 }
 
 .overlay-waveform-bar {
   --level: 0;
-  height: calc(4px + var(--level) * 20px);
+  height: calc(3px + var(--level) * 28px);
   border-radius: 999px;
-  opacity: calc(0.25 + var(--level) * 0.75);
+  opacity: calc(0.3 + var(--level) * 0.7);
   background: linear-gradient(180deg, #ffb6b6, #ff5d6b);
   transition:
-    height 90ms linear,
-    opacity 120ms ease;
-  transform-origin: bottom;
+    height 80ms linear,
+    opacity 100ms ease;
+  transform-origin: center;
 }
 
 .overlay-elapsed {

@@ -1,6 +1,6 @@
-import { type FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Eye, EyeOff, RefreshCw, Download, Save, Key, Trash2 } from "lucide-react";
+import { Eye, EyeOff, RefreshCw, Download, Key, Trash2 } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -75,11 +75,13 @@ function formatMicrophoneLabel(device: MicrophoneInfo): string {
 
 export default function Settings() {
   const [isLoading, setIsLoading] = useState(true);
-  const [isSavingSettings, setIsSavingSettings] = useState(false);
   const [isSavingApiKey, setIsSavingApiKey] = useState(false);
   const [isRefreshingMics, setIsRefreshingMics] = useState(false);
   const [isExportingLogs, setIsExportingLogs] = useState(false);
   const [feedback, setFeedback] = useState<SaveFeedback | null>(null);
+  const [isSavingSettings, setIsSavingSettings] = useState(false);
+  const initialLoadDone = useRef(false);
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [hotkeyShortcut, setHotkeyShortcut] = useState("");
   const [recordingMode, setRecordingMode] = useState<RecordingMode>("hold_to_talk");
@@ -136,6 +138,7 @@ export default function Settings() {
       }
 
       await loadMicrophones(false);
+      initialLoadDone.current = true;
     } catch (error) {
       setFeedback({ kind: "error", message: toErrorMessage(error, "Unable to load settings.") });
     } finally {
@@ -157,35 +160,43 @@ export default function Settings() {
   const canClearApiKey = hasStoredApiKey;
   const canRevealApiKeyDraft = apiKeyDraft.trim().length > 0;
 
-  async function handleSettingsSave(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setIsSavingSettings(true);
+  // Auto-save settings on change with debounce
+  useEffect(() => {
+    if (!initialLoadDone.current) return;
 
-    try {
-      const updatedSettings = await invoke<VoiceSettings>("apply_settings", {
-        update: createSettingsUpdatePayload({
-          hotkeyShortcut: normalizeShortcut(hotkeyShortcut),
-          recordingMode,
-          microphoneId,
-          language,
-          autoInsert,
-          launchAtLogin,
-        }),
-      });
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
 
-      setHotkeyShortcut(updatedSettings.hotkey_shortcut);
-      setRecordingMode(normalizeRecordingMode(updatedSettings.recording_mode));
-      setMicrophoneId(updatedSettings.microphone_id ?? "");
-      setLanguage(updatedSettings.language ?? "");
-      setAutoInsert(updatedSettings.auto_insert);
-      setLaunchAtLogin(updatedSettings.launch_at_login);
-      setFeedback({ kind: "success", message: "Settings saved." });
-    } catch (error) {
-      setFeedback({ kind: "error", message: toErrorMessage(error, "Unable to save settings.") });
-    } finally {
-      setIsSavingSettings(false);
-    }
-  }
+    saveTimerRef.current = setTimeout(async () => {
+      setIsSavingSettings(true);
+      try {
+        const updatedSettings = await invoke<VoiceSettings>("apply_settings", {
+          update: createSettingsUpdatePayload({
+            hotkeyShortcut: normalizeShortcut(hotkeyShortcut),
+            recordingMode,
+            microphoneId,
+            language,
+            autoInsert,
+            launchAtLogin,
+          }),
+        });
+        setHotkeyShortcut(updatedSettings.hotkey_shortcut);
+        setRecordingMode(normalizeRecordingMode(updatedSettings.recording_mode));
+        setMicrophoneId(updatedSettings.microphone_id ?? "");
+        setLanguage(updatedSettings.language ?? "");
+        setAutoInsert(updatedSettings.auto_insert);
+        setLaunchAtLogin(updatedSettings.launch_at_login);
+        setFeedback({ kind: "success", message: "Settings saved." });
+      } catch (error) {
+        setFeedback({ kind: "error", message: toErrorMessage(error, "Unable to save settings.") });
+      } finally {
+        setIsSavingSettings(false);
+      }
+    }, 600);
+
+    return () => {
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    };
+  }, [hotkeyShortcut, recordingMode, microphoneId, language, autoInsert, launchAtLogin]);
 
   async function handleRefreshMicrophones() {
     setIsRefreshingMics(true);
@@ -269,7 +280,7 @@ export default function Settings() {
   }
 
   return (
-    <form className="space-y-4" onSubmit={handleSettingsSave} aria-live="polite">
+    <div className="space-y-4" aria-live="polite">
       {/* ── Recording ── */}
       <Card>
         <CardContent className="space-y-4 py-4">
@@ -486,10 +497,9 @@ export default function Settings() {
           {isExportingLogs ? "Exporting..." : "Export Logs"}
         </Button>
 
-        <Button type="submit" size="sm" disabled={isSavingSettings}>
-          <Save className="size-3.5" />
-          {isSavingSettings ? "Saving..." : "Save Settings"}
-        </Button>
+        {isSavingSettings && (
+          <p className="text-xs text-muted-foreground">Saving...</p>
+        )}
       </div>
 
       {/* Feedback */}
@@ -512,6 +522,6 @@ export default function Settings() {
           </AlertDescription>
         </Alert>
       )}
-    </form>
+    </div>
   );
 }
