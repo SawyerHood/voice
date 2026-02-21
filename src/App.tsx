@@ -1,9 +1,26 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import {
+  Mic,
+  History,
+  Settings as SettingsIcon,
+  ShieldCheck,
+  ShieldAlert,
+  ShieldQuestion,
+  RefreshCw,
+  X,
+} from "lucide-react";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { Progress } from "@/components/ui/progress";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { cn } from "@/lib/utils";
+import { useDarkMode } from "@/hooks/use-dark-mode";
 import HistoryPanel from "./HistoryPanel";
 import Settings from "./Settings";
-import "./App.css";
 
 type AppStatus = "idle" | "listening" | "transcribing" | "error";
 type AppTab = "status" | "history" | "settings";
@@ -24,10 +41,11 @@ const STATUS_LABEL: Record<AppStatus, string> = {
   error: "Error",
 };
 
-const TAB_LABEL: Record<AppTab, string> = {
-  status: "Status",
-  history: "History",
-  settings: "Settings",
+const STATUS_DESC: Record<AppStatus, string> = {
+  idle: "Waiting for the global hotkey.",
+  listening: "Capturing microphone input.",
+  transcribing: "Converting audio to text.",
+  error: "A recoverable issue occurred.",
 };
 
 const PERMISSION_LABEL: Record<PermissionType, string> = {
@@ -40,23 +58,11 @@ const PERMISSION_HELP: Record<PermissionType, string> = {
   accessibility: "Required to type/paste into other apps.",
 };
 
-const PERMISSION_STATUS_LABEL: Record<PermissionState, string> = {
-  granted: "Granted",
-  denied: "Denied",
-  not_determined: "Needs Access",
-};
-
 const PERMISSION_CARD_DISMISSED_KEY = "voice.permissionsOnboardingDismissed.v1";
 
 function toErrorMessage(error: unknown, fallbackMessage: string): string {
-  if (typeof error === "string" && error.trim()) {
-    return error;
-  }
-
-  if (error instanceof Error && error.message.trim()) {
-    return error.message;
-  }
-
+  if (typeof error === "string" && error.trim()) return error;
+  if (error instanceof Error && error.message.trim()) return error.message;
   return fallbackMessage;
 }
 
@@ -74,40 +80,22 @@ function setPermissionCardDismissed(dismissed: boolean) {
       window.localStorage.setItem(PERMISSION_CARD_DISMISSED_KEY, "1");
       return;
     }
-
     window.localStorage.removeItem(PERMISSION_CARD_DISMISSED_KEY);
   } catch {
-    // Ignore storage write errors in restricted environments.
+    // Ignore storage write errors
   }
 }
 
-function TabIcon({ tab }: { tab: AppTab }) {
-  if (tab === "status") {
-    return (
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <path d="M12 2.5a1 1 0 0 1 1 1v7.1l4.65 2.7a1 1 0 1 1-1 1.74l-5.15-3A1 1 0 0 1 11 11V3.5a1 1 0 0 1 1-1Z" />
-        <path d="M12 22a10 10 0 1 1 10-10 1 1 0 1 1-2 0 8 8 0 1 0-8 8 1 1 0 1 1 0 2Z" />
-      </svg>
-    );
-  }
-
-  if (tab === "history") {
-    return (
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <path d="M12 3a9 9 0 1 1-8.95 10h2.05a7 7 0 1 0 1.97-5.09L9 10H3V4l2.63 2.63A8.95 8.95 0 0 1 12 3Z" />
-        <path d="M12 8a1 1 0 0 1 1 1v3.4l2.8 1.62a1 1 0 1 1-1 1.73l-3.3-1.9A1 1 0 0 1 11 13V9a1 1 0 0 1 1-1Z" />
-      </svg>
-    );
-  }
-
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M11.3 2.15a1 1 0 0 1 1.4 0l1.03 1.03a1 1 0 0 0 .86.27l1.43-.31a1 1 0 0 1 1.19.8l.27 1.42a1 1 0 0 0 .56.72l1.31.64a1 1 0 0 1 .46 1.34l-.64 1.31a1 1 0 0 0 0 .9l.64 1.31a1 1 0 0 1-.46 1.34l-1.31.64a1 1 0 0 0-.56.72l-.27 1.42a1 1 0 0 1-1.19.8l-1.43-.31a1 1 0 0 0-.86.27L12.7 21.85a1 1 0 0 1-1.4 0l-1.03-1.03a1 1 0 0 0-.86-.27l-1.43.31a1 1 0 0 1-1.19-.8l-.27-1.42a1 1 0 0 0-.56-.72l-1.31-.64a1 1 0 0 1-.46-1.34l.64-1.31a1 1 0 0 0 0-.9l-.64-1.31a1 1 0 0 1 .46-1.34l1.31-.64a1 1 0 0 0 .56-.72l.27-1.42a1 1 0 0 1 1.19-.8l1.43.31a1 1 0 0 0 .86-.27Z" />
-      <path d="M12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7Zm0-2A1.5 1.5 0 1 0 12 10.5a1.5 1.5 0 0 0 0 3Z" />
-    </svg>
-  );
+/* ─── Permission status icon ───────────────────────── */
+function PermissionIcon({ state }: { state: PermissionState }) {
+  if (state === "granted")
+    return <ShieldCheck className="size-4 text-emerald-500" />;
+  if (state === "denied")
+    return <ShieldAlert className="size-4 text-destructive" />;
+  return <ShieldQuestion className="size-4 text-amber-500" />;
 }
 
+/* ─── Permission onboarding card ────────────────────── */
 type PermissionCardProps = {
   errorMessage: string;
   isRefreshing: boolean;
@@ -132,71 +120,87 @@ function PermissionOnboardingCard({
   const permissionOrder: PermissionType[] = ["microphone", "accessibility"];
 
   return (
-    <section className="permissions-card" aria-live="polite">
-      <div className="permissions-header">
-        <div>
-          <p className="card-title">Permissions</p>
-          <p className="permissions-description">
-            {permissions?.allGranted
-              ? "All required permissions are granted."
-              : "Voice needs these macOS permissions to record and insert text."}
-          </p>
+    <Card className="border-amber-500/30 bg-amber-50/50 dark:bg-amber-950/20">
+      <CardHeader className="pb-3">
+        <div className="flex items-start justify-between">
+          <div>
+            <CardTitle className="text-sm">Permissions Required</CardTitle>
+            <CardDescription className="text-xs mt-1">
+              {permissions?.allGranted
+                ? "All required permissions are granted."
+                : "Voice needs these macOS permissions to record and insert text."}
+            </CardDescription>
+          </div>
+          {showDismiss && (
+            <Button variant="ghost" size="icon-xs" onClick={onDismiss}>
+              <X className="size-3.5" />
+            </Button>
+          )}
         </div>
+      </CardHeader>
+      <CardContent className="space-y-2">
+        {errorMessage && (
+          <Alert variant="destructive" className="py-2">
+            <AlertDescription className="text-xs">{errorMessage}</AlertDescription>
+          </Alert>
+        )}
 
-        {showDismiss ? (
-          <button type="button" className="utility-button" onClick={onDismiss}>
-            Dismiss
-          </button>
-        ) : null}
-      </div>
-
-      {errorMessage ? <p className="permissions-error">{errorMessage}</p> : null}
-
-      <div className="permissions-list">
-        {permissionOrder.map((permissionType) => {
-          const state = permissions?.[permissionType] ?? "not_determined";
+        {permissionOrder.map((permType) => {
+          const state = permissions?.[permType] ?? "not_determined";
           const isGranted = state === "granted";
-          const isRequesting = requestingPermission === permissionType;
+          const isRequesting = requestingPermission === permType;
 
           return (
-            <div className="permission-row" key={permissionType}>
-              <div>
-                <p className="permission-name">{PERMISSION_LABEL[permissionType]}</p>
-                <p className="permission-help">{PERMISSION_HELP[permissionType]}</p>
+            <div
+              key={permType}
+              className="flex items-center justify-between rounded-lg border bg-background/60 p-2.5"
+            >
+              <div className="flex items-center gap-2.5">
+                <PermissionIcon state={state} />
+                <div>
+                  <p className="text-xs font-medium">{PERMISSION_LABEL[permType]}</p>
+                  <p className="text-[11px] text-muted-foreground">{PERMISSION_HELP[permType]}</p>
+                </div>
               </div>
-
-              <div className="permission-row-actions">
-                <span className={`permission-state permission-${state}`}>
-                  {PERMISSION_STATUS_LABEL[state]}
-                </span>
-                <button
-                  type="button"
-                  className="secondary-button permission-action-button"
-                  disabled={isGranted || isRequesting}
-                  onClick={() => onRequestPermission(permissionType)}
+              <div className="flex items-center gap-2">
+                <Badge
+                  variant={isGranted ? "default" : state === "denied" ? "destructive" : "secondary"}
+                  className="text-[10px] px-1.5 py-0"
                 >
-                  {isGranted ? "Granted" : isRequesting ? "Requesting..." : "Grant Access"}
-                </button>
+                  {isGranted ? "Granted" : state === "denied" ? "Denied" : "Needs Access"}
+                </Badge>
+                {!isGranted && (
+                  <Button
+                    size="xs"
+                    variant="outline"
+                    disabled={isRequesting}
+                    onClick={() => onRequestPermission(permType)}
+                  >
+                    {isRequesting ? "Requesting..." : "Grant"}
+                  </Button>
+                )}
               </div>
             </div>
           );
         })}
-      </div>
 
-      <div className="permissions-footer">
-        <button
-          type="button"
-          className="utility-button"
-          onClick={onRefresh}
-          disabled={isRefreshing || requestingPermission !== null}
-        >
-          {isRefreshing ? "Refreshing..." : "Refresh Status"}
-        </button>
-      </div>
-    </section>
+        <div className="flex justify-end pt-1">
+          <Button
+            variant="ghost"
+            size="xs"
+            onClick={onRefresh}
+            disabled={isRefreshing || requestingPermission !== null}
+          >
+            <RefreshCw className={cn("size-3", isRefreshing && "animate-spin")} />
+            {isRefreshing ? "Refreshing..." : "Refresh Status"}
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
   );
 }
 
+/* ─── Status View ───────────────────────────────────── */
 type StatusViewProps = {
   audioLevel: number;
   isRefreshingPermissions: boolean;
@@ -226,9 +230,23 @@ function StatusView({
   status,
   statusDescription,
 }: StatusViewProps) {
+  const statusColors: Record<AppStatus, string> = {
+    idle: "bg-muted-foreground",
+    listening: "bg-blue-500 animate-pulse-dot",
+    transcribing: "bg-amber-500 animate-pulse-dot-fast",
+    error: "bg-destructive",
+  };
+
+  const statusRingColors: Record<AppStatus, string> = {
+    idle: "",
+    listening: "ring-2 ring-blue-500/20",
+    transcribing: "ring-2 ring-amber-500/20",
+    error: "ring-2 ring-destructive/20",
+  };
+
   return (
-    <div className="status-layout">
-      {showPermissionsCard ? (
+    <div className="space-y-3">
+      {showPermissionsCard && (
         <PermissionOnboardingCard
           errorMessage={permissionErrorMessage}
           isRefreshing={isRefreshingPermissions}
@@ -239,47 +257,66 @@ function StatusView({
           requestingPermission={requestingPermission}
           showDismiss={Boolean(permissions?.allGranted)}
         />
-      ) : null}
+      )}
 
-      <section className={`status-card status-${status}`}>
-        <div className="status-dot" />
-        <div className="status-text-group">
-          <p className="status-label">{STATUS_LABEL[status]}</p>
-          <p className="status-description">{statusDescription}</p>
-          {status === "transcribing" ? (
-            <div className="transcribing-bar">
-              <div className="transcribing-bar-fill" />
-            </div>
-          ) : null}
-        </div>
-      </section>
+      {/* Status indicator */}
+      <Card className={cn("transition-all duration-200", statusRingColors[status])}>
+        <CardContent className="flex items-center gap-3 py-4">
+          <div className={cn("size-2.5 shrink-0 rounded-full", statusColors[status])} />
+          <div className="min-w-0 flex-1">
+            <p className="text-sm font-semibold">{STATUS_LABEL[status]}</p>
+            <p className="text-xs text-muted-foreground">{statusDescription}</p>
+            {status === "transcribing" && (
+              <div className="mt-2 h-1 w-full overflow-hidden rounded-full bg-muted">
+                <div className="h-full w-2/5 rounded-full bg-amber-500 animate-shimmer" />
+              </div>
+            )}
+          </div>
+        </CardContent>
+      </Card>
 
-      <section className="audio-level-card">
-        <p className="card-title">Audio Level</p>
-        <div className="audio-meter-track">
-          <div
-            className={`audio-meter-fill ${status === "listening" ? "active" : ""}`}
-            style={{ width: `${Math.round(audioLevel * 100)}%` }}
+      {/* Audio Level */}
+      <Card>
+        <CardContent className="py-4 space-y-2.5">
+          <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+            Audio Level
+          </p>
+          <Progress
+            value={status === "listening" ? Math.round(audioLevel * 100) : 0}
+            className="h-2"
           />
-        </div>
-        <p className="audio-meter-value">
-          {status === "listening"
-            ? `${Math.round(audioLevel * 100)}% input`
-            : "Waiting for recording"}
-        </p>
-      </section>
+          <p className="text-xs text-muted-foreground tabular-nums">
+            {status === "listening"
+              ? `${Math.round(audioLevel * 100)}% input`
+              : "Waiting for recording"}
+          </p>
+        </CardContent>
+      </Card>
 
-      <section className="transcript-card">
-        <p className="card-title">Last Transcript</p>
-        <p className={lastTranscript ? "transcript-value" : "transcript-placeholder"}>
-          {lastTranscript || "No transcript captured yet."}
-        </p>
-      </section>
+      {/* Last Transcript */}
+      <Card>
+        <CardContent className="py-4 space-y-2">
+          <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+            Last Transcript
+          </p>
+          <p
+            className={cn(
+              "text-sm leading-relaxed",
+              lastTranscript ? "text-foreground" : "text-muted-foreground italic"
+            )}
+          >
+            {lastTranscript || "No transcript captured yet."}
+          </p>
+        </CardContent>
+      </Card>
     </div>
   );
 }
 
+/* ─── Main App ──────────────────────────────────────── */
 function App() {
+  useDarkMode();
+
   const [status, setStatus] = useState<AppStatus>("idle");
   const [activeTab, setActiveTab] = useState<AppTab>("status");
   const [errorMessage, setErrorMessage] = useState("");
@@ -294,7 +331,7 @@ function App() {
   const [requestingPermission, setRequestingPermission] = useState<PermissionType | null>(null);
   const [isRefreshingPermissions, setIsRefreshingPermissions] = useState(false);
   const [permissionCardDismissed, setPermissionCardDismissedState] = useState<boolean>(
-    () => readPermissionCardDismissed(),
+    () => readPermissionCardDismissed()
   );
   const statusRef = useRef<AppStatus>("idle");
 
@@ -304,14 +341,13 @@ function App() {
 
   const refreshPermissions = useCallback(async () => {
     setIsRefreshingPermissions(true);
-
     try {
       const snapshot = await invoke<PermissionSnapshot>("check_permissions");
       setPermissions(snapshot);
       setPermissionErrorMessage("");
     } catch (error) {
       setPermissionErrorMessage(
-        toErrorMessage(error, "Unable to load permission status from the backend."),
+        toErrorMessage(error, "Unable to load permission status from the backend.")
       );
     } finally {
       setIsRefreshingPermissions(false);
@@ -321,7 +357,6 @@ function App() {
   const requestPermission = useCallback(async (permission: PermissionType) => {
     setRequestingPermission(permission);
     setPermissionErrorMessage("");
-
     try {
       const snapshot = await invoke<PermissionSnapshot>("request_permission", {
         type: permission,
@@ -329,7 +364,7 @@ function App() {
       setPermissions(snapshot);
     } catch (error) {
       setPermissionErrorMessage(
-        toErrorMessage(error, "Unable to request macOS permission from the backend."),
+        toErrorMessage(error, "Unable to request macOS permission from the backend.")
       );
     } finally {
       setRequestingPermission(null);
@@ -357,9 +392,7 @@ function App() {
           invoke<PermissionSnapshot>("check_permissions"),
         ]);
 
-        if (!isMounted) {
-          return;
-        }
+        if (!isMounted) return;
 
         setStatus(initialStatus);
         statusRef.current = initialStatus;
@@ -378,19 +411,14 @@ function App() {
           listen<AppStatus>("voice://status-changed", ({ payload }) => {
             statusRef.current = payload;
             setStatus(payload);
-            if (payload !== "error") {
-              setErrorMessage("");
-            }
+            if (payload !== "error") setErrorMessage("");
           }),
           listen<number>("audio-level", ({ payload }) => {
             const normalized = Math.max(0, Math.min(1, Number(payload) || 0));
-            if (statusRef.current !== "listening" && normalized > 0) {
-              return;
-            }
-
+            if (statusRef.current !== "listening" && normalized > 0) return;
             const quantized = Math.round(normalized * 100) / 100;
             setAudioLevel((previous) =>
-              Math.abs(previous - quantized) < 0.01 ? previous : quantized,
+              Math.abs(previous - quantized) < 0.01 ? previous : quantized
             );
           }),
           listen<TranscriptReadyEvent>("voice://transcript-ready", ({ payload }) => {
@@ -414,9 +442,7 @@ function App() {
         unlistenFns = listeners;
         setBackendSynced(true);
       } catch {
-        if (isMounted) {
-          setBackendSynced(false);
-        }
+        if (isMounted) setBackendSynced(false);
       }
     }
 
@@ -432,75 +458,65 @@ function App() {
     function handleWindowFocus() {
       void refreshPermissions();
     }
-
     window.addEventListener("focus", handleWindowFocus);
-    return () => {
-      window.removeEventListener("focus", handleWindowFocus);
-    };
+    return () => window.removeEventListener("focus", handleWindowFocus);
   }, [refreshPermissions]);
 
   const hasMissingPermissions = useMemo(
     () => !permissions || !permissions.allGranted,
-    [permissions],
+    [permissions]
   );
 
   const showPermissionsCard = useMemo(() => {
-    if (!backendSynced) {
-      return false;
-    }
-
+    if (!backendSynced) return false;
     return hasMissingPermissions || !permissionCardDismissed;
   }, [backendSynced, hasMissingPermissions, permissionCardDismissed]);
 
   const statusDescription = useMemo(() => {
-    switch (status) {
-      case "idle":
-        return "Waiting for the global hotkey.";
-      case "listening":
-        return "Capturing microphone input.";
-      case "transcribing":
-        return "Converting audio to text.";
-      case "error":
-        return errorMessage || "A recoverable issue occurred.";
-      default:
-        return "Unknown state.";
-    }
+    if (status === "error") return errorMessage || STATUS_DESC.error;
+    return STATUS_DESC[status] ?? "Unknown state.";
   }, [errorMessage, status]);
 
   return (
-    <main className="app-shell">
-      <header className="app-header">
-        <div>
-          <p className="eyebrow">Voice Utility</p>
-          <h1>{TAB_LABEL[activeTab]}</h1>
-        </div>
+    <main className="flex h-screen flex-col overflow-hidden p-3">
+      {/* Header */}
+      <header className="mb-2 shrink-0">
+        <p className="text-[10px] font-medium uppercase tracking-widest text-muted-foreground">
+          Voice Utility
+        </p>
+        <h1 className="text-lg font-bold tracking-tight">
+          {activeTab === "status" ? "Status" : activeTab === "history" ? "History" : "Settings"}
+        </h1>
       </header>
 
-      <nav className="app-nav" aria-label="Primary">
-        {(["status", "history", "settings"] as const).map((tab) => (
-          <button
-            key={tab}
-            type="button"
-            className={`nav-button ${activeTab === tab ? "active" : ""}`}
-            onClick={() => setActiveTab(tab)}
-            aria-current={activeTab === tab ? "page" : undefined}
-          >
-            <TabIcon tab={tab} />
-            <span>{TAB_LABEL[tab]}</span>
-          </button>
-        ))}
-      </nav>
+      {/* Tabs */}
+      <Tabs
+        value={activeTab}
+        onValueChange={(v) => setActiveTab(v as AppTab)}
+        className="flex min-h-0 flex-1 flex-col"
+      >
+        <TabsList className="mb-3 grid w-full shrink-0 grid-cols-3">
+          <TabsTrigger value="status" className="gap-1.5 text-xs">
+            <Mic className="size-3.5" />
+            Status
+          </TabsTrigger>
+          <TabsTrigger value="history" className="gap-1.5 text-xs">
+            <History className="size-3.5" />
+            History
+          </TabsTrigger>
+          <TabsTrigger value="settings" className="gap-1.5 text-xs">
+            <SettingsIcon className="size-3.5" />
+            Settings
+          </TabsTrigger>
+        </TabsList>
 
-      <section className="tab-content">
-        {activeTab === "status" ? (
+        <TabsContent value="status" className="mt-0 min-h-0 flex-1 overflow-y-auto">
           <StatusView
             audioLevel={audioLevel}
             isRefreshingPermissions={isRefreshingPermissions}
             lastTranscript={lastTranscript}
             onDismissPermissions={dismissPermissionCard}
-            onRefreshPermissions={() => {
-              void refreshPermissions();
-            }}
+            onRefreshPermissions={() => void refreshPermissions()}
             onRequestPermission={requestPermission}
             permissionErrorMessage={permissionErrorMessage}
             permissions={permissions}
@@ -509,14 +525,23 @@ function App() {
             status={status}
             statusDescription={statusDescription}
           />
-        ) : null}
-        {activeTab === "history" ? <HistoryPanel refreshSignal={historyRefreshSignal} /> : null}
-        {activeTab === "settings" ? <Settings /> : null}
-      </section>
+        </TabsContent>
 
-      <p className={`backend-sync ${backendSynced ? "backend-sync-ok" : ""}`}>
-        {backendSynced ? "" : "Backend: frontend-only fallback"}
-      </p>
+        <TabsContent value="history" className="mt-0 min-h-0 flex-1 overflow-y-auto">
+          <HistoryPanel refreshSignal={historyRefreshSignal} />
+        </TabsContent>
+
+        <TabsContent value="settings" className="mt-0 min-h-0 flex-1 overflow-y-auto">
+          <Settings />
+        </TabsContent>
+      </Tabs>
+
+      {/* Backend sync warning */}
+      {!backendSynced && (
+        <p className="mt-1 shrink-0 text-center text-[11px] text-muted-foreground">
+          Backend: frontend-only fallback
+        </p>
+      )}
     </main>
   );
 }
