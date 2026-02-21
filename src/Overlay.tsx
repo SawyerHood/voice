@@ -130,6 +130,11 @@ function Overlay() {
           isTranscribing ? "transcribing" : ""
         }`}
       >
+        <span className="recording-indicator" aria-hidden="true">
+          <span className="recording-dot" />
+        </span>
+        <p className="overlay-transcript-text" aria-live="polite">{statusLabel}</p>
+        <p className="overlay-elapsed">{isListening ? formatElapsedLabel(elapsedMs) : "..."}</p>
         {canCancel ? (
           <button
             type="button"
@@ -140,11 +145,6 @@ function Overlay() {
             ×
           </button>
         ) : null}
-        <span className="recording-indicator" aria-hidden="true">
-          <span className="recording-dot" />
-        </span>
-        <p className="overlay-transcript-text" aria-live="polite">{statusLabel}</p>
-        <p className="overlay-elapsed">{isListening ? formatElapsedLabel(elapsedMs) : "..."}</p>
       </section>
     </main>
   );
