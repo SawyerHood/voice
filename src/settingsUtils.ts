@@ -9,6 +9,7 @@ type SettingsUpdateInput = {
   microphoneId: string;
   language: string;
   autoInsert: boolean;
+  launchAtLogin: boolean;
 };
 
 export type VoiceSettingsUpdatePayload = {
@@ -18,6 +19,7 @@ export type VoiceSettingsUpdatePayload = {
   language: string | null;
   transcription_provider: typeof OPENAI_PROVIDER;
   auto_insert: boolean;
+  launch_at_login: boolean;
 };
 
 export function normalizeShortcut(shortcut: string): string {
@@ -44,6 +46,7 @@ export function createSettingsUpdatePayload(
     language: normalizeOptionalText(input.language),
     transcription_provider: OPENAI_PROVIDER,
     auto_insert: input.autoInsert,
+    launch_at_login: input.launchAtLogin,
   };
 }
 

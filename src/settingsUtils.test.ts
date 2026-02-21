@@ -32,6 +32,7 @@ describe("settingsUtils", () => {
         microphoneId: "  mic-1 ",
         language: "  fr ",
         autoInsert: false,
+        launchAtLogin: true,
       }),
     ).toEqual({
       hotkey_shortcut: "Cmd+Shift+Space",
@@ -40,6 +41,7 @@ describe("settingsUtils", () => {
       language: "fr",
       transcription_provider: "openai",
       auto_insert: false,
+      launch_at_login: true,
     });
   });
 

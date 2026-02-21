@@ -23,6 +23,7 @@ pub struct VoiceSettings {
     pub language: Option<String>,
     pub transcription_provider: String,
     pub auto_insert: bool,
+    pub launch_at_login: bool,
 }
 
 impl Default for VoiceSettings {
@@ -34,6 +35,7 @@ impl Default for VoiceSettings {
             language: None,
             transcription_provider: DEFAULT_TRANSCRIPTION_PROVIDER.to_string(),
             auto_insert: true,
+            launch_at_login: false,
         }
     }
 }
@@ -76,6 +78,10 @@ impl VoiceSettings {
             self.auto_insert = auto_insert;
         }
 
+        if let Some(launch_at_login) = update.launch_at_login {
+            self.launch_at_login = launch_at_login;
+        }
+
         self.normalized()
     }
 }
@@ -89,6 +95,7 @@ pub struct VoiceSettingsUpdate {
     pub language: Option<Option<String>>,
     pub transcription_provider: Option<String>,
     pub auto_insert: Option<bool>,
+    pub launch_at_login: Option<bool>,
 }
 
 #[derive(Debug, Default)]
@@ -271,6 +278,7 @@ mod tests {
             DEFAULT_TRANSCRIPTION_PROVIDER
         );
         assert!(defaults.auto_insert);
+        assert!(!defaults.launch_at_login);
     }
 
     #[test]
@@ -283,6 +291,38 @@ mod tests {
             .expect("loading missing settings should succeed");
 
         assert_eq!(loaded, VoiceSettings::default());
+        cleanup_settings_path(&settings_path);
+    }
+
+    #[test]
+    fn load_backfills_launch_at_login_for_legacy_settings_files() {
+        let store = SettingsStore::new();
+        let settings_path = unique_settings_path("legacy");
+
+        if let Some(parent_dir) = settings_path.parent() {
+            fs::create_dir_all(parent_dir).expect("legacy test directory should be created");
+        }
+
+        let legacy_payload = serde_json::json!({
+            "hotkey_shortcut": "Alt+Space",
+            "recording_mode": "hold_to_talk",
+            "microphone_id": null,
+            "language": null,
+            "transcription_provider": "openai",
+            "auto_insert": true
+        });
+        fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&legacy_payload)
+                .expect("legacy settings payload should serialize"),
+        )
+        .expect("legacy settings file should be written");
+
+        let loaded = store
+            .load_from_path(&settings_path)
+            .expect("legacy settings should load");
+
+        assert!(!loaded.launch_at_login);
         cleanup_settings_path(&settings_path);
     }
 
@@ -301,6 +341,7 @@ mod tests {
                     language: Some(Some("en".to_string())),
                     transcription_provider: Some("OpenAI".to_string()),
                     auto_insert: Some(false),
+                    launch_at_login: Some(true),
                 },
             )
             .expect("update should succeed");
@@ -313,6 +354,7 @@ mod tests {
         assert_eq!(updated.language.as_deref(), Some("en"));
         assert_eq!(updated.transcription_provider, "openai");
         assert!(!updated.auto_insert);
+        assert!(updated.launch_at_login);
         assert_eq!(reloaded, updated);
 
         cleanup_settings_path(&settings_path);

@@ -16,6 +16,7 @@ type VoiceSettings = {
   microphone_id: string | null;
   language: string | null;
   auto_insert: boolean;
+  launch_at_login: boolean;
 };
 
 type HotkeyConfig = {
@@ -80,6 +81,7 @@ export default function Settings() {
   const [isSavingSettings, setIsSavingSettings] = useState(false);
   const [isSavingApiKey, setIsSavingApiKey] = useState(false);
   const [isRefreshingMics, setIsRefreshingMics] = useState(false);
+  const [isUpdatingLaunchAtLogin, setIsUpdatingLaunchAtLogin] = useState(false);
   const [feedback, setFeedback] = useState<SaveFeedback | null>(null);
 
   const [hotkeyShortcut, setHotkeyShortcut] = useState("");
@@ -88,6 +90,7 @@ export default function Settings() {
   const [microphoneId, setMicrophoneId] = useState("");
   const [language, setLanguage] = useState("");
   const [autoInsert, setAutoInsert] = useState(true);
+  const [launchAtLogin, setLaunchAtLogin] = useState(false);
 
   const [storedApiKey, setStoredApiKey] = useState("");
   const [apiKeyDraft, setApiKeyDraft] = useState("");
@@ -138,9 +141,16 @@ export default function Settings() {
       setMicrophoneId(settings.microphone_id ?? "");
       setLanguage(settings.language ?? "");
       setAutoInsert(settings.auto_insert);
+      setLaunchAtLogin(settings.launch_at_login);
       setStoredApiKey(openAiKey ?? "");
       setApiKeyDraft("");
       setIsApiKeyVisible(false);
+
+      try {
+        setLaunchAtLogin(await invoke<boolean>("get_launch_at_login"));
+      } catch {
+        // Fall back to persisted settings when the runtime autostart query fails.
+      }
 
       await loadMicrophones(false);
     } catch (error) {
@@ -197,6 +207,7 @@ export default function Settings() {
           microphoneId,
           language,
           autoInsert,
+          launchAtLogin,
         }),
       });
 
@@ -205,6 +216,7 @@ export default function Settings() {
       setMicrophoneId(updatedSettings.microphone_id ?? "");
       setLanguage(updatedSettings.language ?? "");
       setAutoInsert(updatedSettings.auto_insert);
+      setLaunchAtLogin(updatedSettings.launch_at_login);
 
       setFeedback({
         kind: "success",
@@ -224,6 +236,29 @@ export default function Settings() {
     setIsRefreshingMics(true);
     await loadMicrophones(true);
     setIsRefreshingMics(false);
+  }
+
+  async function handleLaunchAtLoginToggle(enabled: boolean) {
+    const previous = launchAtLogin;
+    setLaunchAtLogin(enabled);
+    setIsUpdatingLaunchAtLogin(true);
+
+    try {
+      const nextValue = await invoke<boolean>("set_launch_at_login", { enabled });
+      setLaunchAtLogin(nextValue);
+      setFeedback({
+        kind: "success",
+        message: nextValue ? "Launch at login enabled." : "Launch at login disabled.",
+      });
+    } catch (error) {
+      setLaunchAtLogin(previous);
+      setFeedback({
+        kind: "error",
+        message: toErrorMessage(error, "Unable to update launch at login."),
+      });
+    } finally {
+      setIsUpdatingLaunchAtLogin(false);
+    }
   }
 
   async function handleSaveApiKey() {
@@ -379,6 +414,18 @@ export default function Settings() {
               type="checkbox"
               checked={autoInsert}
               onChange={(event) => setAutoInsert(event.currentTarget.checked)}
+            />
+          </label>
+
+          <label className="settings-field checkbox-field">
+            <span className="field-label">Launch at Login</span>
+            <input
+              type="checkbox"
+              checked={launchAtLogin}
+              onChange={(event) => {
+                void handleLaunchAtLoginToggle(event.currentTarget.checked);
+              }}
+              disabled={isUpdatingLaunchAtLogin}
             />
           </label>
 

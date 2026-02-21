@@ -36,6 +36,7 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconEvent},
     AppHandle, Emitter, Listener, Manager,
 };
+use tauri_plugin_autostart::{MacosLauncher, ManagerExt as AutostartManagerExt};
 use text_insertion_service::TextInsertionService;
 use transcription::openai::{OpenAiTranscriptionConfig, OpenAiTranscriptionProvider};
 use transcription::{TranscriptionOptions, TranscriptionOrchestrator};
@@ -293,6 +294,23 @@ fn parse_audio_stream_error_message(payload: &str) -> String {
         .unwrap_or_else(|| "Microphone stream failed unexpectedly".to_string())
 }
 
+fn get_launch_at_login_state(app: &AppHandle) -> Result<bool, String> {
+    app.autolaunch()
+        .is_enabled()
+        .map_err(|error| format!("Failed to get launch-at-login state: {error}"))
+}
+
+fn set_launch_at_login_state(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    let autolaunch = app.autolaunch();
+    let result = if enabled {
+        autolaunch.enable()
+    } else {
+        autolaunch.disable()
+    };
+
+    result.map_err(|error| format!("Failed to set launch-at-login state: {error}"))
+}
+
 fn handle_audio_input_stream_error_with_hooks<
     BeginSession,
     ForceStopRecording,
@@ -448,6 +466,36 @@ fn update_settings(
     state: tauri::State<'_, AppState>,
 ) -> Result<VoiceSettings, String> {
     state.services.settings_store.update(&app, update)
+}
+
+#[tauri::command]
+fn get_launch_at_login(app: AppHandle) -> Result<bool, String> {
+    get_launch_at_login_state(&app)
+}
+
+#[tauri::command]
+fn set_launch_at_login(
+    app: AppHandle,
+    enabled: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    let previous = get_launch_at_login_state(&app)?;
+    set_launch_at_login_state(&app, enabled)?;
+
+    if let Err(error) = state.services.settings_store.update(
+        &app,
+        VoiceSettingsUpdate {
+            launch_at_login: Some(enabled),
+            ..VoiceSettingsUpdate::default()
+        },
+    ) {
+        let _ = set_launch_at_login_state(&app, previous);
+        return Err(format!(
+            "Failed to persist launch-at-login setting: {error}"
+        ));
+    }
+
+    Ok(enabled)
 }
 
 #[tauri::command]
@@ -641,6 +689,10 @@ fn handle_tray_menu_event(app: &AppHandle, menu_id: &str) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            None::<Vec<&str>>,
+        ))
         .plugin(tauri_plugin_opener::init())
         .manage(AppState::default())
         .manage(HotkeyService::new())
@@ -661,8 +713,16 @@ pub fn run() {
                 .map_err(std::io::Error::other)?;
 
             let app_state = app.state::<AppState>();
-            if let Err(error) = app_state.services.settings_store.load(app.handle()) {
-                eprintln!("Failed to load persisted settings: {error}");
+            let launch_at_login = match app_state.services.settings_store.load(app.handle()) {
+                Ok(settings) => settings.launch_at_login,
+                Err(error) => {
+                    eprintln!("Failed to load persisted settings: {error}");
+                    false
+                }
+            };
+
+            if let Err(error) = set_launch_at_login_state(app.handle(), launch_at_login) {
+                eprintln!("Failed to apply launch-at-login preference: {error}");
             }
 
             register_pipeline_handlers(app.handle());
@@ -708,6 +768,8 @@ pub fn run() {
             set_status,
             get_settings,
             update_settings,
+            get_launch_at_login,
+            set_launch_at_login,
             get_api_key,
             set_api_key,
             delete_api_key,
