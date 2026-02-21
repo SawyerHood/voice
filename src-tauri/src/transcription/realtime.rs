@@ -23,7 +23,7 @@ const DEFAULT_OPENAI_REALTIME_MODEL: &str = "gpt-realtime";
 const DEFAULT_OPENAI_TRANSCRIPTION_MODEL: &str = "gpt-4o-mini-transcribe";
 const DEFAULT_COMMIT_TIMEOUT_SECS: u64 = 20;
 const DEFAULT_TURN_THRESHOLD: f32 = 0.5;
-const DEFAULT_PREFIX_PADDING_MS: u64 = 300;
+
 const DEFAULT_SILENCE_DURATION_MS: u64 = 500;
 const REALTIME_OUTPUT_SAMPLE_RATE_HZ: u32 = 24_000;
 const EVENT_SESSION_CREATED: &str = "session.created";
@@ -556,11 +556,6 @@ fn resolve_realtime_endpoint(endpoint: &str, model: &str) -> Result<String, Tran
         url.query_pairs_mut().append_pair("model", model);
     }
 
-    let has_intent = url.query_pairs().any(|(key, _)| key == "intent");
-    if !has_intent {
-        url.query_pairs_mut().append_pair("intent", "transcription");
-    }
-
     Ok(url.to_string())
 }
 
@@ -636,23 +631,11 @@ fn build_session_update_payload(
         "type": "session.update",
         "session": {
             "type": "transcription",
-            "audio": {
-                "input": {
-                    "format": {
-                        "type": "audio/pcm",
-                        "rate": REALTIME_OUTPUT_SAMPLE_RATE_HZ,
-                    },
-                    "noise_reduction": {
-                        "type": "near_field"
-                    },
-                    "transcription": transcription_config,
-                    "turn_detection": {
-                        "type": "server_vad",
-                        "threshold": config.turn_detection_threshold,
-                        "prefix_padding_ms": DEFAULT_PREFIX_PADDING_MS,
-                        "silence_duration_ms": config.silence_duration_ms,
-                    }
-                }
+            "input_audio_transcription": transcription_config,
+            "turn_detection": {
+                "type": "server_vad",
+                "threshold": config.turn_detection_threshold,
+                "silence_duration_ms": config.silence_duration_ms,
             }
         }
     })
@@ -823,37 +806,25 @@ mod tests {
             Value::String("transcription".to_string())
         );
         assert_eq!(
-            payload["session"]["audio"]["input"]["transcription"]["model"],
+            payload["session"]["input_audio_transcription"]["model"],
             Value::String(config.transcription_model.clone())
         );
         assert_eq!(
-            payload["session"]["audio"]["input"]["transcription"]["language"],
+            payload["session"]["input_audio_transcription"]["language"],
             Value::String("en".to_string())
         );
         assert_eq!(
-            payload["session"]["audio"]["input"]["format"]["type"],
-            Value::String("audio/pcm".to_string())
-        );
-        assert_eq!(
-            payload["session"]["audio"]["input"]["format"]["rate"],
-            Value::from(REALTIME_OUTPUT_SAMPLE_RATE_HZ)
-        );
-        assert_eq!(
-            payload["session"]["audio"]["input"]["turn_detection"]["type"],
+            payload["session"]["turn_detection"]["type"],
             Value::String("server_vad".to_string())
         );
         assert_eq!(
-            payload["session"]["audio"]["input"]["turn_detection"]["prefix_padding_ms"],
-            Value::from(DEFAULT_PREFIX_PADDING_MS)
-        );
-        assert_eq!(
-            payload["session"]["audio"]["input"]["turn_detection"]["silence_duration_ms"],
+            payload["session"]["turn_detection"]["silence_duration_ms"],
             Value::from(config.silence_duration_ms)
         );
     }
 
     #[test]
-    fn resolve_realtime_endpoint_appends_model_and_intent_query_parameters() {
+    fn resolve_realtime_endpoint_appends_model_query_parameter() {
         let endpoint = "wss://api.openai.com/v1/realtime";
         let resolved = resolve_realtime_endpoint(endpoint, "gpt-realtime")
             .expect("endpoint should parse and include model query");
@@ -863,24 +834,6 @@ mod tests {
             .find(|(key, _)| key == "model")
             .map(|(_, value)| value.to_string());
         assert_eq!(model.as_deref(), Some("gpt-realtime"));
-        let intent = parsed
-            .query_pairs()
-            .find(|(key, _)| key == "intent")
-            .map(|(_, value)| value.to_string());
-        assert_eq!(intent.as_deref(), Some("transcription"));
-    }
-
-    #[test]
-    fn resolve_realtime_endpoint_preserves_existing_intent() {
-        let endpoint = "wss://api.openai.com/v1/realtime?intent=conversation";
-        let resolved = resolve_realtime_endpoint(endpoint, "gpt-realtime")
-            .expect("endpoint should parse");
-        let parsed = Url::parse(&resolved).expect("resolved endpoint should be valid URL");
-        let intent = parsed
-            .query_pairs()
-            .find(|(key, _)| key == "intent")
-            .map(|(_, value)| value.to_string());
-        assert_eq!(intent.as_deref(), Some("conversation"));
     }
 
     #[test]
@@ -997,15 +950,7 @@ mod tests {
             assert_eq!(first_payload["type"], "session.update");
             assert_eq!(first_payload["session"]["type"], "transcription");
             assert_eq!(
-                first_payload["session"]["audio"]["input"]["format"]["type"],
-                Value::String("audio/pcm".to_string())
-            );
-            assert_eq!(
-                first_payload["session"]["audio"]["input"]["format"]["rate"],
-                Value::from(REALTIME_OUTPUT_SAMPLE_RATE_HZ)
-            );
-            assert_eq!(
-                first_payload["session"]["audio"]["input"]["transcription"]["model"],
+                first_payload["session"]["input_audio_transcription"]["model"],
                 Value::String(DEFAULT_OPENAI_TRANSCRIPTION_MODEL.to_string())
             );
 
