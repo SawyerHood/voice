@@ -21,10 +21,8 @@ use super::{
 const DEFAULT_OPENAI_REALTIME_ENDPOINT: &str = "wss://api.openai.com/v1/realtime";
 const DEFAULT_OPENAI_REALTIME_MODEL: &str = "gpt-realtime";
 const DEFAULT_OPENAI_TRANSCRIPTION_MODEL: &str = "gpt-4o-mini-transcribe";
+const OPENAI_REALTIME_BETA_HEADER_VALUE: &str = "realtime=v1";
 const DEFAULT_COMMIT_TIMEOUT_SECS: u64 = 20;
-const DEFAULT_TURN_THRESHOLD: f32 = 0.5;
-const DEFAULT_PREFIX_PADDING_MS: u64 = 300;
-const DEFAULT_SILENCE_DURATION_MS: u64 = 500;
 const REALTIME_OUTPUT_SAMPLE_RATE_HZ: u32 = 24_000;
 const EVENT_SESSION_CREATED: &str = "session.created";
 const EVENT_SESSION_UPDATED: &str = "session.updated";
@@ -47,8 +45,6 @@ pub struct OpenAiRealtimeTranscriptionConfig {
     pub realtime_model: String,
     pub transcription_model: String,
     pub commit_timeout_secs: u64,
-    pub turn_detection_threshold: f32,
-    pub silence_duration_ms: u64,
 }
 
 impl Default for OpenAiRealtimeTranscriptionConfig {
@@ -60,8 +56,6 @@ impl Default for OpenAiRealtimeTranscriptionConfig {
             realtime_model: DEFAULT_OPENAI_REALTIME_MODEL.to_string(),
             transcription_model: DEFAULT_OPENAI_TRANSCRIPTION_MODEL.to_string(),
             commit_timeout_secs: DEFAULT_COMMIT_TIMEOUT_SECS,
-            turn_detection_threshold: DEFAULT_TURN_THRESHOLD,
-            silence_duration_ms: DEFAULT_SILENCE_DURATION_MS,
         }
     }
 }
@@ -325,7 +319,7 @@ async fn run_realtime_session(
     options: TranscriptionOptions,
     mut command_rx: mpsc::UnboundedReceiver<RealtimeCommand>,
 ) -> Result<TranscriptionResult, TranscriptionError> {
-    let endpoint = resolve_realtime_endpoint(&config.endpoint, &config.realtime_model)?;
+    let endpoint = resolve_realtime_endpoint(&config.endpoint)?;
     let mut request = endpoint.clone().into_client_request().map_err(|error| {
         TranscriptionError::Provider(format!(
             "Invalid realtime websocket endpoint `{endpoint}`: {error}",
@@ -340,6 +334,10 @@ async fn run_realtime_session(
     request
         .headers_mut()
         .insert("Authorization", authorization_header_value);
+    request.headers_mut().insert(
+        "OpenAI-Beta",
+        HeaderValue::from_static(OPENAI_REALTIME_BETA_HEADER_VALUE),
+    );
 
     info!(
         endpoint = %endpoint,
@@ -525,8 +523,9 @@ async fn run_realtime_session(
         }
     }
 
-    let final_text = transcript_done.unwrap_or(transcript_from_deltas);
-    if final_text.trim().is_empty() {
+    let final_text = if let Some(done) = transcript_done {
+        done
+    } else if transcript_from_deltas.trim().is_empty() {
         warn!(
             commit_sent,
             "realtime session ended without a transcript payload"
@@ -534,7 +533,9 @@ async fn run_realtime_session(
         return Err(TranscriptionError::InvalidResponse(
             "Realtime API did not return a transcript".to_string(),
         ));
-    }
+    } else {
+        transcript_from_deltas
+    };
 
     Ok(TranscriptionResult {
         text: normalize_transcript_text(&final_text),
@@ -544,21 +545,31 @@ async fn run_realtime_session(
     })
 }
 
-fn resolve_realtime_endpoint(endpoint: &str, model: &str) -> Result<String, TranscriptionError> {
+fn resolve_realtime_endpoint(endpoint: &str) -> Result<String, TranscriptionError> {
     let mut url = Url::parse(endpoint).map_err(|error| {
         TranscriptionError::Provider(format!(
             "Invalid realtime websocket endpoint `{endpoint}`: {error}",
         ))
     })?;
 
-    let has_model = url.query_pairs().any(|(key, _)| key == "model");
-    if !has_model {
-        url.query_pairs_mut().append_pair("model", model);
-    }
+    let retained_pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .filter_map(|(key, value)| {
+            if key == "model" || key == "intent" {
+                None
+            } else {
+                Some((key.into_owned(), value.into_owned()))
+            }
+        })
+        .collect();
 
-    let has_intent = url.query_pairs().any(|(key, _)| key == "intent");
-    if !has_intent {
-        url.query_pairs_mut().append_pair("intent", "transcription");
+    {
+        let mut query_pairs = url.query_pairs_mut();
+        query_pairs.clear();
+        for (key, value) in retained_pairs {
+            query_pairs.append_pair(&key, &value);
+        }
+        query_pairs.append_pair("intent", "transcription");
     }
 
     Ok(url.to_string())
@@ -579,7 +590,7 @@ fn parse_server_event(payload: &Value) -> ParsedServerEvent {
                 .map(ParsedServerEvent::Delta)
                 .unwrap_or(ParsedServerEvent::Ignore)
         }
-        EVENT_COMPLETED | EVENT_FALLBACK_COMPLETED => extract_first_text(
+        EVENT_COMPLETED | EVENT_FALLBACK_COMPLETED => extract_first_string(
             payload,
             &["transcript", "text", "/item/transcript", "/item/text"],
         )
@@ -618,6 +629,20 @@ fn extract_first_text(payload: &Value, keys_or_pointers: &[&str]) -> Option<Stri
     None
 }
 
+fn extract_first_string(payload: &Value, keys_or_pointers: &[&str]) -> Option<String> {
+    for key_or_pointer in keys_or_pointers {
+        let maybe_value = if key_or_pointer.starts_with('/') {
+            payload.pointer(key_or_pointer)
+        } else {
+            payload.get(*key_or_pointer)
+        };
+        if let Some(value) = maybe_value.and_then(Value::as_str) {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
 fn build_session_update_payload(
     config: &OpenAiRealtimeTranscriptionConfig,
     options: &TranscriptionOptions,
@@ -633,27 +658,12 @@ fn build_session_update_payload(
     }
 
     json!({
-        "type": "session.update",
+        "type": "transcription_session.update",
         "session": {
-            "type": "transcription",
-            "audio": {
-                "input": {
-                    "format": {
-                        "type": "audio/pcm",
-                        "rate": REALTIME_OUTPUT_SAMPLE_RATE_HZ,
-                    },
-                    "noise_reduction": {
-                        "type": "near_field"
-                    },
-                    "transcription": transcription_config,
-                    "turn_detection": {
-                        "type": "server_vad",
-                        "threshold": config.turn_detection_threshold,
-                        "prefix_padding_ms": DEFAULT_PREFIX_PADDING_MS,
-                        "silence_duration_ms": config.silence_duration_ms,
-                    }
-                }
-            }
+            "input_audio_format": "pcm16",
+            // Disable server VAD so explicit commit controls when transcription occurs.
+            "turn_detection": null,
+            "input_audio_transcription": transcription_config,
         }
     })
 }
@@ -817,52 +827,40 @@ mod tests {
             },
         );
 
-        assert_eq!(payload["type"], Value::String("session.update".to_string()));
         assert_eq!(
-            payload["session"]["type"],
-            Value::String("transcription".to_string())
+            payload["type"],
+            Value::String("transcription_session.update".to_string())
         );
         assert_eq!(
-            payload["session"]["audio"]["input"]["transcription"]["model"],
+            payload["session"]["input_audio_transcription"]["model"],
             Value::String(config.transcription_model.clone())
         );
         assert_eq!(
-            payload["session"]["audio"]["input"]["transcription"]["language"],
+            payload["session"]["input_audio_transcription"]["language"],
             Value::String("en".to_string())
         );
         assert_eq!(
-            payload["session"]["audio"]["input"]["format"]["type"],
-            Value::String("audio/pcm".to_string())
+            payload["session"]["input_audio_transcription"]["prompt"],
+            Value::String("Dictation\nShort sentences".to_string())
         );
         assert_eq!(
-            payload["session"]["audio"]["input"]["format"]["rate"],
-            Value::from(REALTIME_OUTPUT_SAMPLE_RATE_HZ)
+            payload["session"]["input_audio_format"],
+            Value::String("pcm16".to_string())
         );
-        assert_eq!(
-            payload["session"]["audio"]["input"]["turn_detection"]["type"],
-            Value::String("server_vad".to_string())
-        );
-        assert_eq!(
-            payload["session"]["audio"]["input"]["turn_detection"]["prefix_padding_ms"],
-            Value::from(DEFAULT_PREFIX_PADDING_MS)
-        );
-        assert_eq!(
-            payload["session"]["audio"]["input"]["turn_detection"]["silence_duration_ms"],
-            Value::from(config.silence_duration_ms)
-        );
+        assert_eq!(payload["session"]["turn_detection"], Value::Null);
     }
 
     #[test]
-    fn resolve_realtime_endpoint_appends_model_and_intent_query_parameters() {
+    fn resolve_realtime_endpoint_enforces_transcription_intent_and_strips_model() {
         let endpoint = "wss://api.openai.com/v1/realtime";
-        let resolved = resolve_realtime_endpoint(endpoint, "gpt-realtime")
-            .expect("endpoint should parse and include model query");
+        let resolved =
+            resolve_realtime_endpoint(endpoint).expect("endpoint should parse and include intent");
         let parsed = Url::parse(&resolved).expect("resolved endpoint should be valid URL");
         let model = parsed
             .query_pairs()
             .find(|(key, _)| key == "model")
             .map(|(_, value)| value.to_string());
-        assert_eq!(model.as_deref(), Some("gpt-realtime"));
+        assert_eq!(model, None);
         let intent = parsed
             .query_pairs()
             .find(|(key, _)| key == "intent")
@@ -871,16 +869,26 @@ mod tests {
     }
 
     #[test]
-    fn resolve_realtime_endpoint_preserves_existing_intent() {
-        let endpoint = "wss://api.openai.com/v1/realtime?intent=conversation";
-        let resolved = resolve_realtime_endpoint(endpoint, "gpt-realtime")
-            .expect("endpoint should parse");
+    fn resolve_realtime_endpoint_overrides_existing_intent() {
+        let endpoint =
+            "wss://api.openai.com/v1/realtime?intent=conversation&foo=bar&model=gpt-realtime";
+        let resolved = resolve_realtime_endpoint(endpoint).expect("endpoint should parse");
         let parsed = Url::parse(&resolved).expect("resolved endpoint should be valid URL");
         let intent = parsed
             .query_pairs()
             .find(|(key, _)| key == "intent")
             .map(|(_, value)| value.to_string());
-        assert_eq!(intent.as_deref(), Some("conversation"));
+        assert_eq!(intent.as_deref(), Some("transcription"));
+        let model = parsed
+            .query_pairs()
+            .find(|(key, _)| key == "model")
+            .map(|(_, value)| value.to_string());
+        assert_eq!(model, None);
+        let foo = parsed
+            .query_pairs()
+            .find(|(key, _)| key == "foo")
+            .map(|(_, value)| value.to_string());
+        assert_eq!(foo.as_deref(), Some("bar"));
     }
 
     #[test]
@@ -994,20 +1002,16 @@ mod tests {
             let first_text = first.into_text().expect("session update should be text");
             let first_payload: Value = serde_json::from_str(first_text.as_ref())
                 .expect("session update JSON should parse");
-            assert_eq!(first_payload["type"], "session.update");
-            assert_eq!(first_payload["session"]["type"], "transcription");
+            assert_eq!(first_payload["type"], "transcription_session.update");
             assert_eq!(
-                first_payload["session"]["audio"]["input"]["format"]["type"],
-                Value::String("audio/pcm".to_string())
+                first_payload["session"]["input_audio_format"],
+                Value::String("pcm16".to_string())
             );
             assert_eq!(
-                first_payload["session"]["audio"]["input"]["format"]["rate"],
-                Value::from(REALTIME_OUTPUT_SAMPLE_RATE_HZ)
-            );
-            assert_eq!(
-                first_payload["session"]["audio"]["input"]["transcription"]["model"],
+                first_payload["session"]["input_audio_transcription"]["model"],
                 Value::String(DEFAULT_OPENAI_TRANSCRIPTION_MODEL.to_string())
             );
+            assert_eq!(first_payload["session"]["turn_detection"], Value::Null);
 
             let append = read
                 .next()
@@ -1109,6 +1113,7 @@ mod tests {
             .expect("request URI lock should not be poisoned")
             .clone()
             .unwrap_or_default();
-        assert!(request_uri.contains("model=gpt-realtime"));
+        assert!(request_uri.contains("intent=transcription"));
+        assert!(!request_uri.contains("model="));
     }
 }
