@@ -11,19 +11,26 @@ import {
   RefreshCw,
   X,
 } from "lucide-react";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import { Alert, AlertDescription } from "@/components/ui/alert";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { Separator } from "@/components/ui/separator";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { useDarkMode } from "@/hooks/use-dark-mode";
 import HistoryPanel from "./HistoryPanel";
 import Settings from "./Settings";
 
 type AppStatus = "idle" | "listening" | "transcribing" | "error";
-type AppTab = "status" | "history" | "settings";
+type AppView = "dashboard" | "history" | "settings";
 type PermissionState = "not_determined" | "granted" | "denied";
 type PermissionType = "microphone" | "accessibility";
 type TranscriptReadyEvent = { text: string };
@@ -84,6 +91,34 @@ function setPermissionCardDismissed(dismissed: boolean) {
   } catch {
     // Ignore storage write errors
   }
+}
+
+/* ─── Sidebar Nav Item ─────────────────────────────── */
+type NavItemProps = {
+  icon: React.ReactNode;
+  label: string;
+  active: boolean;
+  onClick: () => void;
+  badge?: React.ReactNode;
+};
+
+function NavItem({ icon, label, active, onClick, badge }: NavItemProps) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        "flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-[13px] font-medium transition-colors",
+        active
+          ? "bg-sidebar-accent text-sidebar-accent-foreground"
+          : "text-sidebar-foreground/60 hover:bg-sidebar-accent/50 hover:text-sidebar-foreground"
+      )}
+    >
+      {icon}
+      <span className="flex-1 text-left truncate">{label}</span>
+      {badge}
+    </button>
+  );
 }
 
 /* ─── Permission status icon ───────────────────────── */
@@ -200,8 +235,8 @@ function PermissionOnboardingCard({
   );
 }
 
-/* ─── Status View ───────────────────────────────────── */
-type StatusViewProps = {
+/* ─── Dashboard View ────────────────────────────────── */
+type DashboardViewProps = {
   audioLevel: number;
   isRefreshingPermissions: boolean;
   lastTranscript: string;
@@ -216,7 +251,7 @@ type StatusViewProps = {
   statusDescription: string;
 };
 
-function StatusView({
+function DashboardView({
   audioLevel,
   isRefreshingPermissions,
   lastTranscript,
@@ -229,7 +264,7 @@ function StatusView({
   showPermissionsCard,
   status,
   statusDescription,
-}: StatusViewProps) {
+}: DashboardViewProps) {
   const statusColors: Record<AppStatus, string> = {
     idle: "bg-muted-foreground",
     listening: "bg-blue-500 animate-pulse-dot",
@@ -313,18 +348,25 @@ function StatusView({
   );
 }
 
+/* ─── View Title Map ────────────────────────────────── */
+const VIEW_TITLES: Record<AppView, string> = {
+  dashboard: "Dashboard",
+  history: "History",
+  settings: "Settings",
+};
+
 /* ─── Main App ──────────────────────────────────────── */
 function App() {
   useDarkMode();
 
   const [status, setStatus] = useState<AppStatus>("idle");
-  const [activeTab, setActiveTab] = useState<AppTab>("status");
+  const [activeView, setActiveView] = useState<AppView>("dashboard");
   const [errorMessage, setErrorMessage] = useState("");
   const [audioLevel, setAudioLevel] = useState(0);
   const [lastTranscript, setLastTranscript] = useState("");
   const [historyRefreshSignal, setHistoryRefreshSignal] = useState(0);
   const [backendSynced, setBackendSynced] = useState<boolean>(true);
-  const activeTabRef = useRef<AppTab>(activeTab);
+  const activeViewRef = useRef<AppView>(activeView);
 
   const [permissions, setPermissions] = useState<PermissionSnapshot | null>(null);
   const [permissionErrorMessage, setPermissionErrorMessage] = useState("");
@@ -377,8 +419,8 @@ function App() {
   }, []);
 
   useEffect(() => {
-    activeTabRef.current = activeTab;
-  }, [activeTab]);
+    activeViewRef.current = activeView;
+  }, [activeView]);
 
   useEffect(() => {
     let isMounted = true;
@@ -423,7 +465,7 @@ function App() {
           }),
           listen<TranscriptReadyEvent>("voice://transcript-ready", ({ payload }) => {
             setLastTranscript(payload.text ?? "");
-            if (activeTabRef.current === "history") {
+            if (activeViewRef.current === "history") {
               setHistoryRefreshSignal((current) => current + 1);
             }
           }),
@@ -477,72 +519,124 @@ function App() {
     return STATUS_DESC[status] ?? "Unknown state.";
   }, [errorMessage, status]);
 
+  /* Status dot color for the sidebar indicator */
+  const statusDotColor = useMemo(() => {
+    switch (status) {
+      case "listening":
+        return "bg-blue-500";
+      case "transcribing":
+        return "bg-amber-500";
+      case "error":
+        return "bg-destructive";
+      default:
+        return "bg-emerald-500";
+    }
+  }, [status]);
+
   return (
-    <main className="flex h-screen flex-col p-3">
-      {/* Header */}
-      <header className="mb-2 shrink-0">
-        <p className="text-[10px] font-medium uppercase tracking-widest text-muted-foreground">
-          Voice Utility
-        </p>
-        <h1 className="text-lg font-bold tracking-tight">
-          {activeTab === "status" ? "Status" : activeTab === "history" ? "History" : "Settings"}
-        </h1>
-      </header>
+    <TooltipProvider delayDuration={400}>
+      <main className="flex h-screen overflow-hidden">
+        {/* ─── Left Sidebar ─── */}
+        <aside className="flex w-[180px] shrink-0 flex-col border-r border-sidebar-border bg-sidebar">
+          {/* App identity */}
+          <div className="flex items-center gap-2 px-3 pt-4 pb-3" data-tauri-drag-region="">
+            <div className={cn(
+              "flex size-7 items-center justify-center rounded-lg bg-sidebar-primary",
+            )}>
+              <Mic className="size-3.5 text-sidebar-primary-foreground" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <p className="text-sm font-semibold text-sidebar-foreground tracking-tight">Voice</p>
+            </div>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <div className={cn("size-2 shrink-0 rounded-full", statusDotColor)} />
+              </TooltipTrigger>
+              <TooltipContent side="right" className="text-xs">
+                {STATUS_LABEL[status]}
+              </TooltipContent>
+            </Tooltip>
+          </div>
 
-      {/* Tabs */}
-      <Tabs
-        value={activeTab}
-        onValueChange={(v) => setActiveTab(v as AppTab)}
-        className="flex min-h-0 flex-1 flex-col"
-      >
-        <TabsList className="mb-3 grid w-full shrink-0 grid-cols-3">
-          <TabsTrigger value="status" className="gap-1.5 text-xs">
-            <Mic className="size-3.5" />
-            Status
-          </TabsTrigger>
-          <TabsTrigger value="history" className="gap-1.5 text-xs">
-            <History className="size-3.5" />
-            History
-          </TabsTrigger>
-          <TabsTrigger value="settings" className="gap-1.5 text-xs">
-            <SettingsIcon className="size-3.5" />
-            Settings
-          </TabsTrigger>
-        </TabsList>
+          <Separator className="bg-sidebar-border" />
 
-        <TabsContent value="status" className="mt-0 flex-1 overflow-y-auto pr-1">
-          <StatusView
-            audioLevel={audioLevel}
-            isRefreshingPermissions={isRefreshingPermissions}
-            lastTranscript={lastTranscript}
-            onDismissPermissions={dismissPermissionCard}
-            onRefreshPermissions={() => void refreshPermissions()}
-            onRequestPermission={requestPermission}
-            permissionErrorMessage={permissionErrorMessage}
-            permissions={permissions}
-            requestingPermission={requestingPermission}
-            showPermissionsCard={showPermissionsCard}
-            status={status}
-            statusDescription={statusDescription}
-          />
-        </TabsContent>
+          {/* Primary nav */}
+          <nav className="flex flex-1 flex-col gap-0.5 px-2 py-2">
+            <NavItem
+              icon={<Mic className="size-4 shrink-0" />}
+              label="Dashboard"
+              active={activeView === "dashboard"}
+              onClick={() => setActiveView("dashboard")}
+            />
+            <NavItem
+              icon={<History className="size-4 shrink-0" />}
+              label="History"
+              active={activeView === "history"}
+              onClick={() => setActiveView("history")}
+            />
 
-        <TabsContent value="history" className="mt-0 flex-1 overflow-y-auto pr-1">
-          <HistoryPanel refreshSignal={historyRefreshSignal} />
-        </TabsContent>
+            {/* Spacer to push settings to bottom */}
+            <div className="flex-1" />
 
-        <TabsContent value="settings" className="mt-0 flex-1 overflow-y-auto pr-1">
-          <Settings />
-        </TabsContent>
-      </Tabs>
+            <Separator className="my-1 bg-sidebar-border" />
 
-      {/* Backend sync warning */}
-      {!backendSynced && (
-        <p className="mt-1 shrink-0 text-center text-[11px] text-muted-foreground">
-          Backend: frontend-only fallback
-        </p>
-      )}
-    </main>
+            <NavItem
+              icon={<SettingsIcon className="size-4 shrink-0" />}
+              label="Settings"
+              active={activeView === "settings"}
+              onClick={() => setActiveView("settings")}
+            />
+          </nav>
+
+          {/* Backend sync warning in sidebar footer */}
+          {!backendSynced && (
+            <div className="px-3 pb-2">
+              <p className="text-[10px] text-sidebar-foreground/50 text-center">
+                Backend offline
+              </p>
+            </div>
+          )}
+        </aside>
+
+        {/* ─── Right Content ─── */}
+        <div className="flex min-w-0 flex-1 flex-col">
+          {/* Content header */}
+          <header className="shrink-0 border-b px-4 py-3" data-tauri-drag-region="">
+            <h1 className="text-sm font-semibold tracking-tight">
+              {VIEW_TITLES[activeView]}
+            </h1>
+          </header>
+
+          {/* Content body */}
+          <ScrollArea className="flex-1">
+            <div className="p-4">
+              {activeView === "dashboard" && (
+                <DashboardView
+                  audioLevel={audioLevel}
+                  isRefreshingPermissions={isRefreshingPermissions}
+                  lastTranscript={lastTranscript}
+                  onDismissPermissions={dismissPermissionCard}
+                  onRefreshPermissions={() => void refreshPermissions()}
+                  onRequestPermission={requestPermission}
+                  permissionErrorMessage={permissionErrorMessage}
+                  permissions={permissions}
+                  requestingPermission={requestingPermission}
+                  showPermissionsCard={showPermissionsCard}
+                  status={status}
+                  statusDescription={statusDescription}
+                />
+              )}
+              {activeView === "history" && (
+                <HistoryPanel refreshSignal={historyRefreshSignal} />
+              )}
+              {activeView === "settings" && (
+                <Settings />
+              )}
+            </div>
+          </ScrollArea>
+        </div>
+      </main>
+    </TooltipProvider>
   );
 }
 
