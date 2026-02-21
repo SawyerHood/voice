@@ -10,6 +10,7 @@ const DEFAULT_ERROR_RESET_DELAY_MS: u64 = 1_500;
 pub enum PipelineErrorStage {
     RecordingStart,
     RecordingStop,
+    RecordingRuntime,
     Transcription,
     TextInsertion,
 }
@@ -19,6 +20,7 @@ impl PipelineErrorStage {
         match self {
             Self::RecordingStart => "recording_start",
             Self::RecordingStop => "recording_stop",
+            Self::RecordingRuntime => "recording_runtime",
             Self::Transcription => "transcription",
             Self::TextInsertion => "text_insertion",
         }

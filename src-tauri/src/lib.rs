@@ -10,10 +10,16 @@ mod text_insertion_service;
 mod transcription;
 mod voice_pipeline;
 
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use async_trait::async_trait;
-use audio_capture_service::{AudioCaptureService, MicrophoneInfo, RecordedAudio};
+use audio_capture_service::{
+    AudioCaptureService, AudioInputStreamErrorEvent, MicrophoneInfo, RecordedAudio,
+    AUDIO_INPUT_STREAM_ERROR_EVENT,
+};
 use history_store::HistoryStore;
 use hotkey_service::HotkeyService;
 use permission_service::PermissionService;
@@ -33,6 +39,7 @@ use voice_pipeline::{PipelineError, VoicePipeline, VoicePipelineDelegate};
 const EVENT_STATUS_CHANGED: &str = "voice://status-changed";
 const EVENT_TRANSCRIPT_READY: &str = "voice://transcript-ready";
 const EVENT_PIPELINE_ERROR: &str = "voice://pipeline-error";
+const AUDIO_STREAM_ERROR_RESET_DELAY_MS: u64 = 1_500;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -180,6 +187,44 @@ fn emit_pipeline_error_event(app: &AppHandle, error: &PipelineError) {
     let _ = app.emit(EVENT_PIPELINE_ERROR, payload);
 }
 
+fn parse_audio_stream_error_message(payload: &str) -> String {
+    serde_json::from_str::<AudioInputStreamErrorEvent>(payload)
+        .ok()
+        .map(|event| event.message.trim().to_string())
+        .filter(|message| !message.is_empty())
+        .unwrap_or_else(|| "Microphone stream failed unexpectedly".to_string())
+}
+
+fn handle_audio_input_stream_error(app: &AppHandle, message: String) {
+    let hotkey_service = app.state::<HotkeyService>();
+    hotkey_service.force_stop_recording(app);
+
+    let state = app.state::<AppState>();
+    if let Err(error) = state
+        .services
+        .audio_capture_service
+        .abort_recording(app.clone())
+    {
+        eprintln!("Failed to abort recording after stream error: {error}");
+    }
+
+    let pipeline_error = PipelineError {
+        stage: voice_pipeline::PipelineErrorStage::RecordingRuntime,
+        message,
+    };
+    emit_pipeline_error_event(app, &pipeline_error);
+    set_status_for_state(app, &state, AppStatus::Error);
+
+    let reset_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(AUDIO_STREAM_ERROR_RESET_DELAY_MS)).await;
+        let state = reset_app.state::<AppState>();
+        if get_status_from_state(&state) == AppStatus::Error {
+            set_status_for_state(&reset_app, &state, AppStatus::Idle);
+        }
+    });
+}
+
 fn register_pipeline_handlers(app: &AppHandle) {
     let start_app = app.clone();
     app.listen(hotkey_service::EVENT_RECORDING_STARTED, move |_| {
@@ -199,6 +244,12 @@ fn register_pipeline_handlers(app: &AppHandle) {
                 .handle_hotkey_stopped(&delegate)
                 .await;
         });
+    });
+
+    let stream_error_app = app.clone();
+    app.listen(AUDIO_INPUT_STREAM_ERROR_EVENT, move |event| {
+        let message = parse_audio_stream_error_message(event.payload());
+        handle_audio_input_stream_error(&stream_error_app, message);
     });
 }
 

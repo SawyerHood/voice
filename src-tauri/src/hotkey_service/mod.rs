@@ -138,6 +138,31 @@ impl HotkeyService {
             .unwrap_or(false)
     }
 
+    pub fn force_stop_recording<R: Runtime>(&self, app: &AppHandle<R>) -> bool {
+        let payload = {
+            let mut state = match self.state.lock() {
+                Ok(state) => state,
+                Err(_) => return false,
+            };
+
+            if !state.is_recording {
+                return false;
+            }
+
+            state.is_recording = false;
+            RecordingStateChangedEvent {
+                is_recording: false,
+                mode: state.config.mode,
+                shortcut: state.config.shortcut.clone(),
+                transition: RecordingTransition::Stopped,
+                trigger: HotkeyTrigger::Released,
+            }
+        };
+
+        let _ = app.emit(EVENT_RECORDING_STATE_CHANGED, &payload);
+        true
+    }
+
     pub fn apply_config<R: Runtime>(
         &self,
         app: &AppHandle<R>,

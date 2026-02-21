@@ -2,7 +2,7 @@ use std::{
     fmt,
     sync::{
         atomic::{AtomicU32, Ordering},
-        mpsc::{self, Receiver, RecvTimeoutError, Sender},
+        mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
         Arc, Mutex,
     },
     thread::{self, JoinHandle},
@@ -11,12 +11,13 @@ use std::{
 
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
-    Device, SampleFormat, Stream, StreamConfig,
+    Device, SampleFormat, Stream, StreamConfig, StreamError,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
 pub const AUDIO_LEVEL_EVENT: &str = "audio-level";
+pub const AUDIO_INPUT_STREAM_ERROR_EVENT: &str = "voice://audio-input-stream-error";
 const LEVEL_EVENT_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, Serialize)]
@@ -38,6 +39,12 @@ pub struct RecordedAudio {
     pub duration_ms: u64,
     pub device_id: String,
     pub device_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioInputStreamErrorEvent {
+    pub message: String,
 }
 
 struct RecordingControl {
@@ -253,6 +260,39 @@ impl AudioCaptureService {
         })
     }
 
+    pub fn abort_recording(&self, app_handle: AppHandle) -> Result<bool, String> {
+        let control = {
+            let mut recording_guard = self
+                .recording
+                .lock()
+                .map_err(|_| "Audio capture state lock is poisoned".to_string())?;
+            recording_guard.take()
+        };
+
+        let Some(RecordingControl {
+            stop_tx,
+            join_handle,
+            ..
+        }) = control
+        else {
+            return Ok(false);
+        };
+
+        let _ = stop_tx.send(());
+        let join_target = join_handle.thread().id();
+        if join_target == thread::current().id() {
+            drop(join_handle);
+        } else if join_handle.join().is_err() {
+            return Err("Microphone capture thread panicked while aborting".to_string());
+        }
+
+        self.audio_level_bits
+            .store(0.0_f32.to_bits(), Ordering::Relaxed);
+        let _ = app_handle.emit(AUDIO_LEVEL_EVENT, 0.0_f32);
+
+        Ok(true)
+    }
+
     pub fn get_audio_level(&self) -> f32 {
         f32::from_bits(self.audio_level_bits.load(Ordering::Relaxed))
     }
@@ -270,10 +310,9 @@ fn recording_thread_main(
         &selected_device_id,
         Arc::clone(&samples),
         Arc::clone(&audio_level_bits),
-        app_handle.clone(),
     );
 
-    let (stream, runtime) = match startup_result {
+    let (stream, runtime, stream_error_rx) = match startup_result {
         Ok(started) => started,
         Err(err) => {
             let _ = ready_tx.send(Err(err));
@@ -282,19 +321,26 @@ fn recording_thread_main(
     };
 
     let _ = ready_tx.send(Ok(runtime));
-    let _ = stop_rx.recv();
+    let loop_exit = run_recording_loop(&stop_rx, &stream_error_rx, || {
+        let level = f32::from_bits(audio_level_bits.load(Ordering::Relaxed));
+        let _ = app_handle.emit(AUDIO_LEVEL_EVENT, level);
+    });
 
     drop(stream);
     audio_level_bits.store(0.0_f32.to_bits(), Ordering::Relaxed);
     let _ = app_handle.emit(AUDIO_LEVEL_EVENT, 0.0_f32);
+
+    if let RecordingLoopExit::StreamError(message) = loop_exit {
+        let payload = AudioInputStreamErrorEvent { message };
+        let _ = app_handle.emit(AUDIO_INPUT_STREAM_ERROR_EVENT, payload);
+    }
 }
 
 fn start_recording_worker(
     selected_device_id: &str,
     samples: Arc<Mutex<Vec<i16>>>,
     audio_level_bits: Arc<AtomicU32>,
-    app_handle: AppHandle,
-) -> Result<(Stream, RecordingRuntime), String> {
+) -> Result<(Stream, RecordingRuntime, Receiver<String>), String> {
     let host = cpal::default_host();
     let devices = enumerate_input_devices(&host)?;
     let selected_device = select_input_device(devices, Some(selected_device_id))?;
@@ -319,7 +365,7 @@ fn start_recording_worker(
         sample_buffer.reserve(usize::try_from(sample_rate_hz).unwrap_or(48_000) * 10);
     }
 
-    let last_emit = Arc::new(Mutex::new(Instant::now() - LEVEL_EVENT_INTERVAL));
+    let (stream_error_tx, stream_error_rx) = mpsc::channel::<String>();
 
     let stream = build_input_stream(
         &selected_device.device,
@@ -328,8 +374,7 @@ fn start_recording_worker(
         input_channels,
         samples,
         audio_level_bits,
-        app_handle,
-        last_emit,
+        stream_error_tx,
     )?;
 
     stream
@@ -342,7 +387,43 @@ fn start_recording_worker(
             sample_rate_hz,
             channels: 1,
         },
+        stream_error_rx,
     ))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RecordingLoopExit {
+    StopRequested,
+    StreamError(String),
+}
+
+fn run_recording_loop<F>(
+    stop_rx: &Receiver<()>,
+    stream_error_rx: &Receiver<String>,
+    mut on_level_tick: F,
+) -> RecordingLoopExit
+where
+    F: FnMut(),
+{
+    loop {
+        match stream_error_rx.try_recv() {
+            Ok(message) => return RecordingLoopExit::StreamError(message),
+            Err(TryRecvError::Disconnected | TryRecvError::Empty) => {}
+        }
+
+        match stop_rx.recv_timeout(LEVEL_EVENT_INTERVAL) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                return RecordingLoopExit::StopRequested
+            }
+            Err(RecvTimeoutError::Timeout) => on_level_tick(),
+        }
+    }
+}
+
+fn report_stream_error(format_label: &str, stream_error_tx: &Sender<String>, err: StreamError) {
+    let message = format!("Microphone stream error ({format_label}): {err}");
+    let _ = stream_error_tx.send(message.clone());
+    eprintln!("{message}");
 }
 
 fn enumerate_input_devices(host: &cpal::Host) -> Result<Vec<EnumeratedInputDevice>, String> {
@@ -420,15 +501,13 @@ fn build_input_stream(
     input_channels: usize,
     samples: Arc<Mutex<Vec<i16>>>,
     audio_level_bits: Arc<AtomicU32>,
-    app_handle: AppHandle,
-    last_emit: Arc<Mutex<Instant>>,
+    stream_error_tx: Sender<String>,
 ) -> Result<Stream, String> {
     match sample_format {
         SampleFormat::F32 => {
             let samples = Arc::clone(&samples);
             let level_bits = Arc::clone(&audio_level_bits);
-            let app_handle = app_handle.clone();
-            let last_emit = Arc::clone(&last_emit);
+            let stream_error_tx = stream_error_tx.clone();
             device
                 .build_input_stream(
                     stream_config,
@@ -439,12 +518,10 @@ fn build_input_stream(
                             |sample| sample,
                             &samples,
                             &level_bits,
-                            &app_handle,
-                            &last_emit,
                         );
                     },
                     move |err| {
-                        eprintln!("Audio input stream error (f32): {err}");
+                        report_stream_error("f32", &stream_error_tx, err);
                     },
                     None,
                 )
@@ -453,8 +530,7 @@ fn build_input_stream(
         SampleFormat::I16 => {
             let samples = Arc::clone(&samples);
             let level_bits = Arc::clone(&audio_level_bits);
-            let app_handle = app_handle.clone();
-            let last_emit = Arc::clone(&last_emit);
+            let stream_error_tx = stream_error_tx.clone();
             device
                 .build_input_stream(
                     stream_config,
@@ -465,12 +541,10 @@ fn build_input_stream(
                             |sample| sample as f32 / i16::MAX as f32,
                             &samples,
                             &level_bits,
-                            &app_handle,
-                            &last_emit,
                         );
                     },
                     move |err| {
-                        eprintln!("Audio input stream error (i16): {err}");
+                        report_stream_error("i16", &stream_error_tx, err);
                     },
                     None,
                 )
@@ -479,8 +553,7 @@ fn build_input_stream(
         SampleFormat::U16 => {
             let samples = Arc::clone(&samples);
             let level_bits = Arc::clone(&audio_level_bits);
-            let app_handle = app_handle.clone();
-            let last_emit = Arc::clone(&last_emit);
+            let stream_error_tx = stream_error_tx.clone();
             device
                 .build_input_stream(
                     stream_config,
@@ -491,12 +564,10 @@ fn build_input_stream(
                             |sample| (sample as f32 / u16::MAX as f32) * 2.0 - 1.0,
                             &samples,
                             &level_bits,
-                            &app_handle,
-                            &last_emit,
                         );
                     },
                     move |err| {
-                        eprintln!("Audio input stream error (u16): {err}");
+                        report_stream_error("u16", &stream_error_tx, err);
                     },
                     None,
                 )
@@ -514,8 +585,6 @@ fn process_input_frames<T, F>(
     to_f32: F,
     samples: &Arc<Mutex<Vec<i16>>>,
     audio_level_bits: &Arc<AtomicU32>,
-    app_handle: &AppHandle,
-    last_emit: &Arc<Mutex<Instant>>,
 ) where
     T: Copy,
     F: Fn(T) -> f32,
@@ -558,23 +627,6 @@ fn process_input_frames<T, F>(
     };
     let level = peak.max(rms);
     audio_level_bits.store(level.to_bits(), Ordering::Relaxed);
-
-    let should_emit = {
-        let Ok(mut last_emit_guard) = last_emit.lock() else {
-            return;
-        };
-
-        if last_emit_guard.elapsed() >= LEVEL_EVENT_INTERVAL {
-            *last_emit_guard = Instant::now();
-            true
-        } else {
-            false
-        }
-    };
-
-    if should_emit {
-        let _ = app_handle.emit(AUDIO_LEVEL_EVENT, level);
-    }
 }
 
 fn float_to_pcm16(sample: f32) -> i16 {
@@ -634,7 +686,12 @@ fn pcm16_to_wav_bytes(
 
 #[cfg(test)]
 mod tests {
-    use super::{float_to_pcm16, pcm16_to_wav_bytes, slugify_device_name};
+    use std::sync::mpsc;
+
+    use super::{
+        float_to_pcm16, pcm16_to_wav_bytes, run_recording_loop, slugify_device_name,
+        RecordingLoopExit,
+    };
 
     #[test]
     fn slugify_device_name_normalizes_ascii() {
@@ -679,5 +736,32 @@ mod tests {
         assert_eq!(encoded_first, samples[0]);
         assert_eq!(encoded_second, samples[1]);
         assert_eq!(encoded_third, samples[2]);
+    }
+
+    #[test]
+    fn recording_loop_returns_stream_error_when_callback_reports_error() {
+        let (_stop_tx, stop_rx) = mpsc::channel::<()>();
+        let (stream_error_tx, stream_error_rx) = mpsc::channel::<String>();
+        stream_error_tx
+            .send("stream disconnected".to_string())
+            .expect("stream error should send");
+
+        let exit = run_recording_loop(&stop_rx, &stream_error_rx, || {});
+
+        assert_eq!(
+            exit,
+            RecordingLoopExit::StreamError("stream disconnected".to_string())
+        );
+    }
+
+    #[test]
+    fn recording_loop_stops_when_stop_signal_received() {
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        let (_stream_error_tx, stream_error_rx) = mpsc::channel::<String>();
+        stop_tx.send(()).expect("stop signal should send");
+
+        let exit = run_recording_loop(&stop_rx, &stream_error_rx, || {});
+
+        assert_eq!(exit, RecordingLoopExit::StopRequested);
     }
 }
