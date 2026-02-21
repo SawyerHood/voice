@@ -15,9 +15,11 @@
       {
         "label": "main",
         "title": "Voice",
-        "width": 420,
-        "height": 320,
-        "resizable": false,
+        "width": 480,
+        "height": 640,
+        "minWidth": 380,
+        "minHeight": 480,
+        "resizable": true,
         "visible": false,
         "alwaysOnTop": true,
         "skipTaskbar": true
