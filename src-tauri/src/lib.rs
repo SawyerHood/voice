@@ -51,6 +51,7 @@ use voice_pipeline::{PipelineError, PipelineTranscript, VoicePipeline, VoicePipe
 
 const EVENT_STATUS_CHANGED: &str = "voice://status-changed";
 const EVENT_TRANSCRIPT_READY: &str = "voice://transcript-ready";
+const EVENT_TRANSCRIPTION_DELTA: &str = "voice://transcription-delta";
 const EVENT_PIPELINE_ERROR: &str = "voice://pipeline-error";
 const EVENT_OVERLAY_AUDIO_LEVEL: &str = "voice://overlay-audio-level";
 const AUDIO_STREAM_ERROR_RESET_DELAY_MS: u64 = 1_500;
@@ -430,8 +431,20 @@ impl VoicePipelineDelegate for AppPipelineDelegate {
 
     async fn transcribe(&self, wav_bytes: Vec<u8>) -> Result<PipelineTranscript, String> {
         let settings = self.current_settings();
+        let app_for_delta = self.app.clone();
+        let session_id_for_delta = self.session_id;
         let options = TranscriptionOptions {
             language: settings.language,
+            on_delta: Some(Arc::new(move |delta| {
+                if let Some(session_id) = session_id_for_delta {
+                    let runtime_state = app_for_delta.state::<PipelineRuntimeState>();
+                    if !runtime_state.is_session_active(session_id) {
+                        return;
+                    }
+                }
+
+                emit_transcription_delta_event(&app_for_delta, &delta);
+            })),
             ..TranscriptionOptions::default()
         };
         let orchestrator = {
@@ -570,6 +583,12 @@ fn emit_transcript_event(app: &AppHandle, transcript: &str) {
     };
     if let Err(error) = app.emit(EVENT_TRANSCRIPT_READY, payload) {
         warn!(%error, "failed to emit transcript ready event");
+    }
+}
+
+fn emit_transcription_delta_event(app: &AppHandle, delta: &str) {
+    if let Err(error) = app.emit(EVENT_TRANSCRIPTION_DELTA, delta.to_string()) {
+        warn!(%error, "failed to emit transcription delta event");
     }
 }
 
@@ -1245,11 +1264,16 @@ async fn transcribe_audio(
         "command transcription requested"
     );
     set_status_for_state(&app, &state, AppStatus::Transcribing);
+    let app_for_delta = app.clone();
+    let mut request_options = options.unwrap_or_default();
+    request_options.on_delta = Some(Arc::new(move |delta| {
+        emit_transcription_delta_event(&app_for_delta, &delta);
+    }));
 
     let result = state
         .services
         .transcription_orchestrator
-        .transcribe(audio_bytes, options.unwrap_or_default())
+        .transcribe(audio_bytes, request_options)
         .await;
 
     match result {

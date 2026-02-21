@@ -103,6 +103,17 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+.overlay-transcription-preview {
+  margin: 0;
+  grid-column: 2 / 4;
+  font-size: 12px;
+  font-weight: 500;
+  color: rgba(243, 247, 255, 0.88);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 @keyframes recording-pulse {
   0% {
     box-shadow: 0 0 0 0 rgba(255, 79, 94, 0.55);

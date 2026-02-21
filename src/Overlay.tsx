@@ -10,6 +10,7 @@ const BAR_COUNT = 22;
 const SMOOTHING_FACTOR = 0.35;
 const EVENT_STATUS_CHANGED = "voice://status-changed";
 const EVENT_OVERLAY_AUDIO_LEVEL = "voice://overlay-audio-level";
+const EVENT_TRANSCRIPTION_DELTA = "voice://transcription-delta";
 
 function emptyHistory(): number[] {
   return Array.from({ length: BAR_COUNT }, () => 0);
@@ -19,6 +20,7 @@ function Overlay() {
   const [status, setStatus] = useState<AppStatus>("idle");
   const [elapsedMs, setElapsedMs] = useState(0);
   const [audioHistory, setAudioHistory] = useState<number[]>(() => emptyHistory());
+  const [transcriptionPreview, setTranscriptionPreview] = useState("");
   const statusRef = useRef<AppStatus>("idle");
   const startedAtRef = useRef<number | null>(null);
   const smoothedHistoryRef = useRef<number[]>(emptyHistory());
@@ -56,6 +58,7 @@ function Overlay() {
         return;
       }
 
+      setTranscriptionPreview("");
       startedAtRef.current = null;
       setElapsedMs(0);
       resetHistory();
@@ -91,6 +94,13 @@ function Overlay() {
             }
 
             pushSmoothedLevel(payload);
+          }),
+          listen<string>(EVENT_TRANSCRIPTION_DELTA, ({ payload }) => {
+            if (statusRef.current !== "transcribing") {
+              return;
+            }
+
+            setTranscriptionPreview((current) => current + (payload ?? ""));
           }),
         ]);
 
@@ -133,22 +143,30 @@ function Overlay() {
 
   return (
     <main className="overlay-root">
-      <section className={`overlay-pill ${status === "listening" ? "active" : ""}`}>
+      <section className={`overlay-pill ${status !== "idle" ? "active" : ""}`}>
         <span className="recording-indicator" aria-hidden="true">
           <span className="recording-dot" />
         </span>
 
-        <div className="overlay-waveform" aria-hidden="true">
-          {audioHistory.map((level, index) => (
-            <span
-              key={index}
-              className="overlay-waveform-bar"
-              style={{ "--level": level } as CSSProperties}
-            />
-          ))}
-        </div>
+        {status === "transcribing" ? (
+          <p className="overlay-transcription-preview">
+            {transcriptionPreview || "Transcribing..."}
+          </p>
+        ) : (
+          <>
+            <div className="overlay-waveform" aria-hidden="true">
+              {audioHistory.map((level, index) => (
+                <span
+                  key={index}
+                  className="overlay-waveform-bar"
+                  style={{ "--level": level } as CSSProperties}
+                />
+              ))}
+            </div>
 
-        <p className="overlay-elapsed">{formatElapsedLabel(elapsedMs)}</p>
+            <p className="overlay-elapsed">{formatElapsedLabel(elapsedMs)}</p>
+          </>
+        )}
       </section>
     </main>
   );

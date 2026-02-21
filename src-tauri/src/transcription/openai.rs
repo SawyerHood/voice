@@ -12,16 +12,18 @@ use tracing::{debug, error, info, warn};
 use crate::api_key_store::ApiKeyStore;
 
 use super::{
-    normalize_transcript_text, TranscriptionError, TranscriptionOptions, TranscriptionProvider,
-    TranscriptionResult,
+    normalize_transcript_text, TranscriptionDeltaCallback, TranscriptionError,
+    TranscriptionOptions, TranscriptionProvider, TranscriptionResult,
 };
 
 const DEFAULT_OPENAI_ENDPOINT: &str = "https://api.openai.com/v1/audio/transcriptions";
-const DEFAULT_OPENAI_MODEL: &str = "whisper-1";
+const DEFAULT_OPENAI_MODEL: &str = "gpt-4o-mini-transcribe";
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 180;
 const DEFAULT_MAX_RETRIES: u32 = 3;
 const DEFAULT_INITIAL_BACKOFF_MS: u64 = 500;
 const DEFAULT_MAX_BACKOFF_MS: u64 = 5_000;
+const STREAMING_TRANSCRIPT_DELTA_EVENT: &str = "transcript.text.delta";
+const STREAMING_TRANSCRIPT_DONE_EVENT: &str = "transcript.text.done";
 
 #[derive(Debug, Clone)]
 pub struct OpenAiTranscriptionConfig {
@@ -196,15 +198,28 @@ impl OpenAiTranscriptionProvider {
         state.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
 
+    fn model_supports_streaming(&self) -> bool {
+        self.config
+            .model
+            .to_ascii_lowercase()
+            .contains("transcribe")
+    }
+
     fn build_form(
         &self,
         audio_data: Bytes,
         language: Option<&str>,
         prompt: Option<&str>,
+        stream: bool,
     ) -> Result<multipart::Form, TranscriptionError> {
+        let response_format = if stream { "text" } else { "verbose_json" };
         let mut form = multipart::Form::new()
             .text("model", self.config.model.clone())
-            .text("response_format", "verbose_json".to_string());
+            .text("response_format", response_format.to_string());
+
+        if stream {
+            form = form.text("stream", "true".to_string());
+        }
 
         if let Some(language) = language {
             form = form.text("language", language.to_string());
@@ -226,6 +241,58 @@ impl OpenAiTranscriptionProvider {
 
         Ok(form.part("file", file_part))
     }
+
+    async fn parse_streaming_response(
+        &self,
+        mut response: reqwest::Response,
+        request_language: Option<String>,
+        on_delta: Option<&TranscriptionDeltaCallback>,
+    ) -> Result<TranscriptionResult, TranscriptionError> {
+        let mut stream_state = OpenAiStreamingState::default();
+        let mut line_buffer = Vec::<u8>::new();
+
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| map_transport_error(error).error)?
+        {
+            line_buffer.extend_from_slice(&chunk);
+            while let Some(newline_index) = line_buffer.iter().position(|byte| *byte == b'\n') {
+                let mut line_bytes = line_buffer.drain(..=newline_index).collect::<Vec<_>>();
+                if line_bytes.last() == Some(&b'\n') {
+                    line_bytes.pop();
+                }
+                if line_bytes.last() == Some(&b'\r') {
+                    line_bytes.pop();
+                }
+                let line = String::from_utf8(line_bytes).map_err(|error| {
+                    TranscriptionError::InvalidResponse(format!(
+                        "OpenAI stream payload contained invalid UTF-8: {error}",
+                    ))
+                })?;
+                stream_state.handle_line(&line, on_delta)?;
+            }
+        }
+
+        if !line_buffer.is_empty() {
+            let line = String::from_utf8(line_buffer).map_err(|error| {
+                TranscriptionError::InvalidResponse(format!(
+                    "OpenAI stream payload contained invalid UTF-8: {error}",
+                ))
+            })?;
+            stream_state.handle_line(&line, on_delta)?;
+        }
+
+        stream_state.finalize(on_delta)?;
+        let final_text = stream_state.final_text()?;
+
+        Ok(TranscriptionResult {
+            text: normalize_transcript_text(&final_text),
+            language: request_language,
+            duration_secs: None,
+            confidence: None,
+        })
+    }
 }
 
 #[async_trait]
@@ -239,15 +306,23 @@ impl TranscriptionProvider for OpenAiTranscriptionProvider {
         audio_data: Vec<u8>,
         options: TranscriptionOptions,
     ) -> Result<TranscriptionResult, TranscriptionError> {
+        let TranscriptionOptions {
+            language,
+            prompt,
+            context_hint,
+            on_delta,
+        } = options;
         let api_key = self.api_key()?;
-        let request_language = normalize_optional_string(options.language);
-        let request_prompt = build_prompt(options.prompt, options.context_hint);
+        let request_language = normalize_optional_string(language);
+        let request_prompt = build_prompt(prompt, context_hint);
         let request_language_for_payload = request_language.clone();
+        let stream_response = self.model_supports_streaming();
         let audio_data = Bytes::from(audio_data);
         let mut attempt_index = 0;
         info!(
             endpoint = %self.config.endpoint,
             model = %self.config.model,
+            stream = stream_response,
             audio_bytes = audio_data.len(),
             language = ?request_language,
             has_prompt = request_prompt.is_some(),
@@ -263,6 +338,7 @@ impl TranscriptionProvider for OpenAiTranscriptionProvider {
                 audio_data.clone(),
                 request_language.as_deref(),
                 request_prompt.as_deref(),
+                stream_response,
             )?;
 
             let response = self
@@ -303,6 +379,16 @@ impl TranscriptionProvider for OpenAiTranscriptionProvider {
                     attempt = attempt_index + 1,
                     "OpenAI transcription request succeeded"
                 );
+                if stream_response {
+                    return self
+                        .parse_streaming_response(
+                            response,
+                            request_language_for_payload.clone(),
+                            on_delta.as_ref(),
+                        )
+                        .await;
+                }
+
                 let response_payload: OpenAiTranscriptionResponse = response
                     .json()
                     .await
@@ -342,6 +428,119 @@ impl TranscriptionProvider for OpenAiTranscriptionProvider {
             return Err(http_error.error);
         }
     }
+}
+
+#[derive(Debug, Default)]
+struct OpenAiStreamingState {
+    current_event_name: Option<String>,
+    current_data_lines: Vec<String>,
+    saw_event_payload: bool,
+    transcript_from_deltas: String,
+    transcript_done: Option<String>,
+}
+
+impl OpenAiStreamingState {
+    fn handle_line(
+        &mut self,
+        line: &str,
+        on_delta: Option<&TranscriptionDeltaCallback>,
+    ) -> Result<(), TranscriptionError> {
+        if line.is_empty() {
+            self.flush_current_event(on_delta)?;
+            return Ok(());
+        }
+
+        if line.starts_with(':') {
+            return Ok(());
+        }
+
+        if let Some(event_name) = line.strip_prefix("event:") {
+            self.current_event_name = normalize_optional_string(Some(event_name.to_string()));
+            return Ok(());
+        }
+
+        if let Some(data) = line.strip_prefix("data:") {
+            self.current_data_lines
+                .push(data.trim_start_matches(' ').to_string());
+        }
+
+        Ok(())
+    }
+
+    fn finalize(
+        &mut self,
+        on_delta: Option<&TranscriptionDeltaCallback>,
+    ) -> Result<(), TranscriptionError> {
+        self.flush_current_event(on_delta)
+    }
+
+    fn final_text(self) -> Result<String, TranscriptionError> {
+        if !self.saw_event_payload {
+            return Err(TranscriptionError::InvalidResponse(
+                "OpenAI streaming response did not contain transcript events".to_string(),
+            ));
+        }
+
+        Ok(self.transcript_done.unwrap_or(self.transcript_from_deltas))
+    }
+
+    fn flush_current_event(
+        &mut self,
+        on_delta: Option<&TranscriptionDeltaCallback>,
+    ) -> Result<(), TranscriptionError> {
+        let event_name = self.current_event_name.take();
+        if self.current_data_lines.is_empty() {
+            return Ok(());
+        }
+
+        let data_payload = self.current_data_lines.join("\n");
+        self.current_data_lines.clear();
+        if data_payload.trim().is_empty() || data_payload.trim() == "[DONE]" {
+            return Ok(());
+        }
+
+        let parsed_payload = serde_json::from_str::<OpenAiStreamingEventPayload>(&data_payload)
+            .map_err(|error| {
+                TranscriptionError::InvalidResponse(format!(
+                    "Unable to parse OpenAI streaming payload: {error}",
+                ))
+            })?;
+        self.saw_event_payload = true;
+
+        let payload_event_name = parsed_payload
+            .kind
+            .and_then(|kind| normalize_optional_string(Some(kind)));
+        let resolved_event = payload_event_name.or(event_name);
+
+        match resolved_event.as_deref() {
+            Some(STREAMING_TRANSCRIPT_DELTA_EVENT) => {
+                if let Some(delta) = parsed_payload.delta {
+                    if let Some(callback) = on_delta {
+                        callback(delta.clone());
+                    }
+                    self.transcript_from_deltas.push_str(&delta);
+                }
+            }
+            Some(STREAMING_TRANSCRIPT_DONE_EVENT) => {
+                if let Some(text) = parsed_payload.text {
+                    self.transcript_done = Some(text);
+                }
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiStreamingEventPayload {
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    delta: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -548,8 +747,11 @@ fn seed_from_clock() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use mockito::Server;
-    use std::time::{Duration, Instant};
+    use mockito::{Matcher, Server};
+    use std::{
+        sync::{Arc, Mutex},
+        time::{Duration, Instant},
+    };
 
     use super::*;
 
@@ -604,6 +806,7 @@ mod tests {
                     language: None,
                     prompt: Some("voice memo".to_string()),
                     context_hint: Some("meeting notes".to_string()),
+                    ..TranscriptionOptions::default()
                 },
             )
             .await
@@ -614,6 +817,63 @@ mod tests {
         assert_eq!(result.language.as_deref(), Some("en"));
         assert_eq!(result.duration_secs, Some(2.4));
         assert!(result.confidence.is_some());
+    }
+
+    #[tokio::test]
+    async fn streams_deltas_and_returns_done_payload_for_transcribe_models() {
+        let mut server = Server::new_async().await;
+        let stream_mock = server
+            .mock("POST", "/v1/audio/transcriptions")
+            .match_header("authorization", "Bearer test-key")
+            .match_body(Matcher::Regex(r#"name="stream"\r\n\r\ntrue"#.to_string()))
+            .match_body(Matcher::Regex(
+                r#"name="response_format"\r\n\r\ntext"#.to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(
+                "event: transcript.text.delta\n\
+                 data: {\"type\":\"transcript.text.delta\",\"delta\":\"Hello\"}\n\n\
+                 event: transcript.text.delta\n\
+                 data: {\"type\":\"transcript.text.delta\",\"delta\":\" world\"}\n\n\
+                 event: transcript.text.done\n\
+                 data: {\"type\":\"transcript.text.done\",\"text\":\"Hello world\"}\n\n",
+            )
+            .create_async()
+            .await;
+
+        let mut config = config_for_test(&server, Some("test-key"));
+        config.model = "gpt-4o-mini-transcribe".to_string();
+        let provider = provider_with_config(config);
+        let deltas = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured_deltas = Arc::clone(&deltas);
+        let options = TranscriptionOptions {
+            on_delta: Some(Arc::new(move |delta| {
+                captured_deltas
+                    .lock()
+                    .expect("delta lock should not be poisoned")
+                    .push(delta);
+            })),
+            ..TranscriptionOptions::default()
+        };
+
+        let result = provider
+            .transcribe(vec![1, 2, 3], options)
+            .await
+            .expect("streaming transcription should succeed");
+
+        stream_mock.assert_async().await;
+        assert_eq!(result.text, "Hello world");
+        assert_eq!(result.language, None);
+        assert_eq!(result.duration_secs, None);
+        assert_eq!(result.confidence, None);
+        assert_eq!(
+            deltas
+                .lock()
+                .expect("delta lock should not be poisoned")
+                .clone(),
+            vec!["Hello".to_string(), " world".to_string()]
+        );
     }
 
     #[tokio::test]
