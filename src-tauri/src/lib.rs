@@ -72,6 +72,19 @@ fn set_status(status: AppStatus, state: tauri::State<'_, AppState>) {
     }
 }
 
+#[tauri::command]
+fn insert_text(text: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state._services._text_insertion_service.insert_text(&text)
+}
+
+#[tauri::command]
+fn copy_to_clipboard(text: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state
+        ._services
+        ._text_insertion_service
+        .copy_to_clipboard(&text)
+}
+
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
@@ -117,8 +130,10 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
-            let show_item = MenuItem::with_id(app, "show_window", "Open Voice", true, None::<&str>)?;
-            let hide_item = MenuItem::with_id(app, "hide_window", "Hide Voice", true, None::<&str>)?;
+            let show_item =
+                MenuItem::with_id(app, "show_window", "Open Voice", true, None::<&str>)?;
+            let hide_item =
+                MenuItem::with_id(app, "hide_window", "Hide Voice", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "Quit Voice", true, None::<&str>)?;
             let tray_menu = Menu::with_items(app, &[&show_item, &hide_item, &quit_item])?;
 
@@ -150,7 +165,12 @@ pub fn run() {
                 let _ = window.hide();
             }
         })
-        .invoke_handler(tauri::generate_handler![get_status, set_status])
+        .invoke_handler(tauri::generate_handler![
+            get_status,
+            set_status,
+            insert_text,
+            copy_to_clipboard
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
