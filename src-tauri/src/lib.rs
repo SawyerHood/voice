@@ -11,6 +11,7 @@ mod transcription;
 mod voice_pipeline;
 
 use std::{
+    path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -252,9 +253,11 @@ struct AppServices {
     permission_service: PermissionService,
 }
 
-impl Default for AppServices {
-    fn default() -> Self {
-        let provider = OpenAiTranscriptionProvider::new(OpenAiTranscriptionConfig::from_env());
+impl AppServices {
+    fn new(app_data_dir: PathBuf) -> Self {
+        let mut openai_config = OpenAiTranscriptionConfig::from_env();
+        openai_config.api_key_store_app_data_dir = Some(app_data_dir.clone());
+        let provider = OpenAiTranscriptionProvider::new(openai_config);
         let transcription_orchestrator = TranscriptionOrchestrator::new(Arc::new(provider));
         info!("initializing app services");
 
@@ -263,16 +266,25 @@ impl Default for AppServices {
             transcription_orchestrator,
             text_insertion_service: TextInsertionService::new(),
             settings_store: SettingsStore::new(),
-            api_key_store: ApiKeyStore::new(),
+            api_key_store: ApiKeyStore::new(app_data_dir),
             permission_service: PermissionService::new(),
         }
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct AppState {
     status_notifier: Mutex<StatusNotifier>,
     services: AppServices,
+}
+
+impl AppState {
+    fn new(app_data_dir: PathBuf) -> Self {
+        Self {
+            status_notifier: Mutex::new(StatusNotifier::default()),
+            services: AppServices::new(app_data_dir),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1399,7 +1411,6 @@ pub fn run() {
             None::<Vec<&str>>,
         ))
         .plugin(tauri_plugin_opener::init())
-        .manage(AppState::default())
         .manage(HotkeyService::new())
         .manage(PipelineRuntimeState::default())
         .setup(|app| {
@@ -1409,6 +1420,13 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             info!("setup started");
+
+            let app_data_dir = app
+                .path()
+                .app_data_dir()
+                .map_err(std::io::Error::other)?;
+            app.manage(AppState::new(app_data_dir.clone()));
+            info!(path = %app_data_dir.display(), "app state initialized");
 
             let history_store = HistoryStore::new(app.handle()).map_err(std::io::Error::other)?;
             app.manage(history_store);

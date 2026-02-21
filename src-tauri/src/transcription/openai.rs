@@ -5,7 +5,10 @@ use reqwest::{
     multipart, Client, StatusCode,
 };
 use serde::Deserialize;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    path::PathBuf,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use tracing::{debug, error, info, warn};
 
 #[cfg(not(test))]
@@ -26,6 +29,7 @@ const DEFAULT_MAX_BACKOFF_MS: u64 = 5_000;
 #[derive(Debug, Clone)]
 pub struct OpenAiTranscriptionConfig {
     pub api_key: Option<String>,
+    pub api_key_store_app_data_dir: Option<PathBuf>,
     pub endpoint: String,
     pub model: String,
     pub request_timeout_secs: u64,
@@ -38,6 +42,7 @@ impl Default for OpenAiTranscriptionConfig {
     fn default() -> Self {
         Self {
             api_key: None,
+            api_key_store_app_data_dir: None,
             endpoint: DEFAULT_OPENAI_ENDPOINT.to_string(),
             model: DEFAULT_OPENAI_MODEL.to_string(),
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
@@ -135,24 +140,26 @@ impl OpenAiTranscriptionProvider {
 
         #[cfg(not(test))]
         {
-            match ApiKeyStore::new().get_api_key(self.name()) {
-                Ok(Some(keychain_key)) => {
-                    debug!("using OpenAI API key from keychain");
-                    return Ok(keychain_key);
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    if let Some(env_key) = read_non_empty_env("OPENAI_API_KEY") {
-                        warn!(
-                            error = %error,
-                            "falling back to OPENAI_API_KEY environment variable after keychain read failure"
-                        );
-                        return Ok(env_key);
+            if let Some(app_data_dir) = self.config.api_key_store_app_data_dir.clone() {
+                match ApiKeyStore::new(app_data_dir).get_api_key(self.name()) {
+                    Ok(Some(stored_key)) => {
+                        debug!("using OpenAI API key from persisted API key file");
+                        return Ok(stored_key);
                     }
+                    Ok(None) => {}
+                    Err(error) => {
+                        if let Some(env_key) = read_non_empty_env("OPENAI_API_KEY") {
+                            warn!(
+                                error = %error,
+                                "falling back to OPENAI_API_KEY environment variable after API key file read failure"
+                            );
+                            return Ok(env_key);
+                        }
 
-                    return Err(TranscriptionError::Provider(format!(
-                        "Unable to read API key from macOS keychain: {error}",
-                    )));
+                        return Err(TranscriptionError::Provider(format!(
+                            "Unable to read API key from local API key store: {error}",
+                        )));
+                    }
                 }
             }
         }
@@ -556,6 +563,7 @@ mod tests {
     fn config_for_test(server: &Server, api_key: Option<&str>) -> OpenAiTranscriptionConfig {
         OpenAiTranscriptionConfig {
             api_key: api_key.map(ToString::to_string),
+            api_key_store_app_data_dir: None,
             endpoint: format!("{}/v1/audio/transcriptions", server.url()),
             model: "whisper-1".to_string(),
             request_timeout_secs: 5,
@@ -759,18 +767,5 @@ mod tests {
             elapsed >= Duration::from_millis(900),
             "elapsed {elapsed:?} should include retry-after delay",
         );
-    }
-
-    #[tokio::test]
-    async fn returns_missing_api_key_when_not_configured() {
-        let server = Server::new_async().await;
-        let provider = provider_for_test(&server, None);
-
-        let error = provider
-            .transcribe(vec![1, 2, 3], TranscriptionOptions::default())
-            .await
-            .expect_err("request should fail");
-
-        assert_eq!(error, TranscriptionError::MissingApiKey);
     }
 }

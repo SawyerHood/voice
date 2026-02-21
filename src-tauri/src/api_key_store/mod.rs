@@ -1,14 +1,17 @@
 use std::{
     collections::HashMap,
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::settings_store::DEFAULT_TRANSCRIPTION_PROVIDER;
 
-const KEYCHAIN_SERVICE: &str = "voice.transcription.api-keys";
-#[cfg(target_os = "macos")]
-const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
+const API_KEY_STORE_NAMESPACE: &str = "voice.transcription.api-keys";
+const API_KEYS_FILE_NAME: &str = "api_keys.json";
 
 #[derive(Debug, Clone)]
 pub struct ApiKeyStore {
@@ -16,17 +19,12 @@ pub struct ApiKeyStore {
     cache: Arc<Mutex<HashMap<String, Option<String>>>>,
 }
 
-impl Default for ApiKeyStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl ApiKeyStore {
-    pub fn new() -> Self {
-        debug!("api key store initialized");
+    pub fn new(app_data_dir: PathBuf) -> Self {
+        let file_path = app_data_dir.join(API_KEYS_FILE_NAME);
+        debug!(path = %file_path.display(), "api key store initialized");
         Self {
-            backend: Arc::new(SystemKeychainBackend),
+            backend: Arc::new(FileBackend::new(file_path)),
             cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -47,7 +45,9 @@ impl ApiKeyStore {
         }
 
         debug!(provider = %account, "reading api key from store");
-        let key = self.backend.get(KEYCHAIN_SERVICE, account.as_str())?;
+        let key = self
+            .backend
+            .get(API_KEY_STORE_NAMESPACE, account.as_str())?;
         self.set_cached_api_key(account.as_str(), key.clone())?;
         Ok(key)
     }
@@ -60,15 +60,19 @@ impl ApiKeyStore {
         let account = normalize_provider(provider)?;
         let normalized_key = normalize_api_key(key)?;
         info!(provider = %account, "writing api key to store");
-        self.backend
-            .set(KEYCHAIN_SERVICE, account.as_str(), normalized_key.as_str())?;
+        self.backend.set(
+            API_KEY_STORE_NAMESPACE,
+            account.as_str(),
+            normalized_key.as_str(),
+        )?;
         self.set_cached_api_key(account.as_str(), Some(normalized_key))
     }
 
     pub fn delete_api_key(&self, provider: &str) -> Result<(), String> {
         let account = normalize_provider(provider)?;
         info!(provider = %account, "deleting api key from store");
-        self.backend.delete(KEYCHAIN_SERVICE, account.as_str())?;
+        self.backend
+            .delete(API_KEY_STORE_NAMESPACE, account.as_str())?;
         self.clear_cached_api_key(account.as_str())
     }
 
@@ -106,64 +110,152 @@ trait ApiKeyBackend: Send + Sync + std::fmt::Debug {
 }
 
 #[derive(Debug)]
-struct SystemKeychainBackend;
+struct FileBackend {
+    file_path: PathBuf,
+    io_lock: Mutex<()>,
+}
 
-#[cfg(target_os = "macos")]
-impl ApiKeyBackend for SystemKeychainBackend {
-    fn get(&self, service: &str, account: &str) -> Result<Option<String>, String> {
-        use security_framework::passwords::get_generic_password;
-
-        match get_generic_password(service, account) {
-            Ok(raw_key) => {
-                let key = String::from_utf8(raw_key)
-                    .map_err(|error| format!("Stored key is not valid UTF-8: {error}"))?;
-                debug!(provider = %account, "api key read from macOS keychain");
-                Ok(normalize_optional_string(Some(key)))
-            }
-            Err(error) if is_item_not_found(&error) => Ok(None),
-            Err(error) => Err(format!("Failed to read macOS keychain item: {error}")),
+impl FileBackend {
+    fn new(file_path: PathBuf) -> Self {
+        Self {
+            file_path,
+            io_lock: Mutex::new(()),
         }
     }
 
-    fn set(&self, service: &str, account: &str, key: &str) -> Result<(), String> {
-        use security_framework::passwords::set_generic_password;
-
-        set_generic_password(service, account, key.as_bytes())
-            .map_err(|error| format!("Failed to write macOS keychain item: {error}"))
-    }
-
-    fn delete(&self, service: &str, account: &str) -> Result<(), String> {
-        use security_framework::passwords::delete_generic_password;
-
-        match delete_generic_password(service, account) {
-            Ok(()) => Ok(()),
-            Err(error) if is_item_not_found(&error) => {
-                warn!(provider = %account, "api key delete requested but keychain item was absent");
-                Ok(())
-            }
-            Err(error) => Err(format!("Failed to delete macOS keychain item: {error}")),
+    fn ensure_file_exists(&self) -> Result<(), String> {
+        if let Some(parent_dir) = self.file_path.parent() {
+            fs::create_dir_all(parent_dir).map_err(|error| {
+                format!(
+                    "Failed to create API key directory `{}`: {error}",
+                    parent_dir.display()
+                )
+            })?;
         }
+
+        if self.file_path.exists() {
+            return Ok(());
+        }
+
+        write_atomic_file(&self.file_path, br#"{}"#)
+    }
+
+    fn read_keys(&self) -> Result<HashMap<String, String>, String> {
+        self.ensure_file_exists()?;
+        let raw_contents = fs::read_to_string(&self.file_path).map_err(|error| {
+            format!(
+                "Failed to read API key file `{}`: {error}",
+                self.file_path.display()
+            )
+        })?;
+
+        if raw_contents.trim().is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        serde_json::from_str(&raw_contents).map_err(|error| {
+            format!(
+                "Failed to parse API key file `{}`: {error}",
+                self.file_path.display()
+            )
+        })
+    }
+
+    fn write_keys(&self, keys: &HashMap<String, String>) -> Result<(), String> {
+        let serialized = serde_json::to_vec_pretty(keys)
+            .map_err(|error| format!("Failed to serialize API keys: {error}"))?;
+        write_atomic_file(&self.file_path, &serialized)
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-impl ApiKeyBackend for SystemKeychainBackend {
-    fn get(&self, _service: &str, _account: &str) -> Result<Option<String>, String> {
-        Err("macOS keychain is only available on macOS targets".to_string())
+impl ApiKeyBackend for FileBackend {
+    fn get(&self, _service: &str, account: &str) -> Result<Option<String>, String> {
+        let _guard = self
+            .io_lock
+            .lock()
+            .map_err(|_| "api key backend lock poisoned".to_string())?;
+        let keys = self.read_keys()?;
+        Ok(normalize_optional_string(keys.get(account).cloned()))
     }
 
-    fn set(&self, _service: &str, _account: &str, _key: &str) -> Result<(), String> {
-        Err("macOS keychain is only available on macOS targets".to_string())
+    fn set(&self, _service: &str, account: &str, key: &str) -> Result<(), String> {
+        let _guard = self
+            .io_lock
+            .lock()
+            .map_err(|_| "api key backend lock poisoned".to_string())?;
+        let mut keys = self.read_keys()?;
+        keys.insert(account.to_string(), key.to_string());
+        self.write_keys(&keys)
     }
 
-    fn delete(&self, _service: &str, _account: &str) -> Result<(), String> {
-        Err("macOS keychain is only available on macOS targets".to_string())
+    fn delete(&self, _service: &str, account: &str) -> Result<(), String> {
+        let _guard = self
+            .io_lock
+            .lock()
+            .map_err(|_| "api key backend lock poisoned".to_string())?;
+        let mut keys = self.read_keys()?;
+        if keys.remove(account).is_some() {
+            return self.write_keys(&keys);
+        }
+
+        Ok(())
     }
 }
 
-#[cfg(target_os = "macos")]
-fn is_item_not_found(error: &security_framework::base::Error) -> bool {
-    error.code() == ERR_SEC_ITEM_NOT_FOUND
+fn write_atomic_file(file_path: &Path, contents: &[u8]) -> Result<(), String> {
+    let temp_path = temp_file_path_for(file_path);
+    let mut temp_file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temp_path)
+        .map_err(|error| {
+            format!(
+                "Failed to create temp API key file `{}`: {error}",
+                temp_path.display()
+            )
+        })?;
+
+    if let Err(error) = temp_file.write_all(contents) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!(
+            "Failed to write temp API key file `{}`: {error}",
+            temp_path.display()
+        ));
+    }
+
+    if let Err(error) = temp_file.sync_all() {
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!(
+            "Failed to flush temp API key file `{}`: {error}",
+            temp_path.display()
+        ));
+    }
+
+    drop(temp_file);
+
+    fs::rename(&temp_path, file_path).map_err(|error| {
+        let _ = fs::remove_file(&temp_path);
+        format!(
+            "Failed to finalize API key file `{}`: {error}",
+            file_path.display()
+        )
+    })?;
+
+    Ok(())
+}
+
+fn temp_file_path_for(file_path: &Path) -> PathBuf {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let file_name = file_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(API_KEYS_FILE_NAME);
+    let pid = std::process::id();
+
+    file_path.with_file_name(format!(".{file_name}.{pid}.{timestamp}.tmp"))
 }
 
 fn normalize_provider(provider: &str) -> Result<String, String> {
@@ -220,6 +312,8 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
 mod tests {
     use std::{
         collections::HashMap,
+        fs,
+        path::{Path, PathBuf},
         sync::{
             atomic::{AtomicUsize, Ordering},
             Arc, Mutex,
@@ -307,6 +401,22 @@ mod tests {
         }
     }
 
+    fn unique_api_key_file_path(prefix: &str) -> PathBuf {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("voice-api-key-store-{prefix}-{timestamp}"))
+            .join(API_KEYS_FILE_NAME)
+    }
+
+    fn cleanup_api_key_file(path: &Path) {
+        if let Some(parent_dir) = path.parent() {
+            let _ = fs::remove_dir_all(parent_dir);
+        }
+    }
+
     #[test]
     fn set_get_delete_round_trip_works() {
         let store = ApiKeyStore::with_backend(Arc::new(InMemoryBackend::default()));
@@ -383,7 +493,7 @@ mod tests {
     fn caches_backend_get_results_per_provider() {
         let backend = Arc::new(CountingBackend::default());
         backend
-            .set(KEYCHAIN_SERVICE, "openai", "sk-cached")
+            .set(API_KEY_STORE_NAMESPACE, "openai", "sk-cached")
             .expect("seed should succeed");
         let store = ApiKeyStore::with_backend(backend.clone());
 
@@ -469,48 +579,64 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
-    fn macos_keychain_backend_round_trip_works() {
-        let store = ApiKeyStore::new();
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time should move forward")
-            .as_nanos();
-        let provider = format!("openai-test-{suffix}");
-        let key = format!("sk-roundtrip-{suffix}");
+    fn file_backend_round_trip_works() {
+        let file_path = unique_api_key_file_path("roundtrip");
+        let app_data_dir = file_path
+            .parent()
+            .expect("api key file should have parent directory")
+            .to_path_buf();
+        let store = ApiKeyStore::new(app_data_dir);
 
-        let _ = store.delete_api_key(provider.as_str());
-
-        store
-            .set_api_key(provider.as_str(), key.as_str())
-            .expect("set should succeed");
-        assert!(
-            store
-                .has_api_key(provider.as_str())
-                .expect("has should succeed after set"),
-            "expected macOS keychain provider to report key presence"
-        );
-
-        let fetched = store
-            .get_api_key(provider.as_str())
-            .expect("get should succeed");
-        assert_eq!(fetched.as_deref(), Some(key.as_str()));
-
-        store
-            .delete_api_key(provider.as_str())
-            .expect("delete should succeed");
-        assert!(
-            !store
-                .has_api_key(provider.as_str())
-                .expect("has should succeed after delete"),
-            "expected macOS keychain provider to report no key after delete"
-        );
         assert_eq!(
             store
-                .get_api_key(provider.as_str())
-                .expect("get after delete should succeed"),
+                .get_api_key("openai")
+                .expect("initial lookup should succeed"),
             None
         );
+        assert!(
+            file_path.exists(),
+            "expected API key file to be created when first read"
+        );
+
+        store
+            .set_api_key("openai", "sk-file")
+            .expect("set should succeed");
+        assert_eq!(
+            store
+                .get_api_key("openai")
+                .expect("lookup after set should succeed")
+                .as_deref(),
+            Some("sk-file")
+        );
+
+        let persisted = fs::read_to_string(&file_path).expect("api key file should be readable");
+        let persisted_map = serde_json::from_str::<HashMap<String, String>>(&persisted)
+            .expect("api key file should parse");
+        assert_eq!(
+            persisted_map.get("openai").map(String::as_str),
+            Some("sk-file")
+        );
+
+        store
+            .delete_api_key("openai")
+            .expect("delete should succeed");
+        assert_eq!(
+            store
+                .get_api_key("openai")
+                .expect("lookup after delete should succeed"),
+            None
+        );
+
+        let after_delete =
+            fs::read_to_string(&file_path).expect("api key file should remain readable");
+        let after_delete_map = serde_json::from_str::<HashMap<String, String>>(&after_delete)
+            .expect("api key file should parse after delete");
+        assert!(
+            !after_delete_map.contains_key("openai"),
+            "expected API key to be removed from persisted file"
+        );
+
+        cleanup_api_key_file(&file_path);
     }
 }
