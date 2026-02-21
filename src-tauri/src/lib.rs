@@ -32,8 +32,8 @@ use logging::LoggingState;
 use permission_service::{PermissionService, PermissionSnapshot, PermissionState, PermissionType};
 use serde::Serialize;
 use settings_store::{
-    SettingsStore, VoiceSettings, VoiceSettingsUpdate, RECORDING_MODE_HOLD_TO_TALK,
-    RECORDING_MODE_TOGGLE,
+    SettingsStore, VoiceSettings, VoiceSettingsUpdate, RECORDING_MODE_DOUBLE_TAP_TOGGLE,
+    RECORDING_MODE_HOLD_TO_TALK, RECORDING_MODE_TOGGLE,
 };
 use status_notifier::{AppStatus, StatusNotifier};
 use tauri::{
@@ -71,8 +71,9 @@ fn recording_mode_from_settings_value(value: &str) -> Result<RecordingMode, Stri
     match value.trim().to_lowercase().as_str() {
         RECORDING_MODE_HOLD_TO_TALK => Ok(RecordingMode::HoldToTalk),
         RECORDING_MODE_TOGGLE => Ok(RecordingMode::Toggle),
+        RECORDING_MODE_DOUBLE_TAP_TOGGLE => Ok(RecordingMode::DoubleTapToggle),
         normalized => Err(format!(
-            "Unsupported recording mode `{normalized}`. Expected `{RECORDING_MODE_HOLD_TO_TALK}` or `{RECORDING_MODE_TOGGLE}`"
+            "Unsupported recording mode `{normalized}`. Expected `{RECORDING_MODE_HOLD_TO_TALK}`, `{RECORDING_MODE_TOGGLE}`, or `{RECORDING_MODE_DOUBLE_TAP_TOGGLE}`"
         )),
     }
 }
@@ -81,6 +82,7 @@ fn recording_mode_to_settings_value(mode: RecordingMode) -> &'static str {
     match mode {
         RecordingMode::HoldToTalk => RECORDING_MODE_HOLD_TO_TALK,
         RecordingMode::Toggle => RECORDING_MODE_TOGGLE,
+        RecordingMode::DoubleTapToggle => RECORDING_MODE_DOUBLE_TAP_TOGGLE,
     }
 }
 
@@ -1542,7 +1544,10 @@ mod tests {
 
     use crate::{
         hotkey_service::{HotkeyConfig, RecordingMode},
-        settings_store::{VoiceSettings, VoiceSettingsUpdate, RECORDING_MODE_TOGGLE},
+        settings_store::{
+            VoiceSettings, VoiceSettingsUpdate, RECORDING_MODE_DOUBLE_TAP_TOGGLE,
+            RECORDING_MODE_TOGGLE,
+        },
         status_notifier::AppStatus,
         voice_pipeline::{
             PipelineError, PipelineErrorStage, PipelineTranscript, VoicePipeline,
@@ -2256,6 +2261,34 @@ mod tests {
             }]
         );
         assert_eq!(default_fallback_calls, 0);
+    }
+
+    #[test]
+    fn startup_restore_applies_double_tap_toggle_mode() {
+        let settings = VoiceSettings {
+            hotkey_shortcut: "F6".to_string(),
+            recording_mode: RECORDING_MODE_DOUBLE_TAP_TOGGLE.to_string(),
+            ..VoiceSettings::default()
+        };
+        let mut applied = Vec::new();
+
+        apply_hotkey_from_settings_with_fallback(
+            &settings,
+            |config| {
+                applied.push(config);
+                Ok(())
+            },
+            || panic!("double tap toggle mode should not require fallback"),
+        )
+        .expect("startup restoration should accept double tap toggle mode");
+
+        assert_eq!(
+            applied,
+            vec![HotkeyConfig {
+                shortcut: "F6".to_string(),
+                mode: RecordingMode::DoubleTapToggle,
+            }]
+        );
     }
 
     #[test]

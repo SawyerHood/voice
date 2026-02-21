@@ -22,6 +22,7 @@ import {
   normalizeRecordingMode,
   normalizeShortcut,
   OPENAI_PROVIDER,
+  shortcutFromKeyboardEvent,
   type RecordingMode,
 } from "./settingsUtils";
 
@@ -73,6 +74,28 @@ function formatMicrophoneLabel(device: MicrophoneInfo): string {
   return `${device.name} (${details.join(", ")})`;
 }
 
+const HOTKEY_PRESETS = [
+  { label: "Alt+Space (Default)", value: "Alt+Space" },
+  { label: "Ctrl+Space", value: "Ctrl+Space" },
+  { label: "Shift+Space", value: "Shift+Space" },
+  { label: "Meta+Space", value: "Cmd+Space" },
+  { label: "F5", value: "F5" },
+  { label: "F6", value: "F6" },
+  { label: "F7", value: "F7" },
+  { label: "Ctrl+Shift+S", value: "Ctrl+Shift+S" },
+] as const;
+
+const CUSTOM_SHORTCUT_PRESET_VALUE = "__custom_shortcut__";
+
+const RECORDING_MODE_OPTIONS: ReadonlyArray<{
+  value: RecordingMode;
+  label: string;
+}> = [
+  { value: "hold_to_talk", label: "Hold-to-talk" },
+  { value: "toggle", label: "Toggle" },
+  { value: "double_tap_toggle", label: "Double-tap toggle" },
+];
+
 export default function Settings() {
   const [isLoading, setIsLoading] = useState(true);
   const [isSavingApiKey, setIsSavingApiKey] = useState(false);
@@ -90,6 +113,7 @@ export default function Settings() {
   const [language, setLanguage] = useState("");
   const [autoInsert, setAutoInsert] = useState(true);
   const [launchAtLogin, setLaunchAtLogin] = useState(false);
+  const [isRecordingShortcut, setIsRecordingShortcut] = useState(false);
 
   const [hasStoredApiKey, setHasStoredApiKey] = useState(false);
   const [apiKeyDraft, setApiKeyDraft] = useState("");
@@ -154,11 +178,60 @@ export default function Settings() {
     () => microphoneId === "" || microphones.some((device) => device.id === microphoneId),
     [microphoneId, microphones]
   );
+  const selectedShortcutPreset = useMemo(() => {
+    const normalized = hotkeyShortcut.trim().toLowerCase();
+    const matchingPreset = HOTKEY_PRESETS.find(
+      (preset) => preset.value.toLowerCase() === normalized,
+    );
+    return matchingPreset?.value ?? CUSTOM_SHORTCUT_PRESET_VALUE;
+  }, [hotkeyShortcut]);
 
   const apiKeyPlaceholder = hasStoredApiKey ? "Enter new key to replace existing key" : "sk-...";
   const canSaveApiKey = apiKeyDraft.trim().length > 0;
   const canClearApiKey = hasStoredApiKey;
   const canRevealApiKeyDraft = apiKeyDraft.trim().length > 0;
+
+  const handleShortcutPresetChange = useCallback((presetValue: string) => {
+    if (presetValue === CUSTOM_SHORTCUT_PRESET_VALUE) {
+      return;
+    }
+
+    setIsRecordingShortcut(false);
+    setHotkeyShortcut(presetValue);
+  }, []);
+
+  const handleRecordShortcutClick = useCallback(() => {
+    setIsRecordingShortcut((active) => !active);
+  }, []);
+
+  useEffect(() => {
+    if (!isRecordingShortcut) {
+      return;
+    }
+
+    const handleShortcutKeydown = (event: KeyboardEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+
+      if (event.repeat) {
+        return;
+      }
+
+      const capturedShortcut = shortcutFromKeyboardEvent(event);
+      if (!capturedShortcut) {
+        return;
+      }
+
+      setIsRecordingShortcut(false);
+      setHotkeyShortcut(capturedShortcut);
+      setFeedback({ kind: "success", message: `Shortcut set to ${capturedShortcut}.` });
+    };
+
+    window.addEventListener("keydown", handleShortcutKeydown, true);
+    return () => {
+      window.removeEventListener("keydown", handleShortcutKeydown, true);
+    };
+  }, [isRecordingShortcut]);
 
   // Auto-save settings on change with debounce
   useEffect(() => {
@@ -288,42 +361,83 @@ export default function Settings() {
             Recording
           </p>
 
-          {/* Hotkey */}
-          <div className="space-y-1.5">
+          {/* Recording Shortcut */}
+          <div className="space-y-2">
             <Label htmlFor="hotkey" className="text-xs">
-              Hotkey Shortcut
+              Recording Shortcut
             </Label>
+            <div className="flex gap-2">
+              <Select
+                value={selectedShortcutPreset}
+                onValueChange={handleShortcutPresetChange}
+              >
+                <SelectTrigger className="h-8 flex-1 text-xs">
+                  <SelectValue placeholder="Choose a shortcut preset" />
+                </SelectTrigger>
+                <SelectContent>
+                  {HOTKEY_PRESETS.map((preset) => (
+                    <SelectItem key={preset.value} value={preset.value}>
+                      {preset.label}
+                    </SelectItem>
+                  ))}
+                  <SelectItem value={CUSTOM_SHORTCUT_PRESET_VALUE}>
+                    Custom (manual or recorded)
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+              <Button
+                type="button"
+                variant={isRecordingShortcut ? "default" : "outline"}
+                size="xs"
+                onClick={handleRecordShortcutClick}
+              >
+                {isRecordingShortcut ? "Cancel" : "Record Shortcut"}
+              </Button>
+            </div>
             <Input
               id="hotkey"
               value={hotkeyShortcut}
-              onChange={(e) => setHotkeyShortcut(e.currentTarget.value)}
+              onChange={(event) => {
+                setIsRecordingShortcut(false);
+                setHotkeyShortcut(event.currentTarget.value);
+              }}
               placeholder={normalizeShortcut("")}
               autoComplete="off"
               spellCheck={false}
-              className="h-8 text-xs"
+              className="h-8 text-xs font-mono"
             />
+            <p className="text-[11px] text-muted-foreground">
+              {isRecordingShortcut
+                ? "Press the shortcut now."
+                : "Fn cannot be captured on macOS because the system intercepts it. Use F5/F6/F7 or another key combo instead. Right Alt/Option is captured as Alt."}
+            </p>
           </div>
 
           {/* Recording Mode */}
           <div className="space-y-1.5">
             <Label className="text-xs">Recording Mode</Label>
             <div className="flex rounded-lg border bg-muted/50 p-0.5">
-              {(["hold_to_talk", "toggle"] as const).map((mode) => (
+              {RECORDING_MODE_OPTIONS.map(({ value, label }) => (
                 <button
-                  key={mode}
+                  key={value}
                   type="button"
                   className={cn(
                     "flex-1 rounded-md px-3 py-1.5 text-xs font-medium transition-all",
-                    recordingMode === mode
+                    recordingMode === value
                       ? "bg-background text-foreground shadow-sm"
                       : "text-muted-foreground hover:text-foreground"
                   )}
-                  onClick={() => setRecordingMode(mode)}
+                  onClick={() => setRecordingMode(value)}
                 >
-                  {mode === "hold_to_talk" ? "Hold-to-talk" : "Toggle"}
+                  {label}
                 </button>
               ))}
             </div>
+            {recordingMode === "double_tap_toggle" && (
+              <p className="text-[11px] text-muted-foreground">
+                Press the shortcut twice quickly to start recording, then press once to stop.
+              </p>
+            )}
           </div>
 
           {/* Microphone */}

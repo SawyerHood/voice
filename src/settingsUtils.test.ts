@@ -7,7 +7,20 @@ import {
   normalizeOptionalText,
   normalizeRecordingMode,
   normalizeShortcut,
+  shortcutFromKeyboardEvent,
 } from "./settingsUtils";
+
+function keyboardEvent(input: Partial<KeyboardEvent>): KeyboardEvent {
+  return {
+    key: "",
+    code: "",
+    ctrlKey: false,
+    altKey: false,
+    shiftKey: false,
+    metaKey: false,
+    ...input,
+  } as KeyboardEvent;
+}
 
 describe("settingsUtils", () => {
   it("uses default shortcut when the input is blank", () => {
@@ -21,6 +34,7 @@ describe("settingsUtils", () => {
 
   it("normalizes recording mode with a safe fallback", () => {
     expect(normalizeRecordingMode("toggle")).toBe("toggle");
+    expect(normalizeRecordingMode("double_tap_toggle")).toBe("double_tap_toggle");
     expect(normalizeRecordingMode("anything-else")).toBe("hold_to_talk");
   });
 
@@ -49,5 +63,54 @@ describe("settingsUtils", () => {
     expect(maskApiKey("sk-short")).toBe("••••••••");
     expect(maskApiKey("a".repeat(40))).toBe("•".repeat(24));
     expect(maskApiKey("   ")).toBe("");
+  });
+
+  it("captures modifier shortcuts from keyboard events", () => {
+    expect(
+      shortcutFromKeyboardEvent(
+        keyboardEvent({
+          key: "s",
+          code: "KeyS",
+          ctrlKey: true,
+          shiftKey: true,
+        }),
+      ),
+    ).toBe("Ctrl+Shift+S");
+  });
+
+  it("captures right alt as the Alt modifier", () => {
+    expect(
+      shortcutFromKeyboardEvent(
+        keyboardEvent({
+          key: " ",
+          code: "Space",
+          altKey: true,
+        }),
+      ),
+    ).toBe("Alt+Space");
+  });
+
+  it("captures command shortcuts with Cmd token", () => {
+    expect(
+      shortcutFromKeyboardEvent(
+        keyboardEvent({
+          key: " ",
+          code: "Space",
+          metaKey: true,
+        }),
+      ),
+    ).toBe("Cmd+Space");
+  });
+
+  it("ignores pure modifier presses while recording shortcuts", () => {
+    expect(
+      shortcutFromKeyboardEvent(
+        keyboardEvent({
+          key: "Shift",
+          code: "ShiftLeft",
+          shiftKey: true,
+        }),
+      ),
+    ).toBeNull();
   });
 });

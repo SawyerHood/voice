@@ -1,7 +1,12 @@
 export const DEFAULT_HOTKEY_SHORTCUT = "Alt+Space";
 export const OPENAI_PROVIDER = "openai";
 
-export type RecordingMode = "hold_to_talk" | "toggle";
+export type RecordingMode = "hold_to_talk" | "toggle" | "double_tap_toggle";
+
+type ShortcutCaptureEvent = Pick<
+  KeyboardEvent,
+  "key" | "code" | "ctrlKey" | "altKey" | "shiftKey" | "metaKey"
+>;
 
 type SettingsUpdateInput = {
   hotkeyShortcut: string;
@@ -33,7 +38,9 @@ export function normalizeOptionalText(value: string): string | null {
 }
 
 export function normalizeRecordingMode(value: string): RecordingMode {
-  return value === "toggle" ? "toggle" : "hold_to_talk";
+  if (value === "toggle") return "toggle";
+  if (value === "double_tap_toggle") return "double_tap_toggle";
+  return "hold_to_talk";
 }
 
 export function createSettingsUpdatePayload(
@@ -48,6 +55,124 @@ export function createSettingsUpdatePayload(
     auto_insert: input.autoInsert,
     launch_at_login: input.launchAtLogin,
   };
+}
+
+const MODIFIER_CODES = new Set([
+  "ShiftLeft",
+  "ShiftRight",
+  "ControlLeft",
+  "ControlRight",
+  "AltLeft",
+  "AltRight",
+  "MetaLeft",
+  "MetaRight",
+  "Fn",
+]);
+
+const MODIFIER_KEYS = new Set([
+  "Shift",
+  "Control",
+  "Alt",
+  "Meta",
+  "OS",
+  "Fn",
+]);
+
+const CODE_ALIASES: Record<string, string> = {
+  Space: "Space",
+  Escape: "Escape",
+  Enter: "Enter",
+  Tab: "Tab",
+  Backspace: "Backspace",
+  Delete: "Delete",
+  Insert: "Insert",
+  Home: "Home",
+  End: "End",
+  PageUp: "PageUp",
+  PageDown: "PageDown",
+  ArrowUp: "ArrowUp",
+  ArrowDown: "ArrowDown",
+  ArrowLeft: "ArrowLeft",
+  ArrowRight: "ArrowRight",
+  Minus: "-",
+  Equal: "=",
+  BracketLeft: "[",
+  BracketRight: "]",
+  Backslash: "\\",
+  Semicolon: ";",
+  Quote: "'",
+  Comma: ",",
+  Period: ".",
+  Slash: "/",
+  Backquote: "`",
+  Numpad0: "Numpad0",
+  Numpad1: "Numpad1",
+  Numpad2: "Numpad2",
+  Numpad3: "Numpad3",
+  Numpad4: "Numpad4",
+  Numpad5: "Numpad5",
+  Numpad6: "Numpad6",
+  Numpad7: "Numpad7",
+  Numpad8: "Numpad8",
+  Numpad9: "Numpad9",
+  NumpadAdd: "NumpadAdd",
+  NumpadSubtract: "NumpadSubtract",
+  NumpadMultiply: "NumpadMultiply",
+  NumpadDivide: "NumpadDivide",
+  NumpadDecimal: "NumpadDecimal",
+  NumpadEnter: "NumpadEnter",
+  NumpadEqual: "NumpadEqual",
+};
+
+function resolveShortcutKey(event: ShortcutCaptureEvent): string | null {
+  if (MODIFIER_CODES.has(event.code) || MODIFIER_KEYS.has(event.key)) {
+    return null;
+  }
+
+  if (/^Key[A-Z]$/i.test(event.code)) {
+    return event.code.slice(3).toUpperCase();
+  }
+
+  if (/^Digit[0-9]$/.test(event.code)) {
+    return event.code.slice(5);
+  }
+
+  if (/^F[0-9]{1,2}$/i.test(event.code)) {
+    return event.code.toUpperCase();
+  }
+
+  const mappedCode = CODE_ALIASES[event.code];
+  if (mappedCode) {
+    return mappedCode;
+  }
+
+  if (event.key === " ") {
+    return "Space";
+  }
+
+  if (/^[a-z]$/i.test(event.key)) {
+    return event.key.toUpperCase();
+  }
+
+  if (/^[0-9]$/.test(event.key)) {
+    return event.key;
+  }
+
+  return null;
+}
+
+export function shortcutFromKeyboardEvent(event: ShortcutCaptureEvent): string | null {
+  const key = resolveShortcutKey(event);
+  if (!key) return null;
+
+  const modifiers: string[] = [];
+  if (event.ctrlKey) modifiers.push("Ctrl");
+  if (event.altKey) modifiers.push("Alt");
+  if (event.shiftKey) modifiers.push("Shift");
+  if (event.metaKey) modifiers.push("Cmd");
+  modifiers.push(key);
+
+  return modifiers.join("+");
 }
 
 export function maskApiKey(key: string): string {

@@ -1,6 +1,7 @@
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -13,12 +14,14 @@ pub const EVENT_HOTKEY_CONFIG_CHANGED: &str = "voice://hotkey-config-changed";
 pub const EVENT_RECORDING_STATE_CHANGED: &str = "voice://recording-state-changed";
 pub const EVENT_RECORDING_STARTED: &str = "voice://recording-started";
 pub const EVENT_RECORDING_STOPPED: &str = "voice://recording-stopped";
+const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(400);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RecordingMode {
     HoldToTalk,
     Toggle,
+    DoubleTapToggle,
 }
 
 impl Default for RecordingMode {
@@ -91,6 +94,7 @@ struct HotkeyRuntimeState {
     is_recording: bool,
     desired_recording: bool,
     pending_transitions: VecDeque<RecordingTransition>,
+    last_press_timestamp: Option<Instant>,
 }
 
 impl Default for HotkeyRuntimeState {
@@ -101,6 +105,7 @@ impl Default for HotkeyRuntimeState {
             is_recording: false,
             desired_recording: false,
             pending_transitions: VecDeque::new(),
+            last_press_timestamp: None,
         }
     }
 }
@@ -110,8 +115,13 @@ impl HotkeyRuntimeState {
         &mut self,
         shortcut_state: ShortcutState,
     ) -> Option<RecordingTransition> {
-        let (next_recording_state, transition) =
-            resolve_transition(self.config.mode, self.desired_recording, shortcut_state)?;
+        let (next_recording_state, transition) = resolve_transition_with_runtime_state(
+            self.config.mode,
+            self.desired_recording,
+            shortcut_state,
+            &mut self.last_press_timestamp,
+            Instant::now(),
+        )?;
 
         self.desired_recording = next_recording_state;
         self.pending_transitions.push_back(transition);
@@ -134,6 +144,10 @@ impl HotkeyRuntimeState {
             RecordingTransition::Stopped => false,
         };
 
+        if matches!(transition, RecordingTransition::Stopped) || !self.is_recording {
+            self.last_press_timestamp = None;
+        }
+
         self.recompute_desired_recording();
     }
 
@@ -151,6 +165,7 @@ impl HotkeyRuntimeState {
         self.is_recording = false;
         self.desired_recording = false;
         self.pending_transitions.clear();
+        self.last_press_timestamp = None;
     }
 
     fn stop_processing_decision(&self) -> StopProcessingDecision {
@@ -403,6 +418,7 @@ where
         );
         let mut state = state.lock().map_err(|_| lock_error())?;
         state.config = next_config.clone();
+        state.last_press_timestamp = None;
         drop(state);
         emit_config_changed(&next_config);
         return Ok(next_config);
@@ -456,6 +472,7 @@ where
         state.is_recording = false;
         state.desired_recording = false;
         state.pending_transitions.clear();
+        state.last_press_timestamp = None;
     }
 
     info!(
@@ -527,6 +544,51 @@ fn resolve_transition(
             ShortcutState::Pressed => Some((true, RecordingTransition::Started)),
             ShortcutState::Released => None,
         },
+        RecordingMode::DoubleTapToggle => None,
+    }
+}
+
+fn resolve_transition_with_runtime_state(
+    mode: RecordingMode,
+    is_recording: bool,
+    shortcut_state: ShortcutState,
+    last_press_timestamp: &mut Option<Instant>,
+    now: Instant,
+) -> Option<(bool, RecordingTransition)> {
+    match mode {
+        RecordingMode::DoubleTapToggle => {
+            resolve_double_tap_transition(is_recording, shortcut_state, last_press_timestamp, now)
+        }
+        _ => resolve_transition(mode, is_recording, shortcut_state),
+    }
+}
+
+fn resolve_double_tap_transition(
+    is_recording: bool,
+    shortcut_state: ShortcutState,
+    last_press_timestamp: &mut Option<Instant>,
+    now: Instant,
+) -> Option<(bool, RecordingTransition)> {
+    if !matches!(shortcut_state, ShortcutState::Pressed) {
+        return None;
+    }
+
+    if is_recording {
+        *last_press_timestamp = None;
+        return Some((false, RecordingTransition::Stopped));
+    }
+
+    let is_double_tap = last_press_timestamp
+        .map(|timestamp| now.saturating_duration_since(timestamp) <= DOUBLE_TAP_WINDOW)
+        .unwrap_or(false);
+
+    *last_press_timestamp = Some(now);
+
+    if is_double_tap {
+        *last_press_timestamp = None;
+        Some((true, RecordingTransition::Started))
+    } else {
+        None
     }
 }
 
@@ -568,7 +630,10 @@ fn lock_error() -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Mutex, time::Duration};
+    use std::{
+        sync::Mutex,
+        time::{Duration, Instant},
+    };
 
     use async_trait::async_trait;
 
@@ -722,6 +787,84 @@ mod tests {
     }
 
     #[test]
+    fn double_tap_toggle_requires_two_quick_presses_to_start() {
+        let mut last_press_timestamp = None;
+        let first_press = Instant::now();
+
+        assert_eq!(
+            resolve_transition_with_runtime_state(
+                RecordingMode::DoubleTapToggle,
+                false,
+                ShortcutState::Pressed,
+                &mut last_press_timestamp,
+                first_press
+            ),
+            None
+        );
+        assert_eq!(last_press_timestamp, Some(first_press));
+
+        let second_press = first_press + (DOUBLE_TAP_WINDOW / 2);
+        assert_eq!(
+            resolve_transition_with_runtime_state(
+                RecordingMode::DoubleTapToggle,
+                false,
+                ShortcutState::Pressed,
+                &mut last_press_timestamp,
+                second_press
+            ),
+            Some((true, RecordingTransition::Started))
+        );
+        assert_eq!(last_press_timestamp, None);
+    }
+
+    #[test]
+    fn double_tap_toggle_ignores_slow_second_press() {
+        let mut last_press_timestamp = Some(Instant::now());
+        let next_press =
+            last_press_timestamp.unwrap() + DOUBLE_TAP_WINDOW + Duration::from_millis(1);
+
+        assert_eq!(
+            resolve_transition_with_runtime_state(
+                RecordingMode::DoubleTapToggle,
+                false,
+                ShortcutState::Pressed,
+                &mut last_press_timestamp,
+                next_press
+            ),
+            None
+        );
+        assert_eq!(last_press_timestamp, Some(next_press));
+    }
+
+    #[test]
+    fn double_tap_toggle_stops_on_single_press_while_recording() {
+        let mut last_press_timestamp = Some(Instant::now());
+
+        assert_eq!(
+            resolve_transition_with_runtime_state(
+                RecordingMode::DoubleTapToggle,
+                true,
+                ShortcutState::Pressed,
+                &mut last_press_timestamp,
+                Instant::now()
+            ),
+            Some((false, RecordingTransition::Stopped))
+        );
+        assert_eq!(last_press_timestamp, None);
+
+        assert_eq!(
+            resolve_transition_with_runtime_state(
+                RecordingMode::DoubleTapToggle,
+                true,
+                ShortcutState::Released,
+                &mut last_press_timestamp,
+                Instant::now()
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn shortcut_comparison_ignores_case_and_alias_formatting() {
         assert!(shortcuts_match("alt+space", "Alt+Space"));
     }
@@ -849,6 +992,7 @@ mod tests {
             is_recording: true,
             desired_recording: true,
             pending_transitions: VecDeque::from([RecordingTransition::Started]),
+            last_press_timestamp: None,
         }));
         let mut unregister_attempts = Vec::new();
         let mut register_attempts = Vec::new();
@@ -898,6 +1042,7 @@ mod tests {
             is_recording: true,
             desired_recording: true,
             pending_transitions: VecDeque::from([RecordingTransition::Started]),
+            last_press_timestamp: None,
         }));
         let mut unregister_attempts = Vec::new();
         let mut register_attempts = Vec::new();
@@ -955,6 +1100,7 @@ mod tests {
             is_recording: true,
             desired_recording: true,
             pending_transitions: VecDeque::from([RecordingTransition::Started]),
+            last_press_timestamp: Some(Instant::now()),
         };
 
         state.clear_registered_shortcut();
@@ -963,6 +1109,7 @@ mod tests {
         assert!(!state.is_recording);
         assert!(!state.desired_recording);
         assert!(state.pending_transitions.is_empty());
+        assert_eq!(state.last_press_timestamp, None);
     }
 
     #[test]
