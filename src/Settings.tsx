@@ -80,6 +80,7 @@ export default function Settings() {
   const [isSavingSettings, setIsSavingSettings] = useState(false);
   const [isSavingApiKey, setIsSavingApiKey] = useState(false);
   const [isRefreshingMics, setIsRefreshingMics] = useState(false);
+  const [isExportingLogs, setIsExportingLogs] = useState(false);
   const [feedback, setFeedback] = useState<SaveFeedback | null>(null);
 
   const [hotkeyShortcut, setHotkeyShortcut] = useState("");
@@ -285,6 +286,39 @@ export default function Settings() {
     }
   }
 
+  async function handleExportLogs() {
+    setIsExportingLogs(true);
+
+    try {
+      const logContents = await invoke<string>("export_logs");
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const filename = `voice-logs-${timestamp}.log`;
+      const blob = new Blob([logContents], {
+        type: "text/plain;charset=utf-8",
+      });
+      const objectUrl = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = objectUrl;
+      anchor.download = filename;
+      document.body.append(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(objectUrl);
+
+      setFeedback({
+        kind: "success",
+        message: "Logs exported.",
+      });
+    } catch (error) {
+      setFeedback({
+        kind: "error",
+        message: toErrorMessage(error, "Unable to export logs."),
+      });
+    } finally {
+      setIsExportingLogs(false);
+    }
+  }
+
   return (
     <section className="settings-card" aria-live="polite">
       {isLoading ? (
@@ -430,6 +464,14 @@ export default function Settings() {
           </div>
 
           <div className="settings-actions">
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={handleExportLogs}
+              disabled={isExportingLogs}
+            >
+              {isExportingLogs ? "Exporting..." : "Export Logs"}
+            </button>
             <button
               type="submit"
               className="primary-button"

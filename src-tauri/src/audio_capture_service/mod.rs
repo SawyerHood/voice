@@ -16,6 +16,7 @@ use cpal::{
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
+use tracing::{debug, error, info, warn};
 
 pub const AUDIO_LEVEL_EVENT: &str = "audio-level";
 pub const AUDIO_INPUT_STREAM_ERROR_EVENT: &str = "voice://audio-input-stream-error";
@@ -94,6 +95,7 @@ impl Default for AudioCaptureService {
 
 impl AudioCaptureService {
     pub fn new() -> Self {
+        debug!("audio capture service initialized");
         Self {
             recording: Mutex::new(None),
             audio_level_bits: Arc::new(AtomicU32::new(0.0_f32.to_bits())),
@@ -103,6 +105,7 @@ impl AudioCaptureService {
     pub fn list_microphones(&self) -> Result<Vec<MicrophoneInfo>, String> {
         let host = cpal::default_host();
         let devices = enumerate_input_devices(&host)?;
+        debug!(count = devices.len(), "enumerated input microphones");
 
         Ok(devices
             .into_iter()
@@ -121,12 +124,17 @@ impl AudioCaptureService {
         app_handle: AppHandle,
         preferred_device_id: Option<&str>,
     ) -> Result<(), String> {
+        info!(
+            preferred_device_id = ?preferred_device_id,
+            "audio capture start requested"
+        );
         let mut recording_guard = self
             .recording
             .lock()
             .map_err(|_| "Audio capture state lock is poisoned".to_string())?;
 
         if recording_guard.is_some() {
+            warn!("recording start requested while already recording");
             return Err("Recording is already in progress".to_string());
         }
 
@@ -134,12 +142,18 @@ impl AudioCaptureService {
         let devices = enumerate_input_devices(&host)?;
 
         if devices.is_empty() {
+            warn!("recording start failed because no microphones are available");
             return Err("No microphone input devices are available".to_string());
         }
 
         let selected_device = select_input_device(devices, preferred_device_id)?;
         let selected_device_id = selected_device.id.clone();
         let selected_device_name = selected_device.name.clone();
+        info!(
+            device_id = %selected_device_id,
+            device_name = %selected_device_name,
+            "selected microphone for recording"
+        );
 
         self.audio_level_bits
             .store(0.0_f32.to_bits(), Ordering::Relaxed);
@@ -170,6 +184,7 @@ impl AudioCaptureService {
                 if let Some(handle) = join_handle.take() {
                     let _ = handle.join();
                 }
+                error!(error = %err, "microphone worker failed to initialize");
                 return Err(err);
             }
             Err(RecvTimeoutError::Timeout) => {
@@ -177,12 +192,14 @@ impl AudioCaptureService {
                 if let Some(handle) = join_handle.take() {
                     let _ = handle.join();
                 }
+                error!("microphone worker timed out while starting");
                 return Err("Timed out while starting microphone stream".to_string());
             }
             Err(RecvTimeoutError::Disconnected) => {
                 if let Some(handle) = join_handle.take() {
                     let _ = handle.join();
                 }
+                error!("microphone worker disconnected during startup");
                 return Err("Microphone stream failed to initialize".to_string());
             }
         };
@@ -190,7 +207,9 @@ impl AudioCaptureService {
         let join_handle =
             join_handle.ok_or_else(|| "Microphone worker was unavailable".to_string())?;
 
-        let _ = app_handle.emit(AUDIO_LEVEL_EVENT, 0.0_f32);
+        if let Err(error) = app_handle.emit(AUDIO_LEVEL_EVENT, 0.0_f32) {
+            warn!(%error, "failed to emit initial audio level event");
+        }
 
         *recording_guard = Some(RecordingControl {
             stop_tx,
@@ -203,10 +222,12 @@ impl AudioCaptureService {
             device_name: selected_device_name,
         });
 
+        info!("audio capture started");
         Ok(())
     }
 
     pub fn stop_recording(&self, app_handle: AppHandle) -> Result<RecordedAudio, String> {
+        info!("audio capture stop requested");
         let control = {
             let mut recording_guard = self
                 .recording
@@ -230,6 +251,7 @@ impl AudioCaptureService {
 
         let _ = stop_tx.send(());
         if join_handle.join().is_err() {
+            error!("microphone capture thread panicked while stopping");
             return Err("Microphone capture thread panicked while stopping".to_string());
         }
 
@@ -242,7 +264,9 @@ impl AudioCaptureService {
 
         self.audio_level_bits
             .store(0.0_f32.to_bits(), Ordering::Relaxed);
-        let _ = app_handle.emit(AUDIO_LEVEL_EVENT, 0.0_f32);
+        if let Err(error) = app_handle.emit(AUDIO_LEVEL_EVENT, 0.0_f32) {
+            warn!(%error, "failed to emit audio level reset event after stop");
+        }
 
         let mut duration_ms = started_at.elapsed().as_millis() as u64;
         if duration_ms == 0 && sample_rate_hz > 0 {
@@ -250,6 +274,15 @@ impl AudioCaptureService {
         }
 
         let wav_bytes = pcm16_to_wav_bytes(&buffered_samples, sample_rate_hz, channels)?;
+        info!(
+            duration_ms,
+            sample_rate_hz,
+            channels,
+            sample_count = buffered_samples.len(),
+            device_id = %device_id,
+            device_name = %device_name,
+            "audio capture stopped"
+        );
 
         Ok(RecordedAudio {
             wav_bytes,
@@ -262,6 +295,7 @@ impl AudioCaptureService {
     }
 
     pub fn abort_recording(&self, app_handle: AppHandle) -> Result<bool, String> {
+        warn!("aborting active audio capture");
         let control = {
             let mut recording_guard = self
                 .recording
@@ -276,6 +310,7 @@ impl AudioCaptureService {
             ..
         }) = control
         else {
+            debug!("abort requested but no active recording existed");
             return Ok(false);
         };
 
@@ -284,13 +319,17 @@ impl AudioCaptureService {
         if join_target == thread::current().id() {
             drop(join_handle);
         } else if join_handle.join().is_err() {
+            error!("microphone capture thread panicked while aborting");
             return Err("Microphone capture thread panicked while aborting".to_string());
         }
 
         self.audio_level_bits
             .store(0.0_f32.to_bits(), Ordering::Relaxed);
-        let _ = app_handle.emit(AUDIO_LEVEL_EVENT, 0.0_f32);
+        if let Err(error) = app_handle.emit(AUDIO_LEVEL_EVENT, 0.0_f32) {
+            warn!(%error, "failed to emit audio level reset event after abort");
+        }
 
+        info!("audio capture aborted");
         Ok(true)
     }
 
@@ -307,6 +346,10 @@ fn recording_thread_main(
     ready_tx: Sender<Result<RecordingRuntime, String>>,
     stop_rx: Receiver<()>,
 ) {
+    debug!(
+        device_id = %selected_device_id,
+        "microphone worker thread started"
+    );
     let startup_result = start_recording_worker(
         &selected_device_id,
         Arc::clone(&samples),
@@ -316,6 +359,7 @@ fn recording_thread_main(
     let (stream, runtime, stream_error_rx) = match startup_result {
         Ok(started) => started,
         Err(err) => {
+            error!(device_id = %selected_device_id, error = %err, "microphone worker startup failed");
             let _ = ready_tx.send(Err(err));
             return;
         }
@@ -329,11 +373,18 @@ fn recording_thread_main(
 
     drop(stream);
     audio_level_bits.store(0.0_f32.to_bits(), Ordering::Relaxed);
-    let _ = app_handle.emit(AUDIO_LEVEL_EVENT, 0.0_f32);
+    if let Err(error) = app_handle.emit(AUDIO_LEVEL_EVENT, 0.0_f32) {
+        warn!(%error, "failed to emit audio level reset from worker thread");
+    }
 
     if let RecordingLoopExit::StreamError(message) = loop_exit {
+        error!(message = %message, "microphone worker exited due to stream error");
         let payload = AudioInputStreamErrorEvent { message };
-        let _ = app_handle.emit(AUDIO_INPUT_STREAM_ERROR_EVENT, payload);
+        if let Err(error) = app_handle.emit(AUDIO_INPUT_STREAM_ERROR_EVENT, payload) {
+            warn!(%error, "failed to emit audio stream error event");
+        }
+    } else {
+        debug!("microphone worker exited after stop request");
     }
 }
 
@@ -345,6 +396,11 @@ fn start_recording_worker(
     let host = cpal::default_host();
     let devices = enumerate_input_devices(&host)?;
     let selected_device = select_input_device(devices, Some(selected_device_id))?;
+    info!(
+        device_id = %selected_device.id,
+        device_name = %selected_device.name,
+        "starting recording worker for selected device"
+    );
 
     let supported_config = selected_device
         .device
@@ -381,6 +437,11 @@ fn start_recording_worker(
     stream
         .play()
         .map_err(|err| format!("Failed to start microphone stream: {err}"))?;
+    info!(
+        sample_rate_hz,
+        channels = stream_config.channels,
+        "microphone stream playback started"
+    );
 
     Ok((
         stream,
@@ -406,6 +467,7 @@ fn run_recording_loop<F>(
 where
     F: FnMut(),
 {
+    debug!("entering recording loop");
     loop {
         match stream_error_rx.try_recv() {
             Ok(message) => return RecordingLoopExit::StreamError(message),
@@ -424,7 +486,7 @@ where
 fn report_stream_error(format_label: &str, stream_error_tx: &Sender<String>, err: StreamError) {
     let message = format!("Microphone stream error ({format_label}): {err}");
     let _ = stream_error_tx.send(message.clone());
-    eprintln!("{message}");
+    error!(%message, "microphone stream callback error");
 }
 
 fn enumerate_input_devices(host: &cpal::Host) -> Result<Vec<EnumeratedInputDevice>, String> {
@@ -459,6 +521,7 @@ fn enumerate_input_devices(host: &cpal::Host) -> Result<Vec<EnumeratedInputDevic
         });
     }
 
+    debug!(count = devices.len(), "input device enumeration complete");
     Ok(devices)
 }
 
@@ -468,6 +531,7 @@ fn select_input_device(
 ) -> Result<EnumeratedInputDevice, String> {
     if let Some(device_id) = preferred_device_id {
         if let Some(index) = devices.iter().position(|device| device.id == device_id) {
+            debug!(device_id, "selected preferred input device by id");
             return Ok(devices.swap_remove(index));
         }
 
@@ -476,6 +540,10 @@ fn select_input_device(
                 .iter()
                 .position(|device| slugify_device_name(&device.name) == legacy_slug)
             {
+                warn!(
+                    device_id,
+                    "resolved microphone using legacy device id fallback"
+                );
                 return Ok(devices.swap_remove(index));
             }
         }
@@ -483,10 +551,17 @@ fn select_input_device(
         return Err(format!("No microphone found for id '{device_id}'"));
     }
 
-    devices
+    let selected = devices
         .into_iter()
         .min_by_key(|device| if device.is_default { 0 } else { 1 })
-        .ok_or_else(|| "No microphone input devices are available".to_string())
+        .ok_or_else(|| "No microphone input devices are available".to_string())?;
+    debug!(
+        device_id = %selected.id,
+        device_name = %selected.name,
+        is_default = selected.is_default,
+        "selected microphone device"
+    );
+    Ok(selected)
 }
 
 fn build_microphone_device_id(name: &str, coreaudio_uid: Option<&str>) -> String {
@@ -555,7 +630,7 @@ fn macos_input_device_uids_by_name() -> HashMap<String, VecDeque<String>> {
             uids_by_name
         }
         Err(error) => {
-            eprintln!("Failed to collect CoreAudio input device UIDs: {error}");
+            warn!(%error, "failed to collect CoreAudio input device UIDs");
             HashMap::new()
         }
     }

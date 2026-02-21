@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use tracing::{debug, info, warn};
 
 const KEYCHAIN_SERVICE: &str = "voice.transcription.api-keys";
 #[cfg(target_os = "macos")]
@@ -17,6 +18,7 @@ impl Default for ApiKeyStore {
 
 impl ApiKeyStore {
     pub fn new() -> Self {
+        debug!("api key store initialized");
         Self {
             backend: Arc::new(SystemKeychainBackend),
         }
@@ -29,18 +31,21 @@ impl ApiKeyStore {
 
     pub fn get_api_key(&self, provider: &str) -> Result<Option<String>, String> {
         let account = normalize_provider(provider)?;
+        debug!(provider = %account, "reading api key from store");
         self.backend.get(KEYCHAIN_SERVICE, account.as_str())
     }
 
     pub fn set_api_key(&self, provider: &str, key: &str) -> Result<(), String> {
         let account = normalize_provider(provider)?;
         let normalized_key = normalize_api_key(key)?;
+        info!(provider = %account, "writing api key to store");
         self.backend
             .set(KEYCHAIN_SERVICE, account.as_str(), normalized_key.as_str())
     }
 
     pub fn delete_api_key(&self, provider: &str) -> Result<(), String> {
         let account = normalize_provider(provider)?;
+        info!(provider = %account, "deleting api key from store");
         self.backend.delete(KEYCHAIN_SERVICE, account.as_str())
     }
 }
@@ -63,6 +68,7 @@ impl ApiKeyBackend for SystemKeychainBackend {
             Ok(raw_key) => {
                 let key = String::from_utf8(raw_key)
                     .map_err(|error| format!("Stored key is not valid UTF-8: {error}"))?;
+                debug!(provider = %account, "api key read from macOS keychain");
                 Ok(normalize_optional_string(Some(key)))
             }
             Err(error) if is_item_not_found(&error) => Ok(None),
@@ -82,7 +88,10 @@ impl ApiKeyBackend for SystemKeychainBackend {
 
         match delete_generic_password(service, account) {
             Ok(()) => Ok(()),
-            Err(error) if is_item_not_found(&error) => Ok(()),
+            Err(error) if is_item_not_found(&error) => {
+                warn!(provider = %account, "api key delete requested but keychain item was absent");
+                Ok(())
+            }
             Err(error) => Err(format!("Failed to delete macOS keychain item: {error}")),
         }
     }

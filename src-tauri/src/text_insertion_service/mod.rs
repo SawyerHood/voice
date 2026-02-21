@@ -6,6 +6,7 @@ use std::{
     thread::sleep,
     time::Duration,
 };
+use tracing::{debug, info, warn};
 
 const AX_SUCCESS: i32 = 0;
 const K_CG_ANNOTATED_SESSION_EVENT_TAP: u32 = 2;
@@ -118,14 +119,17 @@ pub struct TextInsertionService {
 
 impl TextInsertionService {
     pub fn new() -> Self {
+        debug!("text insertion service initialized");
         Self::default()
     }
 
     pub fn insert_text(&self, text: &str) -> Result<(), String> {
+        info!(chars = text.chars().count(), "text insertion requested");
         insert_text_with_backend(&self.backend, text, InsertionMode::Auto)
     }
 
     pub fn copy_to_clipboard(&self, text: &str) -> Result<(), String> {
+        info!(chars = text.chars().count(), "copy to clipboard requested");
         insert_text_with_backend(&self.backend, text, InsertionMode::CopyOnly)
     }
 
@@ -140,10 +144,12 @@ fn insert_text_with_backend<B: InsertionBackend>(
     mode: InsertionMode,
 ) -> Result<(), String> {
     if text.is_empty() {
+        debug!("skipping text insertion because payload is empty");
         return Ok(());
     }
 
     if matches!(mode, InsertionMode::CopyOnly) {
+        debug!("executing clipboard-only insertion mode");
         return backend.write_text_to_clipboard(text);
     }
 
@@ -151,11 +157,18 @@ fn insert_text_with_backend<B: InsertionBackend>(
         text.chars().count() > DIRECT_TYPE_THRESHOLD_CHARS || !backend.has_focused_input_target();
 
     if should_use_paste_fallback {
+        warn!(
+            chars = text.chars().count(),
+            "using clipboard paste fallback instead of direct typing"
+        );
         return paste_via_clipboard(backend, text);
     }
 
     match backend.type_unicode_text(text) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            debug!("direct unicode typing succeeded");
+            Ok(())
+        }
         Err(direct_error) => paste_via_clipboard(backend, text).map_err(|paste_error| {
             format!(
                 "Direct insertion failed ({direct_error}); clipboard fallback failed ({paste_error})"
@@ -168,20 +181,22 @@ fn paste_via_clipboard<B: InsertionBackend>(backend: &B, text: &str) -> Result<(
     let previous_clipboard = match backend.read_text_from_clipboard() {
         Ok(clipboard) => Some(clipboard),
         Err(error) => {
-            eprintln!("Failed to read clipboard before paste fallback: {error}");
+            warn!(%error, "failed to read clipboard before paste fallback");
             None
         }
     };
 
+    debug!("writing fallback text to clipboard");
     backend.write_text_to_clipboard(text)?;
     let paste_result = backend.post_command_v();
     if paste_result.is_ok() {
+        debug!("clipboard paste shortcut posted successfully");
         backend.wait_for_paste_to_register();
     }
 
     if let Some(previous_clipboard) = previous_clipboard {
         if let Err(error) = backend.write_text_to_clipboard(&previous_clipboard) {
-            eprintln!("Failed to restore clipboard after paste fallback: {error}");
+            warn!(%error, "failed to restore clipboard after paste fallback");
         }
     }
 

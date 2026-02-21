@@ -4,6 +4,7 @@ mod api_key_store;
 mod audio_capture_service;
 mod history_store;
 mod hotkey_service;
+mod logging;
 mod permission_service;
 mod settings_store;
 mod status_notifier;
@@ -27,6 +28,7 @@ use audio_capture_service::{
 };
 use history_store::{HistoryEntry, HistoryStore};
 use hotkey_service::{HotkeyService, RecordingTransition};
+use logging::LoggingState;
 use permission_service::PermissionService;
 use serde::Serialize;
 use settings_store::{SettingsStore, VoiceSettings, VoiceSettingsUpdate};
@@ -37,6 +39,7 @@ use tauri::{
     AppHandle, Emitter, Listener, Manager,
 };
 use text_insertion_service::TextInsertionService;
+use tracing::{debug, error, info, warn};
 use transcription::openai::{OpenAiTranscriptionConfig, OpenAiTranscriptionProvider};
 use transcription::{TranscriptionOptions, TranscriptionOrchestrator};
 use voice_pipeline::{PipelineError, PipelineTranscript, VoicePipeline, VoicePipelineDelegate};
@@ -67,13 +70,14 @@ struct AppServices {
     text_insertion_service: TextInsertionService,
     settings_store: SettingsStore,
     api_key_store: ApiKeyStore,
-    _permission_service: PermissionService,
+    permission_service: PermissionService,
 }
 
 impl Default for AppServices {
     fn default() -> Self {
         let provider = OpenAiTranscriptionProvider::new(OpenAiTranscriptionConfig::from_env());
         let transcription_orchestrator = TranscriptionOrchestrator::new(Arc::new(provider));
+        info!("initializing app services");
 
         Self {
             audio_capture_service: AudioCaptureService::new(),
@@ -81,7 +85,7 @@ impl Default for AppServices {
             text_insertion_service: TextInsertionService::new(),
             settings_store: SettingsStore::new(),
             api_key_store: ApiKeyStore::new(),
-            _permission_service: PermissionService::new(),
+            permission_service: PermissionService::new(),
         }
     }
 }
@@ -113,6 +117,7 @@ impl PipelineRuntimeState {
     fn begin_session(&self) -> u64 {
         let session_id = self.next_session_id.fetch_add(1, Ordering::Relaxed) + 1;
         self.active_session_id.store(session_id, Ordering::Relaxed);
+        debug!(session_id, "pipeline session started");
         session_id
     }
 
@@ -157,33 +162,65 @@ impl AppPipelineDelegate {
 impl VoicePipelineDelegate for AppPipelineDelegate {
     fn set_status(&self, status: AppStatus) {
         if self.is_session_active() {
+            debug!(?status, session_id = ?self.session_id, "updating app status");
             set_status_for_app(&self.app, status);
+        } else {
+            debug!(
+                ?status,
+                session_id = ?self.session_id,
+                "ignoring status update for inactive session"
+            );
         }
     }
 
     fn emit_transcript(&self, transcript: &str) {
         if self.is_session_active() {
+            info!(
+                session_id = ?self.session_id,
+                transcript_chars = transcript.chars().count(),
+                "pipeline transcript ready"
+            );
             emit_transcript_event(&self.app, transcript);
+        } else {
+            debug!(
+                session_id = ?self.session_id,
+                "ignoring transcript for inactive session"
+            );
         }
     }
 
     fn emit_error(&self, error: &PipelineError) {
         if self.is_session_active() {
+            error!(
+                session_id = ?self.session_id,
+                stage = error.stage.as_str(),
+                message = %error.message,
+                "pipeline error emitted"
+            );
             emit_pipeline_error_event(&self.app, error);
+        } else {
+            debug!(
+                session_id = ?self.session_id,
+                stage = error.stage.as_str(),
+                "ignoring pipeline error for inactive session"
+            );
         }
     }
 
     fn on_recording_started(&self, success: bool) {
+        debug!(session_id = ?self.session_id, success, "recording start acknowledged");
         let hotkey_service = self.app.state::<HotkeyService>();
         hotkey_service.acknowledge_transition(RecordingTransition::Started, success);
     }
 
     fn on_recording_stopped(&self, success: bool) {
+        debug!(session_id = ?self.session_id, success, "recording stop acknowledged");
         let hotkey_service = self.app.state::<HotkeyService>();
         hotkey_service.acknowledge_transition(RecordingTransition::Stopped, success);
     }
 
     fn start_recording(&self) -> Result<(), String> {
+        info!(session_id = ?self.session_id, "pipeline requested recording start");
         let state = self.app.state::<AppState>();
         state
             .services
@@ -192,6 +229,7 @@ impl VoicePipelineDelegate for AppPipelineDelegate {
     }
 
     fn stop_recording(&self) -> Result<Vec<u8>, String> {
+        info!(session_id = ?self.session_id, "pipeline requested recording stop");
         let state = self.app.state::<AppState>();
         state
             .services
@@ -206,6 +244,13 @@ impl VoicePipelineDelegate for AppPipelineDelegate {
             state.services.transcription_orchestrator.clone()
         };
         let provider_name = orchestrator.active_provider_name().to_string();
+        let provider_name_for_error = provider_name.clone();
+        info!(
+            session_id = ?self.session_id,
+            provider = %provider_name,
+            audio_bytes = wav_bytes.len(),
+            "starting transcription request"
+        );
 
         orchestrator
             .transcribe(wav_bytes, TranscriptionOptions::default())
@@ -214,16 +259,42 @@ impl VoicePipelineDelegate for AppPipelineDelegate {
                 text: transcription.text,
                 duration_secs: transcription.duration_secs,
                 language: transcription.language,
-                provider: provider_name,
+                provider: provider_name.clone(),
             })
-            .map_err(|error| error.to_string())
+            .map(|transcript| {
+                info!(
+                    session_id = ?self.session_id,
+                    provider = %transcript.provider,
+                    transcript_chars = transcript.text.chars().count(),
+                    "transcription request completed"
+                );
+                transcript
+            })
+            .map_err(|error| {
+                error!(
+                    session_id = ?self.session_id,
+                    provider = %provider_name_for_error,
+                    error = %error,
+                    "transcription request failed"
+                );
+                error.to_string()
+            })
     }
 
     fn insert_text(&self, transcript: &str) -> Result<(), String> {
         if !self.is_session_active() {
+            warn!(
+                session_id = ?self.session_id,
+                "skipping text insertion for inactive session"
+            );
             return Ok(());
         }
 
+        info!(
+            session_id = ?self.session_id,
+            transcript_chars = transcript.chars().count(),
+            "inserting transcript text"
+        );
         let state = self.app.state::<AppState>();
         state
             .services
@@ -233,6 +304,10 @@ impl VoicePipelineDelegate for AppPipelineDelegate {
 
     fn save_history_entry(&self, transcript: &PipelineTranscript) -> Result<(), String> {
         if !self.is_session_active() {
+            warn!(
+                session_id = ?self.session_id,
+                "skipping history persistence for inactive session"
+            );
             return Ok(());
         }
 
@@ -242,6 +317,12 @@ impl VoicePipelineDelegate for AppPipelineDelegate {
             transcript.duration_secs,
             transcript.language.clone(),
             transcript.provider.clone(),
+        );
+        debug!(
+            session_id = ?self.session_id,
+            provider = %entry.provider,
+            transcript_chars = entry.text.chars().count(),
+            "persisting transcript history entry"
         );
 
         history_store.add_entry(entry)
@@ -253,15 +334,22 @@ fn get_status_from_state(state: &AppState) -> AppStatus {
         .status_notifier
         .lock()
         .map(|notifier| notifier.current())
-        .unwrap_or(AppStatus::Error)
+        .unwrap_or_else(|_| {
+            error!("status notifier lock poisoned while reading status");
+            AppStatus::Error
+        })
 }
 
 fn set_status_for_state(app: &AppHandle, state: &AppState, status: AppStatus) {
     if let Ok(mut notifier) = state.status_notifier.lock() {
         notifier.set(status);
+    } else {
+        error!("status notifier lock poisoned while setting status");
     }
 
-    let _ = app.emit(EVENT_STATUS_CHANGED, status);
+    if let Err(error) = app.emit(EVENT_STATUS_CHANGED, status) {
+        warn!(?status, %error, "failed to emit status changed event");
+    }
 }
 
 fn set_status_for_app(app: &AppHandle, status: AppStatus) {
@@ -273,7 +361,9 @@ fn emit_transcript_event(app: &AppHandle, transcript: &str) {
     let payload = TranscriptReadyEvent {
         text: transcript.to_string(),
     };
-    let _ = app.emit(EVENT_TRANSCRIPT_READY, payload);
+    if let Err(error) = app.emit(EVENT_TRANSCRIPT_READY, payload) {
+        warn!(%error, "failed to emit transcript ready event");
+    }
 }
 
 fn emit_pipeline_error_event(app: &AppHandle, error: &PipelineError) {
@@ -282,7 +372,13 @@ fn emit_pipeline_error_event(app: &AppHandle, error: &PipelineError) {
         message: error.message.clone(),
     };
 
-    let _ = app.emit(EVENT_PIPELINE_ERROR, payload);
+    if let Err(emit_error) = app.emit(EVENT_PIPELINE_ERROR, payload) {
+        warn!(
+            stage = error.stage.as_str(),
+            event_error = %emit_error,
+            "failed to emit pipeline error event"
+        );
+    }
 }
 
 fn parse_audio_stream_error_message(payload: &str) -> String {
@@ -290,7 +386,10 @@ fn parse_audio_stream_error_message(payload: &str) -> String {
         .ok()
         .map(|event| event.message.trim().to_string())
         .filter(|message| !message.is_empty())
-        .unwrap_or_else(|| "Microphone stream failed unexpectedly".to_string())
+        .unwrap_or_else(|| {
+            warn!("audio stream error payload was invalid; using fallback message");
+            "Microphone stream failed unexpectedly".to_string()
+        })
 }
 
 fn handle_audio_input_stream_error_with_hooks<
@@ -316,11 +415,12 @@ fn handle_audio_input_stream_error_with_hooks<
     SetStatus: FnMut(AppStatus),
     ScheduleReset: FnOnce(),
 {
+    error!(message = %message, "handling runtime audio stream error");
     begin_session();
     force_stop_recording();
 
     if let Err(error) = abort_recording() {
-        eprintln!("Failed to abort recording after stream error: {error}");
+        error!(%error, "failed to abort recording after stream error");
     }
 
     let pipeline_error = PipelineError {
@@ -333,6 +433,7 @@ fn handle_audio_input_stream_error_with_hooks<
 }
 
 fn handle_audio_input_stream_error(app: &AppHandle, message: String) {
+    error!(message = %message, "audio stream error received by app");
     let reset_app = app.clone();
     handle_audio_input_stream_error_with_hooks(
         message,
@@ -362,6 +463,10 @@ fn handle_audio_input_stream_error(app: &AppHandle, message: String) {
                 tokio::time::sleep(Duration::from_millis(AUDIO_STREAM_ERROR_RESET_DELAY_MS)).await;
                 let state = reset_app.state::<AppState>();
                 if get_status_from_state(&state) == AppStatus::Error {
+                    info!(
+                        delay_ms = AUDIO_STREAM_ERROR_RESET_DELAY_MS,
+                        "resetting status to idle after stream error"
+                    );
                     set_status_for_state(&reset_app, &state, AppStatus::Idle);
                 }
             });
@@ -378,14 +483,20 @@ fn spawn_pipeline_stage_error_reset<D>(
 where
     D: VoicePipelineDelegate + Send + Sync + 'static,
 {
+    error!(stage = stage.as_str(), message = %message, "scheduling stage error reset");
     tauri::async_runtime::spawn(async move {
         pipeline.handle_stage_error(&delegate, stage, message).await;
     })
 }
 
 fn register_pipeline_handlers(app: &AppHandle) {
+    info!("registering pipeline event handlers");
     let start_app = app.clone();
-    app.listen(hotkey_service::EVENT_RECORDING_STARTED, move |_| {
+    app.listen(hotkey_service::EVENT_RECORDING_STARTED, move |event| {
+        debug!(
+            event_id = event.id(),
+            "received recording started hotkey event"
+        );
         let app = start_app.clone();
         let runtime_state = app.state::<PipelineRuntimeState>().inner().clone();
         tauri::async_runtime::spawn(async move {
@@ -399,7 +510,11 @@ fn register_pipeline_handlers(app: &AppHandle) {
     });
 
     let stop_app = app.clone();
-    app.listen(hotkey_service::EVENT_RECORDING_STOPPED, move |_| {
+    app.listen(hotkey_service::EVENT_RECORDING_STOPPED, move |event| {
+        debug!(
+            event_id = event.id(),
+            "received recording stopped hotkey event"
+        );
         let app = stop_app.clone();
         let runtime_state = app.state::<PipelineRuntimeState>().inner().clone();
         tauri::async_runtime::spawn(async move {
@@ -409,6 +524,10 @@ fn register_pipeline_handlers(app: &AppHandle) {
             let hotkey_service = app.state::<HotkeyService>();
 
             if !hotkey_service.is_recording() {
+                warn!(
+                    session_id,
+                    "received stop event while hotkey service was not recording"
+                );
                 hotkey_service.acknowledge_transition(RecordingTransition::Stopped, false);
                 return;
             }
@@ -422,23 +541,33 @@ fn register_pipeline_handlers(app: &AppHandle) {
     let stream_error_app = app.clone();
     app.listen(AUDIO_INPUT_STREAM_ERROR_EVENT, move |event| {
         let message = parse_audio_stream_error_message(event.payload());
+        error!(
+            event_id = event.id(),
+            message = %message,
+            "received audio input stream error event"
+        );
         handle_audio_input_stream_error(&stream_error_app, message);
     });
 }
 
 #[tauri::command]
 fn get_status(state: tauri::State<'_, AppState>) -> AppStatus {
-    get_status_from_state(&state)
+    let status = get_status_from_state(&state);
+    debug!(?status, "status requested");
+    status
 }
 
 #[tauri::command]
 fn set_status(app: AppHandle, status: AppStatus, state: tauri::State<'_, AppState>) {
+    info!(?status, "status set requested");
     set_status_for_state(&app, &state, status);
 }
 
 #[tauri::command]
 fn get_settings(state: tauri::State<'_, AppState>) -> VoiceSettings {
-    state.services.settings_store.current()
+    let settings = state.services.settings_store.current();
+    debug!("settings requested");
+    settings
 }
 
 #[tauri::command]
@@ -447,7 +576,21 @@ fn update_settings(
     update: VoiceSettingsUpdate,
     state: tauri::State<'_, AppState>,
 ) -> Result<VoiceSettings, String> {
-    state.services.settings_store.update(&app, update)
+    info!("settings update requested");
+    let updated = state.services.settings_store.update(&app, update);
+    match &updated {
+        Ok(settings) => {
+            info!(
+                recording_mode = %settings.recording_mode,
+                auto_insert = settings.auto_insert,
+                "settings updated"
+            );
+        }
+        Err(error) => {
+            error!(%error, "settings update failed");
+        }
+    }
+    updated
 }
 
 #[tauri::command]
@@ -455,7 +598,14 @@ fn get_api_key(
     provider: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<Option<String>, String> {
-    state.services.api_key_store.get_api_key(provider.as_str())
+    debug!(provider = %provider, "api key lookup requested");
+    let result = state.services.api_key_store.get_api_key(provider.as_str());
+    match &result {
+        Ok(Some(_)) => debug!(provider = %provider, "api key lookup returned stored key"),
+        Ok(None) => debug!(provider = %provider, "api key lookup returned no key"),
+        Err(error) => error!(provider = %provider, %error, "api key lookup failed"),
+    }
+    result
 }
 
 #[tauri::command]
@@ -464,23 +614,38 @@ fn set_api_key(
     key: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    state
+    info!(provider = %provider, "api key set requested");
+    let result = state
         .services
         .api_key_store
-        .set_api_key(provider.as_str(), key.as_str())
+        .set_api_key(provider.as_str(), key.as_str());
+    if let Err(error) = &result {
+        error!(provider = %provider, %error, "api key set failed");
+    }
+    result
 }
 
 #[tauri::command]
 fn delete_api_key(provider: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    state
+    info!(provider = %provider, "api key delete requested");
+    let result = state
         .services
         .api_key_store
-        .delete_api_key(provider.as_str())
+        .delete_api_key(provider.as_str());
+    if let Err(error) = &result {
+        error!(provider = %provider, %error, "api key delete failed");
+    }
+    result
 }
 
 #[tauri::command]
 fn list_microphones(state: tauri::State<'_, AppState>) -> Result<Vec<MicrophoneInfo>, String> {
-    state.services.audio_capture_service.list_microphones()
+    let result = state.services.audio_capture_service.list_microphones();
+    match &result {
+        Ok(microphones) => debug!(count = microphones.len(), "listed microphones"),
+        Err(error) => error!(%error, "failed to list microphones"),
+    }
+    result
 }
 
 #[tauri::command]
@@ -489,6 +654,10 @@ fn start_recording(
     state: tauri::State<'_, AppState>,
     microphone_id: Option<String>,
 ) -> Result<(), String> {
+    info!(
+        microphone_id = ?microphone_id.as_deref(),
+        "manual recording start requested"
+    );
     let result = state
         .services
         .audio_capture_service
@@ -496,6 +665,9 @@ fn start_recording(
 
     if result.is_ok() {
         set_status_for_state(&app, &state, AppStatus::Listening);
+        info!("manual recording started");
+    } else if let Err(error) = &result {
+        error!(%error, "manual recording start failed");
     }
 
     result
@@ -506,12 +678,23 @@ fn stop_recording(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<RecordedAudio, String> {
+    info!("manual recording stop requested");
     let recorded = state
         .services
         .audio_capture_service
-        .stop_recording(app.clone())?;
+        .stop_recording(app.clone())
+        .map_err(|error| {
+            error!(%error, "manual recording stop failed");
+            error
+        })?;
 
     set_status_for_state(&app, &state, AppStatus::Idle);
+    info!(
+        duration_ms = recorded.duration_ms,
+        sample_rate_hz = recorded.sample_rate_hz,
+        channels = recorded.channels,
+        "manual recording stopped"
+    );
     Ok(recorded)
 }
 
@@ -522,11 +705,19 @@ fn get_audio_level(state: tauri::State<'_, AppState>) -> f32 {
 
 #[tauri::command]
 fn insert_text(text: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    info!(
+        chars = text.chars().count(),
+        "manual text insertion requested"
+    );
     state.services.text_insertion_service.insert_text(&text)
 }
 
 #[tauri::command]
 fn copy_to_clipboard(text: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    info!(
+        chars = text.chars().count(),
+        "manual clipboard copy requested"
+    );
     state
         .services
         .text_insertion_service
@@ -540,6 +731,10 @@ async fn transcribe_audio(
     options: Option<TranscriptionOptions>,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
+    info!(
+        audio_bytes = audio_bytes.len(),
+        "command transcription requested"
+    );
     set_status_for_state(&app, &state, AppStatus::Transcribing);
 
     let result = state
@@ -551,11 +746,17 @@ async fn transcribe_audio(
     match result {
         Ok(transcription) => {
             set_status_for_state(&app, &state, AppStatus::Idle);
+            info!(
+                transcript_chars = transcription.text.chars().count(),
+                language = ?transcription.language,
+                "command transcription completed"
+            );
 
             Ok(transcription.text)
         }
         Err(error) => {
             let message = error.to_string();
+            error!(%message, "command transcription failed");
             let delegate = AppPipelineDelegate::new(app.clone());
             let _ = spawn_pipeline_stage_error_reset(
                 VoicePipeline::default(),
@@ -575,10 +776,14 @@ fn list_history(
     limit: Option<usize>,
     offset: Option<usize>,
 ) -> Result<Vec<HistoryEntry>, String> {
-    history_store.list_entries(
-        limit.unwrap_or(DEFAULT_HISTORY_PAGE_SIZE),
-        offset.unwrap_or(0),
-    )
+    let page_limit = limit.unwrap_or(DEFAULT_HISTORY_PAGE_SIZE);
+    let page_offset = offset.unwrap_or(0);
+    debug!(
+        limit = page_limit,
+        offset = page_offset,
+        "history list requested"
+    );
+    history_store.list_entries(page_limit, page_offset)
 }
 
 #[tauri::command]
@@ -586,6 +791,7 @@ fn get_history_entry(
     history_store: tauri::State<'_, HistoryStore>,
     id: String,
 ) -> Result<Option<HistoryEntry>, String> {
+    debug!(id = %id, "history lookup requested");
     history_store.get_entry(&id)
 }
 
@@ -594,24 +800,47 @@ fn delete_history_entry(
     history_store: tauri::State<'_, HistoryStore>,
     id: String,
 ) -> Result<bool, String> {
+    info!(id = %id, "history delete requested");
     history_store.delete_entry(&id)
 }
 
 #[tauri::command]
 fn clear_history(history_store: tauri::State<'_, HistoryStore>) -> Result<(), String> {
+    info!("history clear requested");
     history_store.clear_history()
+}
+
+#[tauri::command]
+fn export_logs(log_state: tauri::State<'_, LoggingState>) -> Result<String, String> {
+    info!(
+        log_file = %log_state.log_file_path().display(),
+        "diagnostic log export requested"
+    );
+    logging::export_log_contents(&log_state)
 }
 
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.set_focus();
+        info!("showing main window");
+        if let Err(error) = window.show() {
+            warn!(%error, "failed to show main window");
+        }
+        if let Err(error) = window.set_focus() {
+            warn!(%error, "failed to focus main window");
+        }
+    } else {
+        warn!("main window was not found while attempting to show");
     }
 }
 
 fn hide_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
-        let _ = window.hide();
+        info!("hiding main window");
+        if let Err(error) = window.hide() {
+            warn!(%error, "failed to hide main window");
+        }
+    } else {
+        warn!("main window was not found while attempting to hide");
     }
 }
 
@@ -619,54 +848,84 @@ fn toggle_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         match window.is_visible() {
             Ok(true) => {
-                let _ = window.hide();
+                info!("toggling main window to hidden");
+                if let Err(error) = window.hide() {
+                    warn!(%error, "failed to hide main window while toggling");
+                }
             }
             _ => {
-                let _ = window.show();
-                let _ = window.set_focus();
+                info!("toggling main window to visible");
+                if let Err(error) = window.show() {
+                    warn!(%error, "failed to show main window while toggling");
+                }
+                if let Err(error) = window.set_focus() {
+                    warn!(%error, "failed to focus main window while toggling");
+                }
             }
         }
+    } else {
+        warn!("main window was not found while toggling visibility");
     }
 }
 
 fn handle_tray_menu_event(app: &AppHandle, menu_id: &str) {
+    info!(menu_id, "tray menu event received");
     match menu_id {
         "show_window" => show_main_window(app),
         "hide_window" => hide_main_window(app),
-        "quit" => app.exit(0),
-        _ => {}
+        "quit" => {
+            info!("quitting app from tray menu");
+            app.exit(0);
+        }
+        _ => warn!(menu_id, "unknown tray menu event"),
     }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    info!("starting tauri app builder");
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(AppState::default())
         .manage(HotkeyService::new())
         .manage(PipelineRuntimeState::default())
         .setup(|app| {
+            let logging_state = logging::initialize(app.handle()).map_err(std::io::Error::other)?;
+            app.manage(logging_state);
+
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            info!("setup started");
 
             let history_store = HistoryStore::new(app.handle()).map_err(std::io::Error::other)?;
             app.manage(history_store);
+            info!("history store initialized");
 
             app.handle()
                 .plugin(tauri_plugin_global_shortcut::Builder::new().build())?;
+            info!("global shortcut plugin initialized");
 
             let hotkey_service = app.state::<HotkeyService>();
             hotkey_service
                 .register_default_shortcut(app.handle())
                 .map_err(std::io::Error::other)?;
+            info!("default hotkey registered");
 
             let app_state = app.state::<AppState>();
+            let permission_state = app_state
+                .services
+                .permission_service
+                .microphone_permission();
+            info!(?permission_state, "microphone permission check completed");
             if let Err(error) = app_state.services.settings_store.load(app.handle()) {
-                eprintln!("Failed to load persisted settings: {error}");
+                warn!(%error, "failed to load persisted settings");
+            } else {
+                info!("persisted settings loaded");
             }
 
             register_pipeline_handlers(app.handle());
             set_status_for_app(app.handle(), AppStatus::Idle);
+            info!("pipeline handlers registered and status initialized");
 
             let show_item =
                 MenuItem::with_id(app, "show_window", "Open Voice", true, None::<&str>)?;
@@ -692,15 +951,20 @@ pub fn run() {
                     handle_tray_menu_event(app, event.id().as_ref());
                 })
                 .build(app)?;
+            info!("tray icon initialized");
 
             hide_main_window(app.handle());
+            info!("setup complete");
 
             Ok(())
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                let _ = window.hide();
+                info!("main window close requested; hiding instead");
+                if let Err(error) = window.hide() {
+                    warn!(%error, "failed to hide main window on close request");
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -722,6 +986,7 @@ pub fn run() {
             get_history_entry,
             delete_history_entry,
             clear_history,
+            export_logs,
             hotkey_service::get_hotkey_config,
             hotkey_service::get_hotkey_recording_state,
             hotkey_service::set_hotkey_config

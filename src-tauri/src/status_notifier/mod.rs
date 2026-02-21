@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -22,6 +23,7 @@ pub struct StatusNotifier {
 
 impl StatusNotifier {
     pub fn new() -> Self {
+        debug!("status notifier initialized");
         Self {
             current: AppStatus::Idle,
         }
@@ -32,6 +34,7 @@ impl StatusNotifier {
     }
 
     pub fn set(&mut self, status: AppStatus) {
+        debug!(from = ?self.current, to = ?status, "status notifier updated");
         self.current = status;
     }
 }

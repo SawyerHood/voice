@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tracing::{debug, error, info, warn};
 
 use crate::status_notifier::AppStatus;
 
@@ -72,16 +73,20 @@ impl Default for VoicePipeline {
 
 impl VoicePipeline {
     pub fn new(error_reset_delay: Duration) -> Self {
+        debug!(?error_reset_delay, "voice pipeline initialized");
         Self { error_reset_delay }
     }
 
     pub async fn handle_hotkey_started<D: VoicePipelineDelegate>(&self, delegate: &D) {
+        info!("pipeline handling hotkey start");
         match delegate.start_recording() {
             Ok(()) => {
+                info!("recording started successfully from hotkey");
                 delegate.on_recording_started(true);
                 delegate.set_status(AppStatus::Listening);
             }
             Err(message) => {
+                error!(message = %message, "recording start failed from hotkey");
                 delegate.on_recording_started(false);
                 self.handle_error(delegate, PipelineErrorStage::RecordingStart, message)
                     .await;
@@ -90,14 +95,20 @@ impl VoicePipeline {
     }
 
     pub async fn handle_hotkey_stopped<D: VoicePipelineDelegate>(&self, delegate: &D) {
+        info!("pipeline handling hotkey stop");
         delegate.set_status(AppStatus::Transcribing);
 
         let wav_bytes = match delegate.stop_recording() {
             Ok(wav_bytes) => {
+                info!(
+                    audio_bytes = wav_bytes.len(),
+                    "recording stopped successfully"
+                );
                 delegate.on_recording_stopped(true);
                 wav_bytes
             }
             Err(message) => {
+                error!(message = %message, "recording stop failed");
                 delegate.on_recording_stopped(false);
                 self.handle_error(delegate, PipelineErrorStage::RecordingStop, message)
                     .await;
@@ -106,8 +117,16 @@ impl VoicePipeline {
         };
 
         let transcript = match delegate.transcribe(wav_bytes).await {
-            Ok(transcript) => transcript,
+            Ok(transcript) => {
+                info!(
+                    transcript_chars = transcript.text.chars().count(),
+                    provider = %transcript.provider,
+                    "transcription completed in pipeline"
+                );
+                transcript
+            }
             Err(message) => {
+                error!(message = %message, "pipeline transcription failed");
                 self.handle_error(delegate, PipelineErrorStage::Transcription, message)
                     .await;
                 return;
@@ -117,15 +136,18 @@ impl VoicePipeline {
         delegate.emit_transcript(&transcript.text);
 
         if let Err(message) = delegate.insert_text(&transcript.text) {
+            error!(message = %message, "pipeline text insertion failed");
             self.handle_error(delegate, PipelineErrorStage::TextInsertion, message)
                 .await;
             return;
         }
+        info!("pipeline text insertion succeeded");
 
         if let Err(message) = delegate.save_history_entry(&transcript) {
-            eprintln!("Failed to persist transcript history entry: {message}");
+            warn!(message = %message, "failed to persist transcript history entry");
         }
 
+        debug!("pipeline returning to idle status");
         delegate.set_status(AppStatus::Idle);
     }
 
@@ -135,6 +157,7 @@ impl VoicePipeline {
         stage: PipelineErrorStage,
         message: String,
     ) {
+        debug!(stage = stage.as_str(), "handling pipeline stage error");
         self.handle_error(delegate, stage, message).await;
     }
 
@@ -145,9 +168,19 @@ impl VoicePipeline {
         message: String,
     ) {
         let error = PipelineError { stage, message };
+        error!(
+            stage = error.stage.as_str(),
+            message = %error.message,
+            "pipeline entering error state"
+        );
         delegate.emit_error(&error);
         delegate.set_status(AppStatus::Error);
+        debug!(
+            delay_ms = self.error_reset_delay.as_millis(),
+            "waiting before idle reset"
+        );
         tokio::time::sleep(self.error_reset_delay).await;
+        info!("pipeline resetting status to idle after error");
         delegate.set_status(AppStatus::Idle);
     }
 }
