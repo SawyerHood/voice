@@ -4118,6 +4118,8 @@ name = "tauri-app"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "core-foundation-sys",
+ "coreaudio-rs",
  "cpal",
  "httpdate",
  "mockito",
