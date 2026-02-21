@@ -16,7 +16,6 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import { Alert, AlertDescription } from "@/components/ui/alert";
-import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import {
   Tooltip,
@@ -608,7 +607,7 @@ function App() {
           </header>
 
           {/* Content body */}
-          <ScrollArea className="flex-1">
+          <div className="h-0 flex-1 overflow-y-auto">
             <div className="p-4">
               {activeView === "dashboard" && (
                 <DashboardView
@@ -633,7 +632,7 @@ function App() {
                 <Settings />
               )}
             </div>
-          </ScrollArea>
+          </div>
         </div>
       </main>
     </TooltipProvider>
