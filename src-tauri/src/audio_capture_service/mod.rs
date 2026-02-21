@@ -64,6 +64,8 @@ struct RecordingControl {
 struct RecordingRuntime {
     sample_rate_hz: u32,
     channels: u16,
+    device_id: String,
+    device_name: String,
 }
 
 struct EnumeratedInputDevice {
@@ -138,23 +140,6 @@ impl AudioCaptureService {
             return Err("Recording is already in progress".to_string());
         }
 
-        let host = cpal::default_host();
-        let devices = enumerate_input_devices(&host)?;
-
-        if devices.is_empty() {
-            warn!("recording start failed because no microphones are available");
-            return Err("No microphone input devices are available".to_string());
-        }
-
-        let selected_device = select_input_device(devices, preferred_device_id)?;
-        let selected_device_id = selected_device.id.clone();
-        let selected_device_name = selected_device.name.clone();
-        info!(
-            device_id = %selected_device_id,
-            device_name = %selected_device_name,
-            "selected microphone for recording"
-        );
-
         self.audio_level_bits
             .store(0.0_f32.to_bits(), Ordering::Relaxed);
 
@@ -162,14 +147,14 @@ impl AudioCaptureService {
         let worker_samples = Arc::clone(&samples);
         let worker_level_bits = Arc::clone(&self.audio_level_bits);
         let worker_app_handle = app_handle.clone();
-        let worker_device_id = selected_device_id.clone();
+        let worker_preferred_device_id = preferred_device_id.map(str::to_string);
 
         let (ready_tx, ready_rx) = mpsc::channel::<Result<RecordingRuntime, String>>();
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
 
         let mut join_handle = Some(thread::spawn(move || {
             recording_thread_main(
-                worker_device_id,
+                worker_preferred_device_id,
                 worker_samples,
                 worker_level_bits,
                 worker_app_handle,
@@ -218,8 +203,8 @@ impl AudioCaptureService {
             sample_rate_hz: runtime.sample_rate_hz,
             channels: runtime.channels,
             started_at: Instant::now(),
-            device_id: selected_device_id,
-            device_name: selected_device_name,
+            device_id: runtime.device_id,
+            device_name: runtime.device_name,
         });
 
         info!("audio capture started");
@@ -339,7 +324,7 @@ impl AudioCaptureService {
 }
 
 fn recording_thread_main(
-    selected_device_id: String,
+    preferred_device_id: Option<String>,
     samples: Arc<Mutex<Vec<i16>>>,
     audio_level_bits: Arc<AtomicU32>,
     app_handle: AppHandle,
@@ -347,11 +332,11 @@ fn recording_thread_main(
     stop_rx: Receiver<()>,
 ) {
     debug!(
-        device_id = %selected_device_id,
+        preferred_device_id = ?preferred_device_id.as_deref(),
         "microphone worker thread started"
     );
     let startup_result = start_recording_worker(
-        &selected_device_id,
+        preferred_device_id.as_deref(),
         Arc::clone(&samples),
         Arc::clone(&audio_level_bits),
     );
@@ -359,15 +344,25 @@ fn recording_thread_main(
     let (stream, runtime, stream_error_rx) = match startup_result {
         Ok(started) => started,
         Err(err) => {
-            error!(device_id = %selected_device_id, error = %err, "microphone worker startup failed");
+            error!(
+                preferred_device_id = ?preferred_device_id.as_deref(),
+                error = %err,
+                "microphone worker startup failed"
+            );
             let _ = ready_tx.send(Err(err));
             return;
         }
     };
 
     let _ = ready_tx.send(Ok(runtime));
+    let mut last_emitted_level: Option<f32> = None;
     let loop_exit = run_recording_loop(&stop_rx, &stream_error_rx, || {
-        let level = f32::from_bits(audio_level_bits.load(Ordering::Relaxed));
+        let level =
+            quantize_audio_level_for_emit(f32::from_bits(audio_level_bits.load(Ordering::Relaxed)));
+        if last_emitted_level.is_some_and(|last| (last - level).abs() < f32::EPSILON) {
+            return;
+        }
+        last_emitted_level = Some(level);
         let _ = app_handle.emit(AUDIO_LEVEL_EVENT, level);
     });
 
@@ -389,13 +384,17 @@ fn recording_thread_main(
 }
 
 fn start_recording_worker(
-    selected_device_id: &str,
+    preferred_device_id: Option<&str>,
     samples: Arc<Mutex<Vec<i16>>>,
     audio_level_bits: Arc<AtomicU32>,
 ) -> Result<(Stream, RecordingRuntime, Receiver<String>), String> {
     let host = cpal::default_host();
     let devices = enumerate_input_devices(&host)?;
-    let selected_device = select_input_device(devices, Some(selected_device_id))?;
+    if devices.is_empty() {
+        return Err("No microphone input devices are available".to_string());
+    }
+
+    let selected_device = select_input_device(devices, preferred_device_id)?;
     info!(
         device_id = %selected_device.id,
         device_name = %selected_device.name,
@@ -448,6 +447,8 @@ fn start_recording_worker(
         RecordingRuntime {
             sample_rate_hz,
             channels: 1,
+            device_id: selected_device.id,
+            device_name: selected_device.name,
         },
         stream_error_rx,
     ))
@@ -931,6 +932,11 @@ fn process_input_frames<T, F>(
     audio_level_bits.store(level.to_bits(), Ordering::Relaxed);
 }
 
+fn quantize_audio_level_for_emit(level: f32) -> f32 {
+    let clamped = level.clamp(0.0, 1.0);
+    (clamped * 100.0).round() / 100.0
+}
+
 fn float_to_pcm16(sample: f32) -> i16 {
     let clamped = sample.clamp(-1.0, 1.0);
     if clamped <= -1.0 {
@@ -979,8 +985,24 @@ fn pcm16_to_wav_bytes(
     wav_bytes.extend_from_slice(b"data");
     wav_bytes.extend_from_slice(&data_size.to_le_bytes());
 
-    for sample in samples {
-        wav_bytes.extend_from_slice(&sample.to_le_bytes());
+    #[cfg(target_endian = "little")]
+    {
+        let sample_byte_len = samples
+            .len()
+            .checked_mul(std::mem::size_of::<i16>())
+            .ok_or_else(|| "WAV data size overflow".to_string())?;
+        // SAFETY: `i16` is a plain old data type and `samples` remains alive for the
+        // duration of this conversion.
+        let sample_bytes =
+            unsafe { std::slice::from_raw_parts(samples.as_ptr() as *const u8, sample_byte_len) };
+        wav_bytes.extend_from_slice(sample_bytes);
+    }
+
+    #[cfg(not(target_endian = "little"))]
+    {
+        for sample in samples {
+            wav_bytes.extend_from_slice(&sample.to_le_bytes());
+        }
     }
 
     Ok(wav_bytes)
@@ -992,7 +1014,8 @@ mod tests {
 
     use super::{
         build_microphone_device_id, ensure_unique_device_id, float_to_pcm16, legacy_device_slug,
-        pcm16_to_wav_bytes, run_recording_loop, slugify_device_name, RecordingLoopExit,
+        pcm16_to_wav_bytes, quantize_audio_level_for_emit, run_recording_loop, slugify_device_name,
+        RecordingLoopExit,
     };
 
     #[test]
@@ -1062,6 +1085,15 @@ mod tests {
         assert_eq!(float_to_pcm16(0.0), 0);
         assert_eq!(float_to_pcm16(1.0), i16::MAX);
         assert_eq!(float_to_pcm16(1.5), i16::MAX);
+    }
+
+    #[test]
+    fn audio_level_quantization_clamps_and_rounds() {
+        assert_eq!(quantize_audio_level_for_emit(-0.2), 0.0);
+        assert_eq!(quantize_audio_level_for_emit(0.004), 0.0);
+        assert_eq!(quantize_audio_level_for_emit(0.005), 0.01);
+        assert_eq!(quantize_audio_level_for_emit(0.456), 0.46);
+        assert_eq!(quantize_audio_level_for_emit(1.6), 1.0);
     }
 
     #[test]

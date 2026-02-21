@@ -133,9 +133,10 @@ impl VoicePipeline {
             }
         };
 
+        let insert_result = delegate.insert_text(&transcript.text);
         delegate.emit_transcript(&transcript.text);
 
-        if let Err(message) = delegate.insert_text(&transcript.text) {
+        if let Err(message) = insert_result {
             error!(message = %message, "pipeline text insertion failed");
             self.handle_error(delegate, PipelineErrorStage::TextInsertion, message)
                 .await;
@@ -516,6 +517,35 @@ mod tests {
             vec![AppStatus::Transcribing, AppStatus::Idle]
         );
         assert!(delegate.errors().is_empty());
+    }
+
+    #[tokio::test]
+    async fn hotkey_stop_insertion_failure_emits_transcript_and_sets_error() {
+        let pipeline = VoicePipeline::new(Duration::ZERO);
+        let delegate = MockDelegate {
+            insert_result: Err("accessibility denied".to_string()),
+            ..MockDelegate::default()
+        };
+
+        pipeline.handle_hotkey_stopped(&delegate).await;
+
+        assert_eq!(
+            delegate.call_order(),
+            vec!["stop_recording", "transcribe", "insert_text"]
+        );
+        assert_eq!(delegate.transcripts(), vec!["hello world".to_string()]);
+        assert!(delegate.saved_history().is_empty());
+        assert_eq!(
+            delegate.statuses(),
+            vec![AppStatus::Transcribing, AppStatus::Error, AppStatus::Idle]
+        );
+        assert_eq!(
+            delegate.errors(),
+            vec![PipelineError {
+                stage: PipelineErrorStage::TextInsertion,
+                message: "accessibility denied".to_string(),
+            }]
+        );
     }
 
     #[tokio::test]

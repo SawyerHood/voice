@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use bytes::Bytes;
 use reqwest::{
     header::{HeaderMap, RETRY_AFTER},
     multipart, Client, StatusCode,
@@ -16,7 +17,7 @@ use super::{
 
 const DEFAULT_OPENAI_ENDPOINT: &str = "https://api.openai.com/v1/audio/transcriptions";
 const DEFAULT_OPENAI_MODEL: &str = "whisper-1";
-const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 180;
 const DEFAULT_MAX_RETRIES: u32 = 3;
 const DEFAULT_INITIAL_BACKOFF_MS: u64 = 500;
 const DEFAULT_MAX_BACKOFF_MS: u64 = 5_000;
@@ -193,7 +194,7 @@ impl OpenAiTranscriptionProvider {
 
     fn build_form(
         &self,
-        audio_data: Vec<u8>,
+        audio_data: Bytes,
         language: Option<&str>,
         prompt: Option<&str>,
     ) -> Result<multipart::Form, TranscriptionError> {
@@ -209,7 +210,10 @@ impl OpenAiTranscriptionProvider {
             form = form.text("prompt", prompt.to_string());
         }
 
-        let file_part = multipart::Part::bytes(audio_data)
+        let audio_len = u64::try_from(audio_data.len())
+            .map_err(|_| TranscriptionError::Provider("Audio upload is too large".to_string()))?;
+
+        let file_part = multipart::Part::stream_with_length(audio_data, audio_len)
             .file_name("audio.wav")
             .mime_str("audio/wav")
             .map_err(|error| {
@@ -235,6 +239,7 @@ impl TranscriptionProvider for OpenAiTranscriptionProvider {
         let request_language = normalize_optional_string(options.language);
         let request_prompt = build_prompt(options.prompt, options.context_hint);
         let request_language_for_payload = request_language.clone();
+        let audio_data = Bytes::from(audio_data);
         let mut attempt_index = 0;
         info!(
             endpoint = %self.config.endpoint,

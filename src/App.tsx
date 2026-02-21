@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import HistoryPanel from "./HistoryPanel";
@@ -286,6 +286,11 @@ function App() {
   const [permissionCardDismissed, setPermissionCardDismissedState] = useState<boolean>(
     () => readPermissionCardDismissed(),
   );
+  const statusRef = useRef<AppStatus>("idle");
+
+  useEffect(() => {
+    statusRef.current = status;
+  }, [status]);
 
   const refreshPermissions = useCallback(async () => {
     setIsRefreshingPermissions(true);
@@ -343,6 +348,7 @@ function App() {
         }
 
         setStatus(initialStatus);
+        statusRef.current = initialStatus;
         setAudioLevel(Number.isFinite(initialAudioLevel) ? initialAudioLevel : 0);
         setPermissions(initialPermissions);
         setPermissionErrorMessage("");
@@ -356,6 +362,7 @@ function App() {
       try {
         const listeners = await Promise.all([
           listen<AppStatus>("voice://status-changed", ({ payload }) => {
+            statusRef.current = payload;
             setStatus(payload);
             if (payload !== "error") {
               setErrorMessage("");
@@ -363,13 +370,21 @@ function App() {
           }),
           listen<number>("audio-level", ({ payload }) => {
             const normalized = Math.max(0, Math.min(1, Number(payload) || 0));
-            setAudioLevel(normalized);
+            if (statusRef.current !== "listening" && normalized > 0) {
+              return;
+            }
+
+            const quantized = Math.round(normalized * 100) / 100;
+            setAudioLevel((previous) =>
+              Math.abs(previous - quantized) < 0.01 ? previous : quantized,
+            );
           }),
           listen<TranscriptReadyEvent>("voice://transcript-ready", ({ payload }) => {
             setLastTranscript(payload.text ?? "");
           }),
           listen<PipelineErrorEvent>("voice://pipeline-error", ({ payload }) => {
             setErrorMessage(payload.message || "An unexpected pipeline error occurred.");
+            statusRef.current = "error";
             setStatus("error");
           }),
         ]);
