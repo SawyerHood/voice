@@ -49,6 +49,14 @@ pub enum RecordingTransition {
     Stopped,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopProcessingDecision {
+    Ignore,
+    DeferUntilStarted,
+    AcknowledgeOnly,
+    Process,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum HotkeyTrigger {
@@ -143,6 +151,32 @@ impl HotkeyRuntimeState {
         self.desired_recording = false;
         self.pending_transitions.clear();
     }
+
+    fn stop_processing_decision(&self) -> StopProcessingDecision {
+        let Some(stop_index) = self
+            .pending_transitions
+            .iter()
+            .position(|transition| matches!(transition, RecordingTransition::Stopped))
+        else {
+            return StopProcessingDecision::Ignore;
+        };
+
+        let has_start_before_stop = self
+            .pending_transitions
+            .iter()
+            .take(stop_index)
+            .any(|transition| matches!(transition, RecordingTransition::Started));
+
+        if has_start_before_stop {
+            return StopProcessingDecision::DeferUntilStarted;
+        }
+
+        if self.is_recording {
+            StopProcessingDecision::Process
+        } else {
+            StopProcessingDecision::AcknowledgeOnly
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -185,6 +219,13 @@ impl HotkeyService {
         if let Ok(mut state) = self.state.lock() {
             state.acknowledge_transition(transition, success);
         }
+    }
+
+    pub fn stop_processing_decision(&self) -> StopProcessingDecision {
+        self.state
+            .lock()
+            .map(|state| state.stop_processing_decision())
+            .unwrap_or(StopProcessingDecision::Ignore)
     }
 
     pub fn force_stop_recording<R: Runtime>(&self, app: &AppHandle<R>) -> bool {
@@ -659,6 +700,50 @@ mod tests {
             state.pending_transitions,
             VecDeque::from([RecordingTransition::Stopped])
         );
+    }
+
+    #[test]
+    fn quick_release_defers_stop_until_start_ack_then_processes() {
+        let mut state = HotkeyRuntimeState::default();
+
+        state.apply_shortcut_event(ShortcutState::Pressed);
+        state.apply_shortcut_event(ShortcutState::Released);
+
+        assert_eq!(
+            state.stop_processing_decision(),
+            StopProcessingDecision::DeferUntilStarted
+        );
+
+        state.acknowledge_transition(RecordingTransition::Started, true);
+        assert!(state.is_recording);
+        assert_eq!(
+            state.stop_processing_decision(),
+            StopProcessingDecision::Process
+        );
+
+        state.acknowledge_transition(RecordingTransition::Stopped, true);
+        assert!(!state.is_recording);
+        assert!(!state.desired_recording);
+        assert!(state.pending_transitions.is_empty());
+    }
+
+    #[test]
+    fn quick_release_after_start_failure_acknowledges_stop_without_processing() {
+        let mut state = HotkeyRuntimeState::default();
+
+        state.apply_shortcut_event(ShortcutState::Pressed);
+        state.apply_shortcut_event(ShortcutState::Released);
+        state.acknowledge_transition(RecordingTransition::Started, false);
+
+        assert_eq!(
+            state.stop_processing_decision(),
+            StopProcessingDecision::AcknowledgeOnly
+        );
+
+        state.acknowledge_transition(RecordingTransition::Stopped, false);
+        assert!(!state.is_recording);
+        assert!(!state.desired_recording);
+        assert!(state.pending_transitions.is_empty());
     }
 
     #[tokio::test]
