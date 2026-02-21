@@ -3,6 +3,8 @@ use std::{
     io::Write,
     process::{Command, Stdio},
     ptr,
+    thread::sleep,
+    time::Duration,
 };
 
 const AX_SUCCESS: i32 = 0;
@@ -13,6 +15,7 @@ const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 
 const DIRECT_TYPE_THRESHOLD_CHARS: usize = 400;
 const UNICODE_CHUNK_SIZE: usize = 48;
+const PASTE_REGISTER_DELAY_MS: u64 = 75;
 
 type CFTypeRef = *const c_void;
 type CFAllocatorRef = *const c_void;
@@ -73,8 +76,10 @@ pub enum InsertionMode {
 trait InsertionBackend {
     fn has_focused_input_target(&self) -> bool;
     fn type_unicode_text(&self, text: &str) -> Result<(), String>;
+    fn read_text_from_clipboard(&self) -> Result<String, String>;
     fn write_text_to_clipboard(&self, text: &str) -> Result<(), String>;
     fn post_command_v(&self) -> Result<(), String>;
+    fn wait_for_paste_to_register(&self);
 }
 
 #[derive(Debug, Default)]
@@ -89,12 +94,20 @@ impl InsertionBackend for MacOsInsertionBackend {
         type_unicode_text(text)
     }
 
+    fn read_text_from_clipboard(&self) -> Result<String, String> {
+        read_text_from_clipboard()
+    }
+
     fn write_text_to_clipboard(&self, text: &str) -> Result<(), String> {
         write_text_to_clipboard(text)
     }
 
     fn post_command_v(&self) -> Result<(), String> {
         post_command_v()
+    }
+
+    fn wait_for_paste_to_register(&self) {
+        wait_for_paste_to_register();
     }
 }
 
@@ -152,8 +165,40 @@ fn insert_text_with_backend<B: InsertionBackend>(
 }
 
 fn paste_via_clipboard<B: InsertionBackend>(backend: &B, text: &str) -> Result<(), String> {
+    let previous_clipboard = match backend.read_text_from_clipboard() {
+        Ok(clipboard) => Some(clipboard),
+        Err(error) => {
+            eprintln!("Failed to read clipboard before paste fallback: {error}");
+            None
+        }
+    };
+
     backend.write_text_to_clipboard(text)?;
-    backend.post_command_v()
+    let paste_result = backend.post_command_v();
+    if paste_result.is_ok() {
+        backend.wait_for_paste_to_register();
+    }
+
+    if let Some(previous_clipboard) = previous_clipboard {
+        if let Err(error) = backend.write_text_to_clipboard(&previous_clipboard) {
+            eprintln!("Failed to restore clipboard after paste fallback: {error}");
+        }
+    }
+
+    paste_result
+}
+
+fn read_text_from_clipboard() -> Result<String, String> {
+    let output = Command::new("pbpaste")
+        .output()
+        .map_err(|error| format!("Failed to start pbpaste: {error}"))?;
+
+    if !output.status.success() {
+        return Err(format!("pbpaste exited with status: {}", output.status));
+    }
+
+    String::from_utf8(output.stdout)
+        .map_err(|error| format!("Clipboard is not UTF-8 text: {error}"))
 }
 
 fn write_text_to_clipboard(text: &str) -> Result<(), String> {
@@ -241,14 +286,39 @@ fn has_focused_input_target() -> bool {
 }
 
 fn type_unicode_text(text: &str) -> Result<(), String> {
-    let utf16: Vec<u16> = text.encode_utf16().collect();
-
-    for chunk in utf16.chunks(UNICODE_CHUNK_SIZE) {
-        post_unicode_keystroke(chunk, true)?;
-        post_unicode_keystroke(chunk, false)?;
+    for chunk in utf16_chunks_preserving_char_boundaries(text, UNICODE_CHUNK_SIZE) {
+        post_unicode_keystroke(&chunk, true)?;
+        post_unicode_keystroke(&chunk, false)?;
     }
 
     Ok(())
+}
+
+fn utf16_chunks_preserving_char_boundaries(text: &str, max_units: usize) -> Vec<Vec<u16>> {
+    if max_units == 0 {
+        return Vec::new();
+    }
+
+    let mut chunks: Vec<Vec<u16>> = Vec::new();
+    let mut current_chunk: Vec<u16> = Vec::with_capacity(max_units);
+
+    for character in text.chars() {
+        let mut character_utf16 = [0_u16; 2];
+        let encoded_character = character.encode_utf16(&mut character_utf16);
+
+        if current_chunk.len() + encoded_character.len() > max_units && !current_chunk.is_empty() {
+            chunks.push(current_chunk);
+            current_chunk = Vec::with_capacity(max_units);
+        }
+
+        current_chunk.extend_from_slice(encoded_character);
+    }
+
+    if !current_chunk.is_empty() {
+        chunks.push(current_chunk);
+    }
+
+    chunks
 }
 
 fn post_unicode_keystroke(chunk: &[u16], key_down: bool) -> Result<(), String> {
@@ -288,12 +358,17 @@ fn post_command_v() -> Result<(), String> {
     Ok(())
 }
 
+fn wait_for_paste_to_register() {
+    sleep(Duration::from_millis(PASTE_REGISTER_DELAY_MS));
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
 
     use super::{
-        insert_text_with_backend, InsertionBackend, InsertionMode, DIRECT_TYPE_THRESHOLD_CHARS,
+        insert_text_with_backend, utf16_chunks_preserving_char_boundaries, InsertionBackend,
+        InsertionMode, DIRECT_TYPE_THRESHOLD_CHARS, UNICODE_CHUNK_SIZE,
     };
 
     #[derive(Debug)]
@@ -301,8 +376,11 @@ mod tests {
         focused_input: bool,
         type_result: Result<(), String>,
         copy_result: Result<(), String>,
+        restore_result: Result<(), String>,
         paste_result: Result<(), String>,
+        clipboard_read_result: Result<String, String>,
         calls: RefCell<Vec<&'static str>>,
+        clipboard_writes: RefCell<Vec<String>>,
     }
 
     impl Default for MockBackend {
@@ -311,8 +389,11 @@ mod tests {
                 focused_input: true,
                 type_result: Ok(()),
                 copy_result: Ok(()),
+                restore_result: Ok(()),
                 paste_result: Ok(()),
+                clipboard_read_result: Ok("previous clipboard".to_string()),
                 calls: RefCell::new(Vec::new()),
+                clipboard_writes: RefCell::new(Vec::new()),
             }
         }
     }
@@ -320,6 +401,10 @@ mod tests {
     impl MockBackend {
         fn call_order(&self) -> Vec<&'static str> {
             self.calls.borrow().clone()
+        }
+
+        fn clipboard_writes(&self) -> Vec<String> {
+            self.clipboard_writes.borrow().clone()
         }
     }
 
@@ -334,14 +419,31 @@ mod tests {
             self.type_result.clone()
         }
 
-        fn write_text_to_clipboard(&self, _text: &str) -> Result<(), String> {
+        fn read_text_from_clipboard(&self) -> Result<String, String> {
+            self.calls.borrow_mut().push("clipboard_read");
+            self.clipboard_read_result.clone()
+        }
+
+        fn write_text_to_clipboard(&self, text: &str) -> Result<(), String> {
             self.calls.borrow_mut().push("copy");
-            self.copy_result.clone()
+            let mut clipboard_writes = self.clipboard_writes.borrow_mut();
+            let write_index = clipboard_writes.len();
+            clipboard_writes.push(text.to_string());
+
+            if write_index == 0 {
+                self.copy_result.clone()
+            } else {
+                self.restore_result.clone()
+            }
         }
 
         fn post_command_v(&self) -> Result<(), String> {
             self.calls.borrow_mut().push("paste");
             self.paste_result.clone()
+        }
+
+        fn wait_for_paste_to_register(&self) {
+            self.calls.borrow_mut().push("wait");
         }
     }
 
@@ -375,7 +477,21 @@ mod tests {
         let result = insert_text_with_backend(&backend, "hello", InsertionMode::Auto);
 
         assert!(result.is_ok());
-        assert_eq!(backend.call_order(), vec!["focus_check", "copy", "paste"]);
+        assert_eq!(
+            backend.call_order(),
+            vec![
+                "focus_check",
+                "clipboard_read",
+                "copy",
+                "paste",
+                "wait",
+                "copy"
+            ]
+        );
+        assert_eq!(
+            backend.clipboard_writes(),
+            vec!["hello".to_string(), "previous clipboard".to_string()]
+        );
     }
 
     #[test]
@@ -386,7 +502,10 @@ mod tests {
         let result = insert_text_with_backend(&backend, &text, InsertionMode::Auto);
 
         assert!(result.is_ok());
-        assert_eq!(backend.call_order(), vec!["copy", "paste"]);
+        assert_eq!(
+            backend.call_order(),
+            vec!["clipboard_read", "copy", "paste", "wait", "copy"]
+        );
     }
 
     #[test]
@@ -401,7 +520,15 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(
             backend.call_order(),
-            vec!["focus_check", "direct_type", "copy", "paste"]
+            vec![
+                "focus_check",
+                "direct_type",
+                "clipboard_read",
+                "copy",
+                "paste",
+                "wait",
+                "copy"
+            ]
         );
     }
 
@@ -418,11 +545,57 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             backend.call_order(),
-            vec!["focus_check", "direct_type", "copy"]
+            vec!["focus_check", "direct_type", "clipboard_read", "copy"]
         );
         let error = result.unwrap_err();
         assert!(error.contains("direct failed"));
         assert!(error.contains("copy failed"));
+    }
+
+    #[test]
+    fn paste_succeeds_even_when_clipboard_restore_fails() {
+        let backend = MockBackend {
+            focused_input: false,
+            restore_result: Err("restore failed".to_string()),
+            ..Default::default()
+        };
+
+        let result = insert_text_with_backend(&backend, "hello", InsertionMode::Auto);
+
+        assert!(result.is_ok());
+        assert_eq!(
+            backend.call_order(),
+            vec![
+                "focus_check",
+                "clipboard_read",
+                "copy",
+                "paste",
+                "wait",
+                "copy"
+            ]
+        );
+        assert_eq!(
+            backend.clipboard_writes(),
+            vec!["hello".to_string(), "previous clipboard".to_string()]
+        );
+    }
+
+    #[test]
+    fn skips_clipboard_restore_if_capture_fails() {
+        let backend = MockBackend {
+            focused_input: false,
+            clipboard_read_result: Err("read failed".to_string()),
+            ..Default::default()
+        };
+
+        let result = insert_text_with_backend(&backend, "hello", InsertionMode::Auto);
+
+        assert!(result.is_ok());
+        assert_eq!(
+            backend.call_order(),
+            vec!["focus_check", "clipboard_read", "copy", "paste", "wait"]
+        );
+        assert_eq!(backend.clipboard_writes(), vec!["hello".to_string()]);
     }
 
     #[test]
@@ -433,5 +606,30 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(backend.call_order().is_empty());
+    }
+
+    #[test]
+    fn utf16_chunking_preserves_non_bmp_characters() {
+        let text = format!("{}{}{}", "a".repeat(UNICODE_CHUNK_SIZE - 1), "😀😀", "𐍈");
+        let chunks = utf16_chunks_preserving_char_boundaries(&text, UNICODE_CHUNK_SIZE);
+
+        assert!(!chunks.is_empty());
+        assert!(chunks.iter().all(|chunk| chunk.len() <= UNICODE_CHUNK_SIZE));
+
+        let flattened: Vec<u16> = chunks.into_iter().flatten().collect();
+        let reconstructed = String::from_utf16(&flattened).expect("valid UTF-16 chunks");
+        assert_eq!(reconstructed, text);
+    }
+
+    #[test]
+    fn utf16_chunking_never_splits_surrogate_pairs() {
+        let text = format!("{}{}", "a".repeat(UNICODE_CHUNK_SIZE - 1), "😀😀😀");
+        let chunks = utf16_chunks_preserving_char_boundaries(&text, UNICODE_CHUNK_SIZE);
+
+        assert!(chunks.iter().all(|chunk| {
+            chunk
+                .last()
+                .is_none_or(|unit| !(0xD800..=0xDBFF).contains(unit))
+        }));
     }
 }
