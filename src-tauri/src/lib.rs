@@ -308,6 +308,7 @@ struct PipelineRuntimeState {
     execution_lock: Arc<tokio::sync::Mutex<()>>,
     next_session_id: Arc<AtomicU64>,
     active_session_id: Arc<AtomicU64>,
+    realtime_session: Arc<Mutex<Option<RealtimeTranscriptionSession>>>,
 }
 
 impl Default for PipelineRuntimeState {
@@ -316,6 +317,7 @@ impl Default for PipelineRuntimeState {
             execution_lock: Arc::new(tokio::sync::Mutex::new(())),
             next_session_id: Arc::new(AtomicU64::new(0)),
             active_session_id: Arc::new(AtomicU64::new(0)),
+            realtime_session: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -324,12 +326,31 @@ impl PipelineRuntimeState {
     fn begin_session(&self) -> u64 {
         let session_id = self.next_session_id.fetch_add(1, Ordering::Relaxed) + 1;
         self.active_session_id.store(session_id, Ordering::Relaxed);
+        self.clear_realtime_session();
         debug!(session_id, "pipeline session started");
         session_id
     }
 
+    fn active_session_id(&self) -> Option<u64> {
+        let session_id = self.active_session_id.load(Ordering::Relaxed);
+        (session_id > 0).then_some(session_id)
+    }
+
     fn is_session_active(&self, session_id: u64) -> bool {
         self.active_session_id.load(Ordering::Relaxed) == session_id
+    }
+
+    fn clear_realtime_session(&self) {
+        match self.realtime_session.lock() {
+            Ok(mut guard) => {
+                if let Some(session) = guard.take() {
+                    session.close();
+                }
+            }
+            Err(_) => {
+                error!("failed to clear realtime session because runtime lock was poisoned");
+            }
+        }
     }
 }
 
@@ -342,18 +363,26 @@ struct AppPipelineDelegate {
 
 impl AppPipelineDelegate {
     fn new(app: AppHandle) -> Self {
+        let realtime_session = {
+            let runtime_state = app.state::<PipelineRuntimeState>();
+            Arc::clone(&runtime_state.realtime_session)
+        };
         Self {
             app,
             session_id: None,
-            realtime_session: Arc::new(Mutex::new(None)),
+            realtime_session,
         }
     }
 
     fn for_session(app: AppHandle, session_id: u64) -> Self {
+        let realtime_session = {
+            let runtime_state = app.state::<PipelineRuntimeState>();
+            Arc::clone(&runtime_state.realtime_session)
+        };
         Self {
             app,
             session_id: Some(session_id),
-            realtime_session: Arc::new(Mutex::new(None)),
+            realtime_session,
         }
     }
 
@@ -387,6 +416,17 @@ impl AppPipelineDelegate {
     }
 
     fn store_realtime_session(&self, session: Option<RealtimeTranscriptionSession>) {
+        if self.session_id.is_some() && !self.is_session_active() {
+            if let Some(stale_session) = session {
+                stale_session.close();
+            }
+            debug!(
+                session_id = ?self.session_id,
+                "ignoring realtime session store for inactive session"
+            );
+            return;
+        }
+
         if let Ok(mut guard) = self.realtime_session.lock() {
             *guard = session;
         } else {
@@ -398,6 +438,14 @@ impl AppPipelineDelegate {
     }
 
     fn take_realtime_session(&self) -> Option<RealtimeTranscriptionSession> {
+        if self.session_id.is_some() && !self.is_session_active() {
+            debug!(
+                session_id = ?self.session_id,
+                "ignoring realtime session access for inactive session"
+            );
+            return None;
+        }
+
         match self.realtime_session.lock() {
             Ok(mut guard) => guard.take(),
             Err(_) => {
@@ -1094,6 +1142,10 @@ where
     })
 }
 
+fn active_pipeline_session_id(runtime_state: &PipelineRuntimeState) -> Option<u64> {
+    runtime_state.active_session_id()
+}
+
 fn register_pipeline_handlers(app: &AppHandle) {
     info!("registering pipeline event handlers");
     let start_app = app.clone();
@@ -1132,7 +1184,15 @@ fn register_pipeline_handlers(app: &AppHandle) {
 
             match stop_decision {
                 StopProcessingDecision::Process => {
-                    let session_id = runtime_state.begin_session();
+                    let Some(session_id) = active_pipeline_session_id(&runtime_state) else {
+                        warn!(
+                            "received stop event with no active pipeline session; acknowledging stop as failed"
+                        );
+                        let hotkey_service = app.state::<HotkeyService>();
+                        hotkey_service
+                            .acknowledge_transition(RecordingTransition::Stopped, false);
+                        return;
+                    };
                     let delegate = AppPipelineDelegate::for_session(app.clone(), session_id);
                     VoicePipeline::default()
                         .handle_hotkey_stopped(&delegate)
@@ -1747,7 +1807,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::{Arc, Mutex},
+        sync::{atomic::Ordering, Arc, Mutex},
         time::Duration,
     };
 
@@ -1769,9 +1829,9 @@ mod tests {
     };
 
     use super::{
-        apply_hotkey_from_settings_with_fallback, apply_settings_transaction_with_hooks,
-        handle_audio_input_stream_error_with_hooks, has_api_key,
-        load_startup_settings_with_fallback, overlay_position_from_work_area,
+        active_pipeline_session_id, apply_hotkey_from_settings_with_fallback,
+        apply_settings_transaction_with_hooks, handle_audio_input_stream_error_with_hooks,
+        has_api_key, load_startup_settings_with_fallback, overlay_position_from_work_area,
         permission_preflight_error_message, should_show_overlay_for_status,
         spawn_pipeline_stage_error_reset, AppState, PipelineRuntimeState,
         OVERLAY_WINDOW_TOP_MARGIN, OVERLAY_WINDOW_WIDTH,
@@ -2179,6 +2239,22 @@ mod tests {
 
         assert!(!runtime.is_session_active(first));
         assert!(runtime.is_session_active(second));
+    }
+
+    #[test]
+    fn active_pipeline_session_id_returns_current_session_without_mutating_counter() {
+        let runtime = PipelineRuntimeState::default();
+        let session_id = runtime.begin_session();
+        let next_before = runtime.next_session_id.load(Ordering::Relaxed);
+
+        assert_eq!(active_pipeline_session_id(&runtime), Some(session_id));
+        assert_eq!(runtime.next_session_id.load(Ordering::Relaxed), next_before);
+    }
+
+    #[test]
+    fn active_pipeline_session_id_is_none_before_any_session_starts() {
+        let runtime = PipelineRuntimeState::default();
+        assert_eq!(active_pipeline_session_id(&runtime), None);
     }
 
     #[tokio::test]
