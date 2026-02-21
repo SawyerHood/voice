@@ -9,6 +9,7 @@ mod status_notifier;
 mod text_insertion_service;
 mod transcription;
 
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use audio_capture_service::AudioCaptureService;
@@ -23,13 +24,14 @@ use tauri::{
     AppHandle, Manager,
 };
 use text_insertion_service::TextInsertionService;
-use transcription::openai::OpenAiTranscriptionProvider;
+use transcription::openai::{OpenAiTranscriptionConfig, OpenAiTranscriptionProvider};
+use transcription::{TranscriptionOptions, TranscriptionOrchestrator};
 
 #[derive(Debug)]
 struct AppServices {
     _hotkey_service: HotkeyService,
     _audio_capture_service: AudioCaptureService,
-    _transcription_provider: OpenAiTranscriptionProvider,
+    transcription_orchestrator: TranscriptionOrchestrator,
     _text_insertion_service: TextInsertionService,
     _settings_store: SettingsStore,
     _history_store: HistoryStore,
@@ -38,10 +40,13 @@ struct AppServices {
 
 impl Default for AppServices {
     fn default() -> Self {
+        let provider = OpenAiTranscriptionProvider::new(OpenAiTranscriptionConfig::from_env());
+        let transcription_orchestrator = TranscriptionOrchestrator::new(Arc::new(provider));
+
         Self {
             _hotkey_service: HotkeyService::new(),
             _audio_capture_service: AudioCaptureService::new(),
-            _transcription_provider: OpenAiTranscriptionProvider::new(),
+            transcription_orchestrator,
             _text_insertion_service: TextInsertionService::new(),
             _settings_store: SettingsStore::new(),
             _history_store: HistoryStore::new(),
@@ -53,7 +58,7 @@ impl Default for AppServices {
 #[derive(Debug, Default)]
 struct AppState {
     status_notifier: Mutex<StatusNotifier>,
-    _services: AppServices,
+    services: AppServices,
 }
 
 #[tauri::command]
@@ -69,6 +74,40 @@ fn get_status(state: tauri::State<'_, AppState>) -> AppStatus {
 fn set_status(status: AppStatus, state: tauri::State<'_, AppState>) {
     if let Ok(mut notifier) = state.status_notifier.lock() {
         notifier.set(status);
+    }
+}
+
+#[tauri::command]
+async fn transcribe_audio(
+    audio_bytes: Vec<u8>,
+    options: Option<TranscriptionOptions>,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    if let Ok(mut notifier) = state.status_notifier.lock() {
+        notifier.set(AppStatus::Transcribing);
+    }
+
+    let result = state
+        .services
+        .transcription_orchestrator
+        .transcribe(audio_bytes, options.unwrap_or_default())
+        .await;
+
+    match result {
+        Ok(transcription) => {
+            if let Ok(mut notifier) = state.status_notifier.lock() {
+                notifier.set(AppStatus::Idle);
+            }
+
+            Ok(transcription.text)
+        }
+        Err(error) => {
+            if let Ok(mut notifier) = state.status_notifier.lock() {
+                notifier.set(AppStatus::Error);
+            }
+
+            Err(error.to_string())
+        }
     }
 }
 
@@ -117,8 +156,10 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
-            let show_item = MenuItem::with_id(app, "show_window", "Open Voice", true, None::<&str>)?;
-            let hide_item = MenuItem::with_id(app, "hide_window", "Hide Voice", true, None::<&str>)?;
+            let show_item =
+                MenuItem::with_id(app, "show_window", "Open Voice", true, None::<&str>)?;
+            let hide_item =
+                MenuItem::with_id(app, "hide_window", "Hide Voice", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "Quit Voice", true, None::<&str>)?;
             let tray_menu = Menu::with_items(app, &[&show_item, &hide_item, &quit_item])?;
 
@@ -150,7 +191,11 @@ pub fn run() {
                 let _ = window.hide();
             }
         })
-        .invoke_handler(tauri::generate_handler![get_status, set_status])
+        .invoke_handler(tauri::generate_handler![
+            get_status,
+            set_status,
+            transcribe_audio
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
