@@ -193,17 +193,10 @@ export default function Settings() {
     setIsSavingSettings(true);
 
     try {
-      const hotkeyConfig = await invoke<HotkeyConfig>("set_hotkey_config", {
-        config: {
-          shortcut: normalizeShortcut(hotkeyShortcut),
-          mode: recordingMode,
-        },
-      });
-
-      const updatedSettings = await invoke<VoiceSettings>("update_settings", {
+      const updatedSettings = await invoke<VoiceSettings>("apply_settings", {
         update: createSettingsUpdatePayload({
-          hotkeyShortcut: hotkeyConfig.shortcut,
-          recordingMode: hotkeyConfig.mode,
+          hotkeyShortcut: normalizeShortcut(hotkeyShortcut),
+          recordingMode,
           microphoneId,
           language,
           autoInsert,

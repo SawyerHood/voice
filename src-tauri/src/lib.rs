@@ -26,10 +26,13 @@ use audio_capture_service::{
     AUDIO_INPUT_STREAM_ERROR_EVENT,
 };
 use history_store::{HistoryEntry, HistoryStore};
-use hotkey_service::{HotkeyService, RecordingTransition};
+use hotkey_service::{HotkeyConfig, HotkeyService, RecordingMode, RecordingTransition};
 use permission_service::PermissionService;
 use serde::Serialize;
-use settings_store::{SettingsStore, VoiceSettings, VoiceSettingsUpdate};
+use settings_store::{
+    SettingsStore, VoiceSettings, VoiceSettingsUpdate, RECORDING_MODE_HOLD_TO_TALK,
+    RECORDING_MODE_TOGGLE,
+};
 use status_notifier::{AppStatus, StatusNotifier};
 use tauri::{
     menu::{Menu, MenuItem},
@@ -47,6 +50,105 @@ const EVENT_TRANSCRIPT_READY: &str = "voice://transcript-ready";
 const EVENT_PIPELINE_ERROR: &str = "voice://pipeline-error";
 const AUDIO_STREAM_ERROR_RESET_DELAY_MS: u64 = 1_500;
 const DEFAULT_HISTORY_PAGE_SIZE: usize = 50;
+
+fn recording_mode_from_settings_value(value: &str) -> Result<RecordingMode, String> {
+    match value.trim().to_lowercase().as_str() {
+        RECORDING_MODE_HOLD_TO_TALK => Ok(RecordingMode::HoldToTalk),
+        RECORDING_MODE_TOGGLE => Ok(RecordingMode::Toggle),
+        normalized => Err(format!(
+            "Unsupported recording mode `{normalized}`. Expected `{RECORDING_MODE_HOLD_TO_TALK}` or `{RECORDING_MODE_TOGGLE}`"
+        )),
+    }
+}
+
+fn recording_mode_to_settings_value(mode: RecordingMode) -> &'static str {
+    match mode {
+        RecordingMode::HoldToTalk => RECORDING_MODE_HOLD_TO_TALK,
+        RecordingMode::Toggle => RECORDING_MODE_TOGGLE,
+    }
+}
+
+fn resolve_hotkey_config_for_settings(
+    update: &VoiceSettingsUpdate,
+    fallback_hotkey: &HotkeyConfig,
+) -> Result<HotkeyConfig, String> {
+    let mode = match update.recording_mode.as_deref() {
+        Some(mode) => recording_mode_from_settings_value(mode)?,
+        None => fallback_hotkey.mode,
+    };
+
+    Ok(HotkeyConfig {
+        shortcut: update
+            .hotkey_shortcut
+            .clone()
+            .unwrap_or_else(|| fallback_hotkey.shortcut.clone()),
+        mode,
+    })
+}
+
+fn apply_hotkey_from_settings_with_fallback<FApplyConfig, FApplyDefault>(
+    settings: &VoiceSettings,
+    mut apply_config: FApplyConfig,
+    mut apply_default: FApplyDefault,
+) -> Result<(), String>
+where
+    FApplyConfig: FnMut(HotkeyConfig) -> Result<(), String>,
+    FApplyDefault: FnMut() -> Result<(), String>,
+{
+    let config = match recording_mode_from_settings_value(settings.recording_mode.as_str()) {
+        Ok(mode) => HotkeyConfig {
+            shortcut: settings.hotkey_shortcut.clone(),
+            mode,
+        },
+        Err(error) => {
+            eprintln!(
+                "Invalid persisted recording mode; falling back to default hotkey configuration: {error}"
+            );
+            apply_default()?;
+            return Ok(());
+        }
+    };
+
+    if let Err(error) = apply_config(config) {
+        eprintln!(
+            "Failed to apply persisted hotkey configuration; falling back to defaults: {error}"
+        );
+        apply_default()?;
+    }
+
+    Ok(())
+}
+
+fn apply_settings_transaction_with_hooks<FApplyHotkey, FPersistSettings, FRollbackHotkey>(
+    update: VoiceSettingsUpdate,
+    previous_hotkey: HotkeyConfig,
+    requested_hotkey: HotkeyConfig,
+    mut apply_hotkey: FApplyHotkey,
+    mut persist_settings: FPersistSettings,
+    mut rollback_hotkey: FRollbackHotkey,
+) -> Result<VoiceSettings, String>
+where
+    FApplyHotkey: FnMut(HotkeyConfig) -> Result<HotkeyConfig, String>,
+    FPersistSettings: FnMut(VoiceSettingsUpdate) -> Result<VoiceSettings, String>,
+    FRollbackHotkey: FnMut(HotkeyConfig) -> Result<HotkeyConfig, String>,
+{
+    let applied_hotkey = apply_hotkey(requested_hotkey)?;
+
+    let mut update_with_applied_hotkey = update;
+    update_with_applied_hotkey.hotkey_shortcut = Some(applied_hotkey.shortcut.clone());
+    update_with_applied_hotkey.recording_mode =
+        Some(recording_mode_to_settings_value(applied_hotkey.mode).to_string());
+
+    match persist_settings(update_with_applied_hotkey) {
+        Ok(settings) => Ok(settings),
+        Err(persist_error) => match rollback_hotkey(previous_hotkey) {
+            Ok(_) => Err(format!("Failed to persist settings: {persist_error}")),
+            Err(rollback_error) => Err(format!(
+                "Failed to persist settings: {persist_error}. Failed to roll back hotkey config: {rollback_error}"
+            )),
+        },
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -152,6 +254,11 @@ impl AppPipelineDelegate {
             None => true,
         }
     }
+
+    fn current_settings(&self) -> VoiceSettings {
+        let state = self.app.state::<AppState>();
+        state.services.settings_store.current()
+    }
 }
 
 #[async_trait]
@@ -185,11 +292,12 @@ impl VoicePipelineDelegate for AppPipelineDelegate {
     }
 
     fn start_recording(&self) -> Result<(), String> {
+        let settings = self.current_settings();
         let state = self.app.state::<AppState>();
         state
             .services
             .audio_capture_service
-            .start_recording(self.app.clone(), None)
+            .start_recording(self.app.clone(), settings.microphone_id.as_deref())
     }
 
     fn stop_recording(&self) -> Result<Vec<u8>, String> {
@@ -202,6 +310,11 @@ impl VoicePipelineDelegate for AppPipelineDelegate {
     }
 
     async fn transcribe(&self, wav_bytes: Vec<u8>) -> Result<PipelineTranscript, String> {
+        let settings = self.current_settings();
+        let options = TranscriptionOptions {
+            language: settings.language,
+            ..TranscriptionOptions::default()
+        };
         let orchestrator = {
             let state = self.app.state::<AppState>();
             state.services.transcription_orchestrator.clone()
@@ -209,7 +322,7 @@ impl VoicePipelineDelegate for AppPipelineDelegate {
         let provider_name = orchestrator.active_provider_name().to_string();
 
         orchestrator
-            .transcribe(wav_bytes, TranscriptionOptions::default())
+            .transcribe(wav_bytes, options)
             .await
             .map(|transcription| PipelineTranscript {
                 text: transcription.text,
@@ -226,10 +339,19 @@ impl VoicePipelineDelegate for AppPipelineDelegate {
         }
 
         let state = self.app.state::<AppState>();
-        state
-            .services
-            .text_insertion_service
-            .insert_text(transcript)
+        let auto_insert = state.services.settings_store.current().auto_insert;
+
+        if auto_insert {
+            state
+                .services
+                .text_insertion_service
+                .insert_text(transcript)
+        } else {
+            state
+                .services
+                .text_insertion_service
+                .copy_to_clipboard(transcript)
+        }
     }
 
     fn save_history_entry(&self, transcript: &PipelineTranscript) -> Result<(), String> {
@@ -466,6 +588,26 @@ fn update_settings(
     state: tauri::State<'_, AppState>,
 ) -> Result<VoiceSettings, String> {
     state.services.settings_store.update(&app, update)
+}
+
+#[tauri::command]
+fn apply_settings(
+    app: AppHandle,
+    update: VoiceSettingsUpdate,
+    state: tauri::State<'_, AppState>,
+    hotkey_service: tauri::State<'_, HotkeyService>,
+) -> Result<VoiceSettings, String> {
+    let previous_hotkey = hotkey_service.current_config();
+    let requested_hotkey = resolve_hotkey_config_for_settings(&update, &previous_hotkey)?;
+
+    apply_settings_transaction_with_hooks(
+        update,
+        previous_hotkey,
+        requested_hotkey,
+        |config| hotkey_service.apply_config(&app, config),
+        |persist_update| state.services.settings_store.update(&app, persist_update),
+        |config| hotkey_service.apply_config(&app, config),
+    )
 }
 
 #[tauri::command]
@@ -708,18 +850,26 @@ pub fn run() {
                 .plugin(tauri_plugin_global_shortcut::Builder::new().build())?;
 
             let hotkey_service = app.state::<HotkeyService>();
-            hotkey_service
-                .register_default_shortcut(app.handle())
-                .map_err(std::io::Error::other)?;
-
             let app_state = app.state::<AppState>();
-            let launch_at_login = match app_state.services.settings_store.load(app.handle()) {
-                Ok(settings) => settings.launch_at_login,
+            let settings = match app_state.services.settings_store.load(app.handle()) {
+                Ok(settings) => settings,
                 Err(error) => {
                     eprintln!("Failed to load persisted settings: {error}");
-                    false
+                    VoiceSettings::default()
                 }
             };
+            let launch_at_login = settings.launch_at_login;
+
+            apply_hotkey_from_settings_with_fallback(
+                &settings,
+                |config| {
+                    hotkey_service
+                        .apply_config(app.handle(), config)
+                        .map(|_| ())
+                },
+                || hotkey_service.register_default_shortcut(app.handle()),
+            )
+            .map_err(std::io::Error::other)?;
 
             if let Err(error) = set_launch_at_login_state(app.handle(), launch_at_login) {
                 eprintln!("Failed to apply launch-at-login preference: {error}");
@@ -768,6 +918,7 @@ pub fn run() {
             set_status,
             get_settings,
             update_settings,
+            apply_settings,
             get_launch_at_login,
             set_launch_at_login,
             get_api_key,
@@ -803,6 +954,8 @@ mod tests {
     use tokio::sync::{oneshot, Notify};
 
     use crate::{
+        hotkey_service::{HotkeyConfig, RecordingMode},
+        settings_store::{VoiceSettings, VoiceSettingsUpdate, RECORDING_MODE_TOGGLE},
         status_notifier::AppStatus,
         voice_pipeline::{
             PipelineError, PipelineErrorStage, PipelineTranscript, VoicePipeline,
@@ -811,6 +964,7 @@ mod tests {
     };
 
     use super::{
+        apply_hotkey_from_settings_with_fallback, apply_settings_transaction_with_hooks,
         handle_audio_input_stream_error_with_hooks, spawn_pipeline_stage_error_reset,
         PipelineRuntimeState,
     };
@@ -1333,5 +1487,129 @@ mod tests {
                 message: "command transcription failed".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn startup_restore_applies_persisted_hotkey_configuration() {
+        let settings = VoiceSettings {
+            hotkey_shortcut: "Cmd+Shift+Space".to_string(),
+            recording_mode: RECORDING_MODE_TOGGLE.to_string(),
+            ..VoiceSettings::default()
+        };
+        let mut applied = Vec::new();
+        let mut default_fallback_calls = 0usize;
+
+        apply_hotkey_from_settings_with_fallback(
+            &settings,
+            |config| {
+                applied.push(config);
+                Ok(())
+            },
+            || {
+                default_fallback_calls += 1;
+                Ok(())
+            },
+        )
+        .expect("startup hotkey restoration should succeed");
+
+        assert_eq!(
+            applied,
+            vec![HotkeyConfig {
+                shortcut: "Cmd+Shift+Space".to_string(),
+                mode: RecordingMode::Toggle,
+            }]
+        );
+        assert_eq!(default_fallback_calls, 0);
+    }
+
+    #[test]
+    fn startup_restore_falls_back_to_default_when_persisted_mode_is_invalid() {
+        let settings = VoiceSettings {
+            hotkey_shortcut: "Cmd+Shift+Space".to_string(),
+            recording_mode: "invalid_mode".to_string(),
+            ..VoiceSettings::default()
+        };
+        let mut apply_attempts = 0usize;
+        let mut default_fallback_calls = 0usize;
+
+        apply_hotkey_from_settings_with_fallback(
+            &settings,
+            |_config| {
+                apply_attempts += 1;
+                Ok(())
+            },
+            || {
+                default_fallback_calls += 1;
+                Ok(())
+            },
+        )
+        .expect("startup fallback should recover from invalid mode");
+
+        assert_eq!(apply_attempts, 0);
+        assert_eq!(default_fallback_calls, 1);
+    }
+
+    #[test]
+    fn apply_settings_rolls_back_hotkey_when_settings_persist_fails() {
+        let previous_hotkey = HotkeyConfig {
+            shortcut: "Alt+Space".to_string(),
+            mode: RecordingMode::HoldToTalk,
+        };
+        let requested_hotkey = HotkeyConfig {
+            shortcut: "Ctrl+Space".to_string(),
+            mode: RecordingMode::Toggle,
+        };
+        let update = VoiceSettingsUpdate {
+            microphone_id: Some(Some("mic-42".to_string())),
+            ..VoiceSettingsUpdate::default()
+        };
+        let mut applied_hotkeys = Vec::new();
+        let mut rollback_hotkeys = Vec::new();
+
+        let error = apply_settings_transaction_with_hooks(
+            update,
+            previous_hotkey.clone(),
+            requested_hotkey.clone(),
+            |config| {
+                applied_hotkeys.push(config.clone());
+                Ok(config)
+            },
+            |_update| Err("disk full".to_string()),
+            |config| {
+                rollback_hotkeys.push(config.clone());
+                Ok(config)
+            },
+        )
+        .expect_err("persist failure should return an error");
+
+        assert_eq!(applied_hotkeys, vec![requested_hotkey]);
+        assert_eq!(rollback_hotkeys, vec![previous_hotkey]);
+        assert!(error.contains("Failed to persist settings: disk full"));
+    }
+
+    #[test]
+    fn apply_settings_reports_rollback_failure_after_persist_error() {
+        let previous_hotkey = HotkeyConfig {
+            shortcut: "Alt+Space".to_string(),
+            mode: RecordingMode::HoldToTalk,
+        };
+        let requested_hotkey = HotkeyConfig {
+            shortcut: "Ctrl+Space".to_string(),
+            mode: RecordingMode::Toggle,
+        };
+        let update = VoiceSettingsUpdate::default();
+
+        let error = apply_settings_transaction_with_hooks(
+            update,
+            previous_hotkey,
+            requested_hotkey,
+            Ok,
+            |_update| Err("disk full".to_string()),
+            |_config| Err("rollback shortcut registration failed".to_string()),
+        )
+        .expect_err("persist failure with rollback failure should return combined error");
+
+        assert!(error.contains("Failed to persist settings: disk full"));
+        assert!(error.contains("Failed to roll back hotkey config"));
     }
 }
