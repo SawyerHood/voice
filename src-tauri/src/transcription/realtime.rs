@@ -23,6 +23,8 @@ const DEFAULT_OPENAI_REALTIME_MODEL: &str = "gpt-realtime";
 const DEFAULT_OPENAI_TRANSCRIPTION_MODEL: &str = "gpt-4o-mini-transcribe";
 const OPENAI_REALTIME_BETA_HEADER_VALUE: &str = "realtime=v1";
 const DEFAULT_COMMIT_TIMEOUT_SECS: u64 = 20;
+const DEFAULT_TURN_THRESHOLD: f32 = 0.5;
+const DEFAULT_SILENCE_DURATION_MS: u64 = 500;
 const REALTIME_OUTPUT_SAMPLE_RATE_HZ: u32 = 24_000;
 const EVENT_SESSION_CREATED: &str = "session.created";
 const EVENT_SESSION_UPDATED: &str = "session.updated";
@@ -45,6 +47,8 @@ pub struct OpenAiRealtimeTranscriptionConfig {
     pub realtime_model: String,
     pub transcription_model: String,
     pub commit_timeout_secs: u64,
+    pub turn_detection_threshold: f32,
+    pub silence_duration_ms: u64,
 }
 
 impl Default for OpenAiRealtimeTranscriptionConfig {
@@ -56,6 +60,8 @@ impl Default for OpenAiRealtimeTranscriptionConfig {
             realtime_model: DEFAULT_OPENAI_REALTIME_MODEL.to_string(),
             transcription_model: DEFAULT_OPENAI_TRANSCRIPTION_MODEL.to_string(),
             commit_timeout_secs: DEFAULT_COMMIT_TIMEOUT_SECS,
+            turn_detection_threshold: DEFAULT_TURN_THRESHOLD,
+            silence_duration_ms: DEFAULT_SILENCE_DURATION_MS,
         }
     }
 }
@@ -89,6 +95,8 @@ impl OpenAiRealtimeTranscriptionConfig {
             realtime_model = %config.realtime_model,
             transcription_model = %config.transcription_model,
             commit_timeout_secs = config.commit_timeout_secs,
+            turn_detection_threshold = config.turn_detection_threshold,
+            silence_duration_ms = config.silence_duration_ms,
             "loaded OpenAI realtime transcription config"
         );
 
@@ -108,6 +116,8 @@ impl OpenAiRealtimeTranscriptionClient {
             realtime_model = %config.realtime_model,
             transcription_model = %config.transcription_model,
             commit_timeout_secs = config.commit_timeout_secs,
+            turn_detection_threshold = config.turn_detection_threshold,
+            silence_duration_ms = config.silence_duration_ms,
             "OpenAI realtime transcription client initialized"
         );
         Self { config }
@@ -661,8 +671,11 @@ fn build_session_update_payload(
         "type": "transcription_session.update",
         "session": {
             "input_audio_format": "pcm16",
-            // Disable server VAD so explicit commit controls when transcription occurs.
-            "turn_detection": null,
+            "turn_detection": {
+                "type": "server_vad",
+                "threshold": config.turn_detection_threshold,
+                "silence_duration_ms": config.silence_duration_ms,
+            },
             "input_audio_transcription": transcription_config,
         }
     })
@@ -847,7 +860,18 @@ mod tests {
             payload["session"]["input_audio_format"],
             Value::String("pcm16".to_string())
         );
-        assert_eq!(payload["session"]["turn_detection"], Value::Null);
+        assert_eq!(
+            payload["session"]["turn_detection"]["type"],
+            Value::String("server_vad".to_string())
+        );
+        assert_eq!(
+            payload["session"]["turn_detection"]["threshold"],
+            Value::from(config.turn_detection_threshold as f64)
+        );
+        assert_eq!(
+            payload["session"]["turn_detection"]["silence_duration_ms"],
+            Value::from(config.silence_duration_ms)
+        );
     }
 
     #[test]
@@ -1011,7 +1035,18 @@ mod tests {
                 first_payload["session"]["input_audio_transcription"]["model"],
                 Value::String(DEFAULT_OPENAI_TRANSCRIPTION_MODEL.to_string())
             );
-            assert_eq!(first_payload["session"]["turn_detection"], Value::Null);
+            assert_eq!(
+                first_payload["session"]["turn_detection"]["type"],
+                Value::String("server_vad".to_string())
+            );
+            assert_eq!(
+                first_payload["session"]["turn_detection"]["threshold"],
+                Value::from(DEFAULT_TURN_THRESHOLD as f64)
+            );
+            assert_eq!(
+                first_payload["session"]["turn_detection"]["silence_duration_ms"],
+                Value::from(DEFAULT_SILENCE_DURATION_MS)
+            );
 
             let append = read
                 .next()
