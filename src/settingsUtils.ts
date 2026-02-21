@@ -5,7 +5,7 @@ export type RecordingMode = "hold_to_talk" | "toggle" | "double_tap_toggle";
 
 type ShortcutCaptureEvent = Pick<
   KeyboardEvent,
-  "key" | "code" | "ctrlKey" | "altKey" | "shiftKey" | "metaKey"
+  "key" | "code" | "ctrlKey" | "altKey" | "shiftKey" | "metaKey" | "location" | "getModifierState"
 >;
 
 type SettingsUpdateInput = {
@@ -67,6 +67,8 @@ const MODIFIER_CODES = new Set([
   "MetaLeft",
   "MetaRight",
   "Fn",
+  "FnLeft",
+  "FnRight",
 ]);
 
 const MODIFIER_KEYS = new Set([
@@ -75,8 +77,21 @@ const MODIFIER_KEYS = new Set([
   "Alt",
   "Meta",
   "OS",
+  "LShift",
+  "RShift",
+  "LCtrl",
+  "RCtrl",
+  "LAlt",
+  "RAlt",
+  "LMeta",
+  "RMeta",
+  "Cmd",
   "Fn",
 ]);
+
+const DOM_KEY_LOCATION_STANDARD = globalThis.KeyboardEvent?.DOM_KEY_LOCATION_STANDARD ?? 0;
+const DOM_KEY_LOCATION_LEFT = globalThis.KeyboardEvent?.DOM_KEY_LOCATION_LEFT ?? 1;
+const DOM_KEY_LOCATION_RIGHT = globalThis.KeyboardEvent?.DOM_KEY_LOCATION_RIGHT ?? 2;
 
 const CODE_ALIASES: Record<string, string> = {
   Space: "Space",
@@ -165,14 +180,51 @@ export function shortcutFromKeyboardEvent(event: ShortcutCaptureEvent): string |
   const key = resolveShortcutKey(event);
   if (!key) return null;
 
+  const location = event.location ?? DOM_KEY_LOCATION_STANDARD;
   const modifiers: string[] = [];
-  if (event.ctrlKey) modifiers.push("Ctrl");
-  if (event.altKey) modifiers.push("Alt");
-  if (event.shiftKey) modifiers.push("Shift");
-  if (event.metaKey) modifiers.push("Cmd");
+  if (event.ctrlKey) modifiers.push(locationAwareModifier("Ctrl", location));
+  if (event.altKey) modifiers.push(locationAwareModifier("Alt", location));
+  if (event.shiftKey) modifiers.push(locationAwareModifier("Shift", location));
+  if (event.metaKey) modifiers.push(locationAwareMetaModifier(location));
+  if (isFnModifierPressed(event)) modifiers.push("Fn");
   modifiers.push(key);
 
   return modifiers.join("+");
+}
+
+function locationAwareModifier(
+  modifier: "Ctrl" | "Alt" | "Shift",
+  location: number,
+): string {
+  if (location === DOM_KEY_LOCATION_LEFT) {
+    return `L${modifier}`;
+  }
+
+  if (location === DOM_KEY_LOCATION_RIGHT) {
+    return `R${modifier}`;
+  }
+
+  return modifier;
+}
+
+function locationAwareMetaModifier(location: number): string {
+  if (location === DOM_KEY_LOCATION_LEFT) {
+    return "LMeta";
+  }
+
+  if (location === DOM_KEY_LOCATION_RIGHT) {
+    return "RMeta";
+  }
+
+  return "Cmd";
+}
+
+function isFnModifierPressed(event: ShortcutCaptureEvent): boolean {
+  if (typeof event.getModifierState !== "function") {
+    return false;
+  }
+
+  return event.getModifierState("Fn");
 }
 
 export function maskApiKey(key: string): string {

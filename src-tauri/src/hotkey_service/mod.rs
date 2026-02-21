@@ -12,6 +12,9 @@ use tauri::{AppHandle, Emitter, Runtime, State};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 use tracing::{debug, error, info, warn};
 
+pub mod extended_shortcut;
+use extended_shortcut::ExtendedShortcut;
+
 pub const DEFAULT_SHORTCUT: &str = "Alt+Space";
 pub const EVENT_HOTKEY_CONFIG_CHANGED: &str = "voice://hotkey-config-changed";
 pub const EVENT_RECORDING_STATE_CHANGED: &str = "voice://recording-state-changed";
@@ -405,6 +408,7 @@ where
         "normalized hotkey configuration"
     );
     validate_shortcut(&next_config.shortcut)?;
+    let next_registration_shortcut = global_registration_shortcut(&next_config.shortcut)?;
 
     let current_shortcut = {
         let state = state.lock().map_err(|_| lock_error())?;
@@ -413,7 +417,7 @@ where
 
     if current_shortcut
         .as_deref()
-        .is_some_and(|registered| shortcuts_match(registered, next_config.shortcut.as_str()))
+        .is_some_and(|registered| shortcuts_match(registered, next_registration_shortcut.as_str()))
     {
         debug!(
             shortcut = %next_config.shortcut,
@@ -436,7 +440,7 @@ where
         })?;
     }
 
-    if let Err(error) = register_shortcut(next_config.shortcut.as_str()) {
+    if let Err(error) = register_shortcut(next_registration_shortcut.as_str()) {
         warn!(
             shortcut = %next_config.shortcut,
             %error,
@@ -471,7 +475,7 @@ where
     {
         let mut state = state.lock().map_err(|_| lock_error())?;
         state.config = next_config.clone();
-        state.registered_shortcut = Some(next_config.shortcut.clone());
+        state.registered_shortcut = Some(next_registration_shortcut.clone());
         state.is_recording = false;
         state.desired_recording = false;
         state.pending_transitions.clear();
@@ -519,8 +523,19 @@ fn normalize_config(mut config: HotkeyConfig) -> HotkeyConfig {
 
 fn validate_shortcut(shortcut: &str) -> Result<(), String> {
     shortcut
-        .parse::<Shortcut>()
+        .parse::<ExtendedShortcut>()
         .map(|_| ())
+        .map_err(|error| format!("Invalid hotkey `{shortcut}`: {error}"))
+}
+
+fn global_registration_shortcut(shortcut: &str) -> Result<String, String> {
+    if shortcut.parse::<Shortcut>().is_ok() {
+        return Ok(shortcut.to_string());
+    }
+
+    shortcut
+        .parse::<ExtendedShortcut>()
+        .map(|extended_shortcut| extended_shortcut.to_global_shortcut_string())
         .map_err(|error| format!("Invalid hotkey `{shortcut}`: {error}"))
 }
 
@@ -750,7 +765,26 @@ mod tests {
     #[test]
     fn validate_shortcut_accepts_expected_format_and_rejects_invalid_values() {
         assert!(validate_shortcut(DEFAULT_SHORTCUT).is_ok());
+        assert!(validate_shortcut("RAlt+Space").is_ok());
+        assert!(validate_shortcut("Fn+F5").is_ok());
         assert!(validate_shortcut("not-a-shortcut").is_err());
+    }
+
+    #[test]
+    fn global_registration_shortcut_falls_back_to_lossy_extended_conversion() {
+        assert_eq!(
+            global_registration_shortcut("Ctrl+Shift+S"),
+            Ok("Ctrl+Shift+S".to_string())
+        );
+        assert_eq!(
+            global_registration_shortcut("RAlt+Space"),
+            Ok("Alt+Space".to_string())
+        );
+        assert_eq!(global_registration_shortcut("Fn+F5"), Ok("F5".to_string()));
+        assert_eq!(
+            global_registration_shortcut("Meta+Space"),
+            Ok("Cmd+Space".to_string())
+        );
     }
 
     #[test]
@@ -1035,6 +1069,38 @@ mod tests {
         assert!(!state.is_recording);
         assert!(!state.desired_recording);
         assert!(state.pending_transitions.is_empty());
+    }
+
+    #[test]
+    fn apply_config_registers_lossy_shortcut_for_extended_modifiers() {
+        let state = Arc::new(Mutex::new(HotkeyRuntimeState::default()));
+        let mut register_attempts = Vec::new();
+
+        let applied = apply_config_with_registrar(
+            &state,
+            HotkeyConfig {
+                shortcut: "RAlt+Space".to_string(),
+                mode: RecordingMode::HoldToTalk,
+            },
+            |_shortcut| Ok(()),
+            |shortcut| {
+                register_attempts.push(shortcut.to_string());
+                Ok(())
+            },
+            |_config| {},
+        )
+        .expect("registration should succeed");
+
+        assert_eq!(applied.shortcut, "RAlt+Space");
+        assert_eq!(register_attempts, vec!["Alt+Space".to_string()]);
+        assert_eq!(
+            state
+                .lock()
+                .expect("hotkey state lock should not be poisoned")
+                .registered_shortcut
+                .as_deref(),
+            Some("Alt+Space")
+        );
     }
 
     #[test]

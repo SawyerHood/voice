@@ -18,6 +18,8 @@ function keyboardEvent(input: Partial<KeyboardEvent>): KeyboardEvent {
     altKey: false,
     shiftKey: false,
     metaKey: false,
+    location: 0,
+    getModifierState: () => false,
     ...input,
   } as KeyboardEvent;
 }
@@ -78,16 +80,17 @@ describe("settingsUtils", () => {
     ).toBe("Ctrl+Shift+S");
   });
 
-  it("captures right alt as the Alt modifier", () => {
+  it("captures right alt as RAlt when the event location is right", () => {
     expect(
       shortcutFromKeyboardEvent(
         keyboardEvent({
           key: " ",
           code: "Space",
           altKey: true,
+          location: 2,
         }),
       ),
-    ).toBe("Alt+Space");
+    ).toBe("RAlt+Space");
   });
 
   it("captures command shortcuts with Cmd token", () => {
@@ -100,6 +103,32 @@ describe("settingsUtils", () => {
         }),
       ),
     ).toBe("Cmd+Space");
+  });
+
+  it("captures left-side control and shift modifiers from event location", () => {
+    expect(
+      shortcutFromKeyboardEvent(
+        keyboardEvent({
+          key: "s",
+          code: "KeyS",
+          ctrlKey: true,
+          shiftKey: true,
+          location: 1,
+        }),
+      ),
+    ).toBe("LCtrl+LShift+S");
+  });
+
+  it("captures fn as a modifier when reported by getModifierState", () => {
+    expect(
+      shortcutFromKeyboardEvent(
+        keyboardEvent({
+          key: "F5",
+          code: "F5",
+          getModifierState: (modifier) => modifier === "Fn",
+        }),
+      ),
+    ).toBe("Fn+F5");
   });
 
   it("ignores pure modifier presses while recording shortcuts", () => {
