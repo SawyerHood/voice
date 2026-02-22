@@ -116,7 +116,7 @@ pub struct PressedModifiers {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtendedShortcut {
     modifiers: BTreeSet<ExtendedModifier>,
-    key: Code,
+    key: Option<Code>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,7 +132,7 @@ impl fmt::Display for ExtendedShortcutParseError {
         match self {
             Self::EmptyShortcut => f.write_str("Shortcut cannot be empty"),
             Self::EmptyToken => f.write_str("Shortcut contains an empty token"),
-            Self::MissingKey => f.write_str("Shortcut must include a non-modifier key"),
+            Self::MissingKey => f.write_str("Shortcut must include at least one modifier or key"),
             Self::InvalidKeyToken(token) => {
                 write!(f, "Unsupported key token `{token}`")
             }
@@ -147,8 +147,12 @@ impl ExtendedShortcut {
         shortcut.parse()
     }
 
-    pub fn key(&self) -> Code {
+    pub fn key(&self) -> Option<Code> {
         self.key
+    }
+
+    pub fn is_modifier_only(&self) -> bool {
+        self.key.is_none() && !self.modifiers.is_empty()
     }
 
     pub fn modifiers(&self) -> impl Iterator<Item = ExtendedModifier> + '_ {
@@ -173,9 +177,23 @@ impl ExtendedShortcut {
         self.modifiers.contains(&ExtendedModifier::Fn)
     }
 
+    pub fn requires_event_tap_backend(&self) -> bool {
+        self.is_modifier_only() || self.has_side_specific_modifiers() || self.has_fn_modifier()
+    }
+
     pub fn matches(&self, pressed_modifiers: &PressedModifiers, pressed_key: Code) -> bool {
-        if self.key != pressed_key {
-            return false;
+        self.matches_with_optional_key(pressed_modifiers, Some(pressed_key))
+    }
+
+    pub fn matches_with_optional_key(
+        &self,
+        pressed_modifiers: &PressedModifiers,
+        pressed_key: Option<Code>,
+    ) -> bool {
+        if let Some(expected_key) = self.key {
+            if Some(expected_key) != pressed_key {
+                return false;
+            }
         }
 
         if !matches_family(
@@ -229,7 +247,8 @@ impl ExtendedShortcut {
         self.has_fn_modifier() == pressed_modifiers.fn_key
     }
 
-    pub fn to_global_shortcut(&self) -> Shortcut {
+    pub fn to_global_shortcut(&self) -> Option<Shortcut> {
+        let key = self.key?;
         let mut modifiers = Modifiers::empty();
         if self.has_any_ctrl() {
             modifiers |= Modifiers::CONTROL;
@@ -244,10 +263,11 @@ impl ExtendedShortcut {
             modifiers |= Modifiers::SUPER;
         }
 
-        Shortcut::new(Some(modifiers), self.key)
+        Some(Shortcut::new(Some(modifiers), key))
     }
 
-    pub fn to_global_shortcut_string(&self) -> String {
+    pub fn to_global_shortcut_string(&self) -> Option<String> {
+        let key = self.key?;
         let mut tokens = Vec::new();
         if self.has_any_ctrl() {
             tokens.push("Ctrl".to_string());
@@ -262,8 +282,8 @@ impl ExtendedShortcut {
             tokens.push("Cmd".to_string());
         }
 
-        tokens.push(format_key_token(self.key));
-        tokens.join("+")
+        tokens.push(format_key_token(key));
+        Some(tokens.join("+"))
     }
 
     fn has_any_alt(&self) -> bool {
@@ -321,7 +341,11 @@ impl fmt::Display for ExtendedShortcut {
             .map(ExtendedModifier::as_token)
             .map(ToString::to_string)
             .collect::<Vec<_>>();
-        tokens.push(format_key_token(self.key));
+
+        if let Some(key) = self.key {
+            tokens.push(format_key_token(key));
+        }
+
         f.write_str(&tokens.join("+"))
     }
 }
@@ -352,7 +376,9 @@ impl FromStr for ExtendedShortcut {
         }
 
         normalize_modifiers(&mut modifiers);
-        let key = key.ok_or(ExtendedShortcutParseError::MissingKey)?;
+        if key.is_none() && modifiers.is_empty() {
+            return Err(ExtendedShortcutParseError::MissingKey);
+        }
 
         Ok(Self { modifiers, key })
     }
@@ -472,7 +498,10 @@ mod tests {
         let shortcut: ExtendedShortcut = "Alt+Space".parse().expect("shortcut should parse");
 
         assert_eq!(shortcut.to_string(), "Alt+Space");
-        assert_eq!(shortcut.to_global_shortcut_string(), "Alt+Space");
+        assert_eq!(
+            shortcut.to_global_shortcut_string(),
+            Some("Alt+Space".to_string())
+        );
         assert!(shortcut.matches(
             &PressedModifiers {
                 l_alt: true,
@@ -533,10 +562,18 @@ mod tests {
     }
 
     #[test]
-    fn parser_rejects_modifier_only_shortcuts() {
+    fn parser_accepts_modifier_only_shortcuts() {
+        let shortcut: ExtendedShortcut = "Fn".parse().expect("shortcut should parse");
+        assert!(shortcut.is_modifier_only());
+        assert_eq!(shortcut.to_string(), "Fn");
+        assert_eq!(shortcut.to_global_shortcut_string(), None);
+    }
+
+    #[test]
+    fn parser_rejects_empty_shortcuts() {
         assert_eq!(
-            "Alt+Shift".parse::<ExtendedShortcut>(),
-            Err(ExtendedShortcutParseError::MissingKey)
+            "   ".parse::<ExtendedShortcut>(),
+            Err(ExtendedShortcutParseError::EmptyShortcut)
         );
     }
 
@@ -544,9 +581,14 @@ mod tests {
     fn conversion_to_global_shortcut_drops_side_information_and_fn() {
         let shortcut: ExtendedShortcut = "Fn+RAlt+Space".parse().expect("shortcut should parse");
 
-        assert_eq!(shortcut.to_global_shortcut_string(), "Alt+Space");
+        assert_eq!(
+            shortcut.to_global_shortcut_string(),
+            Some("Alt+Space".to_string())
+        );
 
-        let global_shortcut = shortcut.to_global_shortcut();
+        let global_shortcut = shortcut
+            .to_global_shortcut()
+            .expect("shortcut should include a key for global conversion");
         assert!(global_shortcut.matches(tauri_plugin_global_shortcut::Modifiers::ALT, Code::Space));
     }
 

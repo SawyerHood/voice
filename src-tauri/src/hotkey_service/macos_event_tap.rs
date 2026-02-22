@@ -924,6 +924,34 @@ mod tests {
     }
 
     #[test]
+    fn flags_changed_supports_fn_modifier_only_shortcut() {
+        let parsed = ParsedShortcut::parse("Fn").expect("shortcut should parse");
+        let callback: HotkeyCallback = Arc::new(|_| {});
+        let mut registered = RegisteredHotkey {
+            shortcut: parsed,
+            callback,
+            pressed: false,
+        };
+
+        let pressed = KeyEventSnapshot {
+            event_type: CGEventType::FlagsChanged,
+            key_code: KEY_CODE_FN,
+            modifiers: ModifierState::from_raw_flags(kCGEventFlagMaskSecondaryFn),
+            autorepeat: false,
+        };
+        assert_eq!(registered.evaluate(&pressed), Some(ShortcutState::Pressed));
+
+        let released = KeyEventSnapshot {
+            modifiers: ModifierState::from_raw_flags(0),
+            ..pressed
+        };
+        assert_eq!(
+            registered.evaluate(&released),
+            Some(ShortcutState::Released)
+        );
+    }
+
+    #[test]
     #[ignore = "requires macOS Accessibility permission and manual keyboard interaction"]
     fn integration_smoke_start_and_stop_event_tap_backend() {
         if !MacOSEventTapHotkey::has_accessibility_permission() {

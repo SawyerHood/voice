@@ -14,6 +14,8 @@ use tracing::{debug, error, info, warn};
 
 pub mod extended_shortcut;
 use extended_shortcut::ExtendedShortcut;
+#[cfg(target_os = "macos")]
+use macos_event_tap::{HotkeyBackend, HotkeyCallback, MacOSEventTapHotkey};
 
 pub const DEFAULT_SHORTCUT: &str = "Alt+Space";
 pub const EVENT_HOTKEY_CONFIG_CHANGED: &str = "voice://hotkey-config-changed";
@@ -21,6 +23,29 @@ pub const EVENT_RECORDING_STATE_CHANGED: &str = "voice://recording-state-changed
 pub const EVENT_RECORDING_STARTED: &str = "voice://recording-started";
 pub const EVENT_RECORDING_STOPPED: &str = "voice://recording-stopped";
 const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(400);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegistrationBackend {
+    GlobalShortcut,
+    #[cfg(target_os = "macos")]
+    EventTap,
+}
+
+impl RegistrationBackend {
+    fn label(self) -> &'static str {
+        match self {
+            Self::GlobalShortcut => "global",
+            #[cfg(target_os = "macos")]
+            Self::EventTap => "event tap",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegistrationTarget {
+    backend: RegistrationBackend,
+    shortcut: String,
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -97,6 +122,7 @@ pub struct RecordingStateChangedEvent {
 struct HotkeyRuntimeState {
     config: HotkeyConfig,
     registered_shortcut: Option<String>,
+    registered_backend: RegistrationBackend,
     is_recording: bool,
     desired_recording: bool,
     pending_transitions: VecDeque<RecordingTransition>,
@@ -108,6 +134,7 @@ impl Default for HotkeyRuntimeState {
         Self {
             config: HotkeyConfig::default(),
             registered_shortcut: None,
+            registered_backend: RegistrationBackend::GlobalShortcut,
             is_recording: false,
             desired_recording: false,
             pending_transitions: VecDeque::new(),
@@ -168,6 +195,7 @@ impl HotkeyRuntimeState {
 
     fn clear_registered_shortcut(&mut self) {
         self.registered_shortcut = None;
+        self.registered_backend = RegistrationBackend::GlobalShortcut;
         self.is_recording = false;
         self.desired_recording = false;
         self.pending_transitions.clear();
@@ -201,9 +229,11 @@ impl HotkeyRuntimeState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HotkeyService {
     state: Arc<Mutex<HotkeyRuntimeState>>,
+    #[cfg(target_os = "macos")]
+    event_tap_backend: Arc<MacOSEventTapHotkey>,
 }
 
 impl Default for HotkeyService {
@@ -217,10 +247,17 @@ impl HotkeyService {
         debug!("hotkey service initialized");
         Self {
             state: Arc::new(Mutex::new(HotkeyRuntimeState::default())),
+            #[cfg(target_os = "macos")]
+            event_tap_backend: Arc::new(MacOSEventTapHotkey::new(
+                macos_event_tap::EventTapMode::Passive,
+            )),
         }
     }
 
-    pub fn register_default_shortcut<R: Runtime>(&self, app: &AppHandle<R>) -> Result<(), String> {
+    pub fn register_default_shortcut<R: Runtime + 'static>(
+        &self,
+        app: &AppHandle<R>,
+    ) -> Result<(), String> {
         info!(
             shortcut = DEFAULT_SHORTCUT,
             "registering default hotkey shortcut"
@@ -301,7 +338,7 @@ impl HotkeyService {
         true
     }
 
-    pub fn apply_config<R: Runtime>(
+    pub fn apply_config<R: Runtime + 'static>(
         &self,
         app: &AppHandle<R>,
         config: HotkeyConfig,
@@ -312,21 +349,41 @@ impl HotkeyService {
             "applying hotkey configuration"
         );
         let service = self.clone();
+        #[cfg(target_os = "macos")]
+        let event_tap_backend = Arc::clone(&self.event_tap_backend);
         apply_config_with_registrar(
             &self.state,
             config,
-            |shortcut| {
-                app.global_shortcut()
-                    .unregister(shortcut)
-                    .map_err(|error| error.to_string())
+            |target| match target.backend {
+                RegistrationBackend::GlobalShortcut => app
+                    .global_shortcut()
+                    .unregister(target.shortcut.as_str())
+                    .map_err(|error| error.to_string()),
+                #[cfg(target_os = "macos")]
+                RegistrationBackend::EventTap => {
+                    event_tap_backend.unregister_hotkey(target.shortcut.as_str())?;
+                    event_tap_backend.stop()
+                }
             },
-            |shortcut| {
-                let callback_service = service.clone();
-                app.global_shortcut()
-                    .on_shortcut(shortcut, move |app, _shortcut, event| {
-                        callback_service.handle_shortcut_event(app, event.state);
-                    })
-                    .map_err(|error| error.to_string())
+            |target| match target.backend {
+                RegistrationBackend::GlobalShortcut => {
+                    let callback_service = service.clone();
+                    app.global_shortcut()
+                        .on_shortcut(target.shortcut.as_str(), move |app, _shortcut, event| {
+                            callback_service.handle_shortcut_event(app, event.state);
+                        })
+                        .map_err(|error| error.to_string())
+                }
+                #[cfg(target_os = "macos")]
+                RegistrationBackend::EventTap => {
+                    event_tap_backend.start()?;
+                    let callback_service = service.clone();
+                    let callback_app = app.clone();
+                    let callback: HotkeyCallback = Arc::new(move |shortcut_state| {
+                        callback_service.handle_shortcut_event(&callback_app, shortcut_state);
+                    });
+                    event_tap_backend.register_hotkey(target.shortcut.as_str(), callback)
+                }
             },
             |config| emit_hotkey_config_changed(app, config),
         )
@@ -397,8 +454,8 @@ fn apply_config_with_registrar<FU, FR, FE>(
     mut emit_config_changed: FE,
 ) -> Result<HotkeyConfig, String>
 where
-    FU: FnMut(&str) -> Result<(), String>,
-    FR: FnMut(&str) -> Result<(), String>,
+    FU: FnMut(&RegistrationTarget) -> Result<(), String>,
+    FR: FnMut(&RegistrationTarget) -> Result<(), String>,
     FE: FnMut(&HotkeyConfig),
 {
     let next_config = normalize_config(config);
@@ -407,20 +464,26 @@ where
         mode = ?next_config.mode,
         "normalized hotkey configuration"
     );
-    validate_shortcut(&next_config.shortcut)?;
-    let next_registration_shortcut = global_registration_shortcut(&next_config.shortcut)?;
+    let next_registration_target = registration_target_for_shortcut(&next_config.shortcut)?;
 
-    let current_shortcut = {
+    let current_registration = {
         let state = state.lock().map_err(|_| lock_error())?;
-        state.registered_shortcut.clone()
+        state
+            .registered_shortcut
+            .as_ref()
+            .map(|shortcut| RegistrationTarget {
+                backend: state.registered_backend,
+                shortcut: shortcut.clone(),
+            })
     };
 
-    if current_shortcut
-        .as_deref()
-        .is_some_and(|registered| shortcuts_match(registered, next_registration_shortcut.as_str()))
+    if current_registration
+        .as_ref()
+        .is_some_and(|registered| registration_targets_match(registered, &next_registration_target))
     {
         debug!(
             shortcut = %next_config.shortcut,
+            backend = next_registration_target.backend.label(),
             "hotkey already registered; updating mode only"
         );
         let mut state = state.lock().map_err(|_| lock_error())?;
@@ -431,32 +494,41 @@ where
         return Ok(next_config);
     }
 
-    let previous_shortcut = current_shortcut.clone();
+    let previous_registration = current_registration.clone();
 
-    if let Some(registered_shortcut) = current_shortcut {
-        debug!(shortcut = %registered_shortcut, "unregistering previous hotkey shortcut");
-        unregister_shortcut(registered_shortcut.as_str()).map_err(|error| {
-            format!("Failed to unregister hotkey `{registered_shortcut}`: {error}")
+    if let Some(registered_target) = current_registration.as_ref() {
+        debug!(
+            shortcut = %registered_target.shortcut,
+            backend = registered_target.backend.label(),
+            "unregistering previous hotkey shortcut"
+        );
+        unregister_shortcut(registered_target).map_err(|error| {
+            format!(
+                "Failed to unregister {} hotkey `{}`: {error}",
+                registered_target.backend.label(),
+                registered_target.shortcut
+            )
         })?;
     }
 
-    if let Err(error) = register_shortcut(next_registration_shortcut.as_str()) {
+    if let Err(error) = register_shortcut(&next_registration_target) {
         warn!(
             shortcut = %next_config.shortcut,
+            backend = next_registration_target.backend.label(),
             %error,
             "failed to register new hotkey shortcut; attempting rollback"
         );
         let register_error = error;
         let mut restore_error: Option<String> = None;
 
-        if let Some(previous_shortcut) = previous_shortcut.as_deref() {
-            if let Err(error) = register_shortcut(previous_shortcut) {
+        if let Some(previous_target) = previous_registration.as_ref() {
+            if let Err(error) = register_shortcut(previous_target) {
                 restore_error = Some(error);
             }
         }
 
         if should_clear_registered_shortcut_after_failed_registration(
-            previous_shortcut.as_deref(),
+            previous_registration.as_ref(),
             restore_error.as_deref(),
         ) {
             if let Ok(mut state) = state.lock() {
@@ -465,9 +537,9 @@ where
         }
 
         return Err(format_registration_failure(
-            next_config.shortcut.as_str(),
+            &next_registration_target,
             register_error.as_str(),
-            previous_shortcut.as_deref(),
+            previous_registration.as_ref(),
             restore_error.as_deref(),
         ));
     }
@@ -475,7 +547,8 @@ where
     {
         let mut state = state.lock().map_err(|_| lock_error())?;
         state.config = next_config.clone();
-        state.registered_shortcut = Some(next_registration_shortcut.clone());
+        state.registered_shortcut = Some(next_registration_target.shortcut.clone());
+        state.registered_backend = next_registration_target.backend;
         state.is_recording = false;
         state.desired_recording = false;
         state.pending_transitions.clear();
@@ -528,6 +601,56 @@ fn validate_shortcut(shortcut: &str) -> Result<(), String> {
         .map_err(|error| format!("Invalid hotkey `{shortcut}`: {error}"))
 }
 
+fn registration_target_for_shortcut(shortcut: &str) -> Result<RegistrationTarget, String> {
+    validate_shortcut(shortcut)?;
+
+    let parsed = shortcut
+        .parse::<ExtendedShortcut>()
+        .map_err(|error| format!("Invalid hotkey `{shortcut}`: {error}"))?;
+
+    if parsed.requires_event_tap_backend() {
+        #[cfg(target_os = "macos")]
+        {
+            return Ok(RegistrationTarget {
+                backend: RegistrationBackend::EventTap,
+                shortcut: parsed.to_string(),
+            });
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            if parsed.is_modifier_only() {
+                return Err(format!(
+                    "Invalid hotkey `{shortcut}`: modifier-only shortcuts cannot be registered globally"
+                ));
+            }
+
+            let fallback_shortcut = parsed.to_global_shortcut_string().ok_or_else(|| {
+                format!("Invalid hotkey `{shortcut}`: missing non-modifier key for global shortcut")
+            })?;
+
+            return Ok(RegistrationTarget {
+                backend: RegistrationBackend::GlobalShortcut,
+                shortcut: fallback_shortcut,
+            });
+        }
+    }
+
+    let registration_shortcut = if shortcut.parse::<Shortcut>().is_ok() {
+        shortcut.to_string()
+    } else {
+        parsed.to_global_shortcut_string().ok_or_else(|| {
+            format!("Invalid hotkey `{shortcut}`: missing non-modifier key for global shortcut")
+        })?
+    };
+
+    Ok(RegistrationTarget {
+        backend: RegistrationBackend::GlobalShortcut,
+        shortcut: registration_shortcut,
+    })
+}
+
+#[cfg(test)]
 fn global_registration_shortcut(shortcut: &str) -> Result<String, String> {
     if shortcut.parse::<Shortcut>().is_ok() {
         return Ok(shortcut.to_string());
@@ -535,8 +658,22 @@ fn global_registration_shortcut(shortcut: &str) -> Result<String, String> {
 
     shortcut
         .parse::<ExtendedShortcut>()
-        .map(|extended_shortcut| extended_shortcut.to_global_shortcut_string())
         .map_err(|error| format!("Invalid hotkey `{shortcut}`: {error}"))
+        .and_then(|extended_shortcut| {
+            extended_shortcut.to_global_shortcut_string().ok_or_else(|| {
+                format!(
+                    "Invalid hotkey `{shortcut}`: modifier-only shortcuts cannot be registered globally"
+                )
+            })
+        })
+}
+
+fn registration_targets_match(left: &RegistrationTarget, right: &RegistrationTarget) -> bool {
+    if left.backend != right.backend {
+        return false;
+    }
+
+    shortcuts_match(left.shortcut.as_str(), right.shortcut.as_str())
 }
 
 fn shortcuts_match(left: &str, right: &str) -> bool {
@@ -611,27 +748,37 @@ fn resolve_double_tap_transition(
 }
 
 fn should_clear_registered_shortcut_after_failed_registration(
-    previous_shortcut: Option<&str>,
+    previous_registration: Option<&RegistrationTarget>,
     restore_error: Option<&str>,
 ) -> bool {
-    previous_shortcut.is_none() || restore_error.is_some()
+    previous_registration.is_none() || restore_error.is_some()
 }
 
 fn format_registration_failure(
-    attempted_shortcut: &str,
+    attempted: &RegistrationTarget,
     register_error: &str,
-    previous_shortcut: Option<&str>,
+    previous_registration: Option<&RegistrationTarget>,
     restore_error: Option<&str>,
 ) -> String {
-    match (previous_shortcut, restore_error) {
-        (Some(previous_shortcut), Some(restore_error)) => format!(
-            "Failed to register global hotkey `{attempted_shortcut}`: {register_error}. Failed to restore previous hotkey `{previous_shortcut}`: {restore_error}. No global hotkey is currently registered."
+    match (previous_registration, restore_error) {
+        (Some(previous_target), Some(restore_error)) => format!(
+            "Failed to register {} hotkey `{}`: {register_error}. Failed to restore previous {} hotkey `{}`: {restore_error}. No hotkey is currently registered.",
+            attempted.backend.label(),
+            attempted.shortcut,
+            previous_target.backend.label(),
+            previous_target.shortcut,
         ),
-        (Some(previous_shortcut), None) => format!(
-            "Failed to register global hotkey `{attempted_shortcut}`: {register_error}. Previous hotkey `{previous_shortcut}` remains registered."
+        (Some(previous_target), None) => format!(
+            "Failed to register {} hotkey `{}`: {register_error}. Previous {} hotkey `{}` remains registered.",
+            attempted.backend.label(),
+            attempted.shortcut,
+            previous_target.backend.label(),
+            previous_target.shortcut,
         ),
         (None, _) => format!(
-            "Failed to register global hotkey `{attempted_shortcut}`: {register_error}"
+            "Failed to register {} hotkey `{}`: {register_error}",
+            attempted.backend.label(),
+            attempted.shortcut,
         ),
     }
 }
@@ -767,6 +914,7 @@ mod tests {
         assert!(validate_shortcut(DEFAULT_SHORTCUT).is_ok());
         assert!(validate_shortcut("RAlt+Space").is_ok());
         assert!(validate_shortcut("Fn+F5").is_ok());
+        assert!(validate_shortcut("Fn").is_ok());
         assert!(validate_shortcut("not-a-shortcut").is_err());
     }
 
@@ -785,6 +933,65 @@ mod tests {
             global_registration_shortcut("Meta+Space"),
             Ok("Cmd+Space".to_string())
         );
+        assert!(global_registration_shortcut("Fn").is_err());
+    }
+
+    #[test]
+    fn registration_target_uses_global_backend_for_plain_shortcuts() {
+        assert_eq!(
+            registration_target_for_shortcut("Ctrl+Space"),
+            Ok(RegistrationTarget {
+                backend: RegistrationBackend::GlobalShortcut,
+                shortcut: "Ctrl+Space".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn registration_target_routes_extended_shortcuts_to_event_tap_on_macos() {
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(
+                registration_target_for_shortcut("RAlt+Space"),
+                Ok(RegistrationTarget {
+                    backend: RegistrationBackend::EventTap,
+                    shortcut: "RAlt+Space".to_string(),
+                })
+            );
+            assert_eq!(
+                registration_target_for_shortcut("Fn+Space"),
+                Ok(RegistrationTarget {
+                    backend: RegistrationBackend::EventTap,
+                    shortcut: "Fn+Space".to_string(),
+                })
+            );
+            assert_eq!(
+                registration_target_for_shortcut("Fn"),
+                Ok(RegistrationTarget {
+                    backend: RegistrationBackend::EventTap,
+                    shortcut: "Fn".to_string(),
+                })
+            );
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(
+                registration_target_for_shortcut("RAlt+Space"),
+                Ok(RegistrationTarget {
+                    backend: RegistrationBackend::GlobalShortcut,
+                    shortcut: "Alt+Space".to_string(),
+                })
+            );
+            assert_eq!(
+                registration_target_for_shortcut("Fn+Space"),
+                Ok(RegistrationTarget {
+                    backend: RegistrationBackend::GlobalShortcut,
+                    shortcut: "Space".to_string(),
+                })
+            );
+            assert!(registration_target_for_shortcut("Fn").is_err());
+        }
     }
 
     #[test]
@@ -1026,6 +1233,7 @@ mod tests {
         let state = Arc::new(Mutex::new(HotkeyRuntimeState {
             config: HotkeyConfig::default(),
             registered_shortcut: Some(DEFAULT_SHORTCUT.to_string()),
+            registered_backend: RegistrationBackend::GlobalShortcut,
             is_recording: true,
             desired_recording: true,
             pending_transitions: VecDeque::from([RecordingTransition::Started]),
@@ -1041,12 +1249,12 @@ mod tests {
                 shortcut: "Ctrl+Space".to_string(),
                 mode: RecordingMode::Toggle,
             },
-            |shortcut| {
-                unregister_attempts.push(shortcut.to_string());
+            |target| {
+                unregister_attempts.push(target.shortcut.to_string());
                 Ok(())
             },
-            |shortcut| {
-                register_attempts.push(shortcut.to_string());
+            |target| {
+                register_attempts.push(target.shortcut.to_string());
                 Err("registration failed".to_string())
             },
             |config| emitted_configs.push(config.clone()),
@@ -1072,9 +1280,9 @@ mod tests {
     }
 
     #[test]
-    fn apply_config_registers_lossy_shortcut_for_extended_modifiers() {
+    fn apply_config_routes_extended_shortcuts_to_expected_backend() {
         let state = Arc::new(Mutex::new(HotkeyRuntimeState::default()));
-        let mut register_attempts = Vec::new();
+        let mut register_attempts: Vec<(RegistrationBackend, String)> = Vec::new();
 
         let applied = apply_config_with_registrar(
             &state,
@@ -1082,9 +1290,9 @@ mod tests {
                 shortcut: "RAlt+Space".to_string(),
                 mode: RecordingMode::HoldToTalk,
             },
-            |_shortcut| Ok(()),
-            |shortcut| {
-                register_attempts.push(shortcut.to_string());
+            |_target| Ok(()),
+            |target| {
+                register_attempts.push((target.backend, target.shortcut.to_string()));
                 Ok(())
             },
             |_config| {},
@@ -1092,15 +1300,35 @@ mod tests {
         .expect("registration should succeed");
 
         assert_eq!(applied.shortcut, "RAlt+Space");
-        assert_eq!(register_attempts, vec!["Alt+Space".to_string()]);
-        assert_eq!(
-            state
+
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(
+                register_attempts,
+                vec![(RegistrationBackend::EventTap, "RAlt+Space".to_string())]
+            );
+            let state = state
                 .lock()
-                .expect("hotkey state lock should not be poisoned")
-                .registered_shortcut
-                .as_deref(),
-            Some("Alt+Space")
-        );
+                .expect("hotkey state lock should not be poisoned");
+            assert_eq!(state.registered_backend, RegistrationBackend::EventTap);
+            assert_eq!(state.registered_shortcut.as_deref(), Some("RAlt+Space"));
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(
+                register_attempts,
+                vec![(RegistrationBackend::GlobalShortcut, "Alt+Space".to_string())]
+            );
+            let state = state
+                .lock()
+                .expect("hotkey state lock should not be poisoned");
+            assert_eq!(
+                state.registered_backend,
+                RegistrationBackend::GlobalShortcut
+            );
+            assert_eq!(state.registered_shortcut.as_deref(), Some("Alt+Space"));
+        }
     }
 
     #[test]
@@ -1108,6 +1336,7 @@ mod tests {
         let state = Arc::new(Mutex::new(HotkeyRuntimeState {
             config: HotkeyConfig::default(),
             registered_shortcut: Some(DEFAULT_SHORTCUT.to_string()),
+            registered_backend: RegistrationBackend::GlobalShortcut,
             is_recording: true,
             desired_recording: true,
             pending_transitions: VecDeque::from([RecordingTransition::Started]),
@@ -1123,13 +1352,13 @@ mod tests {
                 shortcut: "Ctrl+Space".to_string(),
                 mode: RecordingMode::Toggle,
             },
-            |shortcut| {
-                unregister_attempts.push(shortcut.to_string());
+            |target| {
+                unregister_attempts.push(target.shortcut.to_string());
                 Ok(())
             },
-            |shortcut| {
-                register_attempts.push(shortcut.to_string());
-                if shortcut == "Ctrl+Space" {
+            |target| {
+                register_attempts.push(target.shortcut.to_string());
+                if target.shortcut == "Ctrl+Space" {
                     Err("registration failed".to_string())
                 } else {
                     Ok(())
@@ -1140,7 +1369,7 @@ mod tests {
 
         let error = result.expect_err("re-register should fail");
         assert!(error.contains("Failed to register global hotkey `Ctrl+Space`"));
-        assert!(error.contains("Previous hotkey `Alt+Space` remains registered"));
+        assert!(error.contains("Previous global hotkey `Alt+Space` remains registered"));
         assert_eq!(unregister_attempts, vec![DEFAULT_SHORTCUT.to_string()]);
         assert_eq!(
             register_attempts,
@@ -1153,6 +1382,10 @@ mod tests {
             .expect("hotkey state lock should not be poisoned");
         assert_eq!(state.config, HotkeyConfig::default());
         assert_eq!(state.registered_shortcut.as_deref(), Some(DEFAULT_SHORTCUT));
+        assert_eq!(
+            state.registered_backend,
+            RegistrationBackend::GlobalShortcut
+        );
         assert!(state.is_recording);
         assert!(state.desired_recording);
         assert_eq!(
@@ -1166,6 +1399,7 @@ mod tests {
         let mut state = HotkeyRuntimeState {
             config: HotkeyConfig::default(),
             registered_shortcut: Some("Alt+Space".to_string()),
+            registered_backend: RegistrationBackend::GlobalShortcut,
             is_recording: true,
             desired_recording: true,
             pending_transitions: VecDeque::from([RecordingTransition::Started]),
@@ -1175,6 +1409,10 @@ mod tests {
         state.clear_registered_shortcut();
 
         assert_eq!(state.registered_shortcut, None);
+        assert_eq!(
+            state.registered_backend,
+            RegistrationBackend::GlobalShortcut
+        );
         assert!(!state.is_recording);
         assert!(!state.desired_recording);
         assert!(state.pending_transitions.is_empty());
@@ -1187,11 +1425,17 @@ mod tests {
             None, None
         ));
         assert!(should_clear_registered_shortcut_after_failed_registration(
-            Some("Alt+Space"),
+            Some(&RegistrationTarget {
+                backend: RegistrationBackend::GlobalShortcut,
+                shortcut: "Alt+Space".to_string(),
+            }),
             Some("already registered")
         ));
         assert!(!should_clear_registered_shortcut_after_failed_registration(
-            Some("Alt+Space"),
+            Some(&RegistrationTarget {
+                backend: RegistrationBackend::GlobalShortcut,
+                shortcut: "Alt+Space".to_string(),
+            }),
             None
         ));
     }
@@ -1199,14 +1443,20 @@ mod tests {
     #[test]
     fn registration_failure_message_reports_restore_failure_explicitly() {
         let message = format_registration_failure(
-            "Ctrl+Shift+Space",
+            &RegistrationTarget {
+                backend: RegistrationBackend::GlobalShortcut,
+                shortcut: "Ctrl+Shift+Space".to_string(),
+            },
             "new shortcut rejected",
-            Some("Alt+Space"),
+            Some(&RegistrationTarget {
+                backend: RegistrationBackend::GlobalShortcut,
+                shortcut: "Alt+Space".to_string(),
+            }),
             Some("restore rejected"),
         );
 
         assert!(message.contains("Failed to register global hotkey `Ctrl+Shift+Space`"));
-        assert!(message.contains("Failed to restore previous hotkey `Alt+Space`"));
-        assert!(message.contains("No global hotkey is currently registered"));
+        assert!(message.contains("Failed to restore previous global hotkey `Alt+Space`"));
+        assert!(message.contains("No hotkey is currently registered"));
     }
 }
