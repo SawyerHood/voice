@@ -53,6 +53,15 @@ type SaveFeedback = {
   message: string;
 };
 
+type SettingsDraft = {
+  hotkeyShortcut: string;
+  recordingMode: RecordingMode;
+  microphoneId: string;
+  language: string;
+  autoInsert: boolean;
+  launchAtLogin: boolean;
+};
+
 type AuthMethod = "none" | "api_key" | "chatgpt_oauth";
 
 type ChatGptAuthStatus = {
@@ -117,6 +126,7 @@ export default function Settings() {
   const [isSavingSettings, setIsSavingSettings] = useState(false);
   const initialLoadDone = useRef(false);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const skipNextDebouncedSaveRef = useRef(false);
 
   const [hotkeyShortcut, setHotkeyShortcut] = useState("");
   const [recordingMode, setRecordingMode] = useState<RecordingMode>("hold_to_talk");
@@ -230,6 +240,68 @@ export default function Settings() {
     setIsRecordingShortcut((active) => !active);
   }, []);
 
+  const applySettingsUpdate = useCallback(async (draft: SettingsDraft) => {
+    setIsSavingSettings(true);
+    try {
+      const updatedSettings = await invoke<VoiceSettings>("apply_settings", {
+        update: createSettingsUpdatePayload({
+          hotkeyShortcut: normalizeShortcut(draft.hotkeyShortcut),
+          recordingMode: draft.recordingMode,
+          microphoneId: draft.microphoneId,
+          language: draft.language,
+          autoInsert: draft.autoInsert,
+          launchAtLogin: draft.launchAtLogin,
+        }),
+      });
+      setHotkeyShortcut(updatedSettings.hotkey_shortcut);
+      setRecordingMode(normalizeRecordingMode(updatedSettings.recording_mode));
+      setMicrophoneId(updatedSettings.microphone_id ?? "");
+      setLanguage(updatedSettings.language ?? "");
+      setAutoInsert(updatedSettings.auto_insert);
+      setLaunchAtLogin(updatedSettings.launch_at_login);
+      setFeedback({ kind: "success", message: "Settings saved." });
+    } catch (error) {
+      setFeedback({ kind: "error", message: toErrorMessage(error, "Unable to save settings.") });
+    } finally {
+      setIsSavingSettings(false);
+    }
+  }, []);
+
+  const handleMicrophoneChange = useCallback((value: string) => {
+    const nextMicrophoneId = value === "__default__" ? "" : value;
+    if (nextMicrophoneId === microphoneId) {
+      return;
+    }
+
+    setMicrophoneId(nextMicrophoneId);
+
+    if (!initialLoadDone.current) {
+      return;
+    }
+
+    skipNextDebouncedSaveRef.current = true;
+    if (saveTimerRef.current) {
+      clearTimeout(saveTimerRef.current);
+    }
+
+    void applySettingsUpdate({
+      hotkeyShortcut,
+      recordingMode,
+      microphoneId: nextMicrophoneId,
+      language,
+      autoInsert,
+      launchAtLogin,
+    });
+  }, [
+    applySettingsUpdate,
+    autoInsert,
+    hotkeyShortcut,
+    language,
+    launchAtLogin,
+    microphoneId,
+    recordingMode,
+  ]);
+
   useEffect(() => {
     if (!isRecordingShortcut) {
       return;
@@ -259,43 +331,41 @@ export default function Settings() {
     };
   }, [isRecordingShortcut]);
 
-  // Auto-save settings on change with debounce
+  // Auto-save most settings on change with debounce.
+  // Microphone changes are persisted immediately in handleMicrophoneChange.
   useEffect(() => {
     if (!initialLoadDone.current) return;
+    if (skipNextDebouncedSaveRef.current) {
+      skipNextDebouncedSaveRef.current = false;
+      return;
+    }
 
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
 
-    saveTimerRef.current = setTimeout(async () => {
-      setIsSavingSettings(true);
-      try {
-        const updatedSettings = await invoke<VoiceSettings>("apply_settings", {
-          update: createSettingsUpdatePayload({
-            hotkeyShortcut: normalizeShortcut(hotkeyShortcut),
-            recordingMode,
-            microphoneId,
-            language,
-            autoInsert,
-            launchAtLogin,
-          }),
-        });
-        setHotkeyShortcut(updatedSettings.hotkey_shortcut);
-        setRecordingMode(normalizeRecordingMode(updatedSettings.recording_mode));
-        setMicrophoneId(updatedSettings.microphone_id ?? "");
-        setLanguage(updatedSettings.language ?? "");
-        setAutoInsert(updatedSettings.auto_insert);
-        setLaunchAtLogin(updatedSettings.launch_at_login);
-        setFeedback({ kind: "success", message: "Settings saved." });
-      } catch (error) {
-        setFeedback({ kind: "error", message: toErrorMessage(error, "Unable to save settings.") });
-      } finally {
-        setIsSavingSettings(false);
-      }
+    const draft: SettingsDraft = {
+      hotkeyShortcut,
+      recordingMode,
+      microphoneId,
+      language,
+      autoInsert,
+      launchAtLogin,
+    };
+    saveTimerRef.current = setTimeout(() => {
+      void applySettingsUpdate(draft);
     }, 600);
 
     return () => {
       if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     };
-  }, [hotkeyShortcut, recordingMode, microphoneId, language, autoInsert, launchAtLogin]);
+  }, [
+    applySettingsUpdate,
+    autoInsert,
+    hotkeyShortcut,
+    language,
+    launchAtLogin,
+    microphoneId,
+    recordingMode,
+  ]);
 
   async function handleRefreshMicrophones() {
     setIsRefreshingMics(true);
@@ -553,7 +623,7 @@ export default function Settings() {
           <div className="space-y-1.5">
             <Label className="text-xs">Microphone</Label>
             <div className="flex gap-2">
-              <Select value={microphoneId || "__default__"} onValueChange={(v) => setMicrophoneId(v === "__default__" ? "" : v)}>
+              <Select value={microphoneId || "__default__"} onValueChange={handleMicrophoneChange}>
                 <SelectTrigger className="h-8 flex-1 text-xs">
                   <SelectValue placeholder="System Default" />
                 </SelectTrigger>

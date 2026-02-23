@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fmt,
     sync::{
         atomic::{AtomicU32, Ordering},
@@ -90,6 +90,14 @@ struct EnumeratedInputDevice {
 struct MacosCoreAudioDeviceIdentity {
     device_id: u32,
     uid: Option<String>,
+    name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct InputDeviceSelectionCandidate {
+    id: String,
+    name: String,
+    is_default: bool,
 }
 
 pub struct AudioCaptureService {
@@ -424,12 +432,17 @@ fn start_recording_worker(
     on_input_chunk: Option<AudioInputChunkCallback>,
 ) -> Result<(Stream, RecordingRuntime, Receiver<String>), String> {
     let host = cpal::default_host();
+    let default_input_device_name = host.default_input_device().and_then(|d| d.name().ok());
     let devices = enumerate_input_devices(&host)?;
     if devices.is_empty() {
         return Err("No microphone input devices are available".to_string());
     }
 
-    let selected_device = select_input_device(devices, preferred_device_id)?;
+    let selected_device = select_input_device(
+        devices,
+        preferred_device_id,
+        default_input_device_name.as_deref(),
+    )?;
     info!(
         device_id = %selected_device.id,
         device_name = %selected_device.name,
@@ -530,7 +543,8 @@ fn report_stream_error(format_label: &str, stream_error_tx: &Sender<String>, err
 fn enumerate_input_devices(host: &cpal::Host) -> Result<Vec<EnumeratedInputDevice>, String> {
     let default_name = host.default_input_device().and_then(|d| d.name().ok());
     let default_coreaudio_device_id = macos_default_input_device_id();
-    let macos_identities = macos_coreaudio_device_identities_in_global_order();
+    let mut macos_identities_by_name =
+        build_macos_identity_lookup_by_name(macos_coreaudio_device_identities_in_global_order());
     let mut devices = Vec::new();
     let mut id_occurrences: HashMap<String, usize> = HashMap::new();
 
@@ -538,7 +552,7 @@ fn enumerate_input_devices(host: &cpal::Host) -> Result<Vec<EnumeratedInputDevic
         .devices()
         .map_err(|err| format!("Failed to enumerate input devices: {err}"))?;
 
-    for (global_index, device) in all_devices.enumerate() {
+    for device in all_devices {
         let supports_input = device
             .supported_input_configs()
             .map(|mut configs| configs.next().is_some())
@@ -550,12 +564,17 @@ fn enumerate_input_devices(host: &cpal::Host) -> Result<Vec<EnumeratedInputDevic
         let name = device
             .name()
             .unwrap_or_else(|_| format!("Microphone {}", devices.len() + 1));
-        let coreaudio_identity = macos_identities.get(global_index);
-        let coreaudio_device_id = coreaudio_identity.map(|identity| identity.device_id);
+        let coreaudio_identity =
+            take_macos_identity_by_device_name(&mut macos_identities_by_name, &name);
+        let coreaudio_device_id = coreaudio_identity
+            .as_ref()
+            .map(|identity| identity.device_id);
         let id = ensure_unique_device_id(
             build_microphone_device_id(
                 &name,
-                coreaudio_identity.and_then(|identity| identity.uid.as_deref()),
+                coreaudio_identity
+                    .as_ref()
+                    .and_then(|identity| identity.uid.as_deref()),
                 coreaudio_device_id,
             ),
             &mut id_occurrences,
@@ -583,11 +602,37 @@ fn enumerate_input_devices(host: &cpal::Host) -> Result<Vec<EnumeratedInputDevic
 fn select_input_device(
     mut devices: Vec<EnumeratedInputDevice>,
     preferred_device_id: Option<&str>,
+    default_device_name: Option<&str>,
 ) -> Result<EnumeratedInputDevice, String> {
+    let candidates = devices
+        .iter()
+        .map(|device| InputDeviceSelectionCandidate {
+            id: device.id.clone(),
+            name: device.name.clone(),
+            is_default: device.is_default,
+        })
+        .collect::<Vec<_>>();
+    let selected_index =
+        select_input_device_index(&candidates, preferred_device_id, default_device_name)?;
+    let selected = devices.swap_remove(selected_index);
+    debug!(
+        device_id = %selected.id,
+        device_name = %selected.name,
+        is_default = selected.is_default,
+        "selected microphone device"
+    );
+    Ok(selected)
+}
+
+fn select_input_device_index(
+    devices: &[InputDeviceSelectionCandidate],
+    preferred_device_id: Option<&str>,
+    default_device_name: Option<&str>,
+) -> Result<usize, String> {
     if let Some(device_id) = preferred_device_id {
         if let Some(index) = devices.iter().position(|device| device.id == device_id) {
             debug!(device_id, "selected preferred input device by id");
-            return Ok(devices.swap_remove(index));
+            return Ok(index);
         }
 
         if let Some(legacy_slug) = legacy_device_slug(device_id) {
@@ -599,24 +644,90 @@ fn select_input_device(
                     device_id,
                     "resolved microphone using legacy device id fallback"
                 );
-                return Ok(devices.swap_remove(index));
+                return Ok(index);
             }
         }
 
-        return Err(format!("No microphone found for id '{device_id}'"));
+        let default_index = resolve_default_input_device_index(devices, default_device_name)
+            .ok_or_else(|| "No microphone input devices are available".to_string())?;
+        let fallback_device = &devices[default_index];
+        warn!(
+            preferred_device_id = device_id,
+            fallback_device_id = %fallback_device.id,
+            fallback_device_name = %fallback_device.name,
+            "preferred microphone was unavailable; falling back to system default input device"
+        );
+        return Ok(default_index);
     }
 
-    let selected = devices
-        .into_iter()
-        .min_by_key(|device| if device.is_default { 0 } else { 1 })
-        .ok_or_else(|| "No microphone input devices are available".to_string())?;
-    debug!(
-        device_id = %selected.id,
-        device_name = %selected.name,
-        is_default = selected.is_default,
-        "selected microphone device"
-    );
-    Ok(selected)
+    resolve_default_input_device_index(devices, default_device_name)
+        .ok_or_else(|| "No microphone input devices are available".to_string())
+}
+
+fn resolve_default_input_device_index(
+    devices: &[InputDeviceSelectionCandidate],
+    default_device_name: Option<&str>,
+) -> Option<usize> {
+    if let Some(default_name) = default_device_name {
+        if let Some((index, _)) = devices
+            .iter()
+            .enumerate()
+            .filter(|(_, device)| device.name == default_name)
+            .min_by_key(|(_, device)| if device.is_default { 0 } else { 1 })
+        {
+            return Some(index);
+        }
+
+        warn!(
+            default_device_name = default_name,
+            "cpal default input device name was not found in enumerated microphones; using fallback selection"
+        );
+    }
+
+    devices
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, device)| if device.is_default { 0 } else { 1 })
+        .map(|(index, _)| index)
+}
+
+fn build_macos_identity_lookup_by_name(
+    identities: Vec<MacosCoreAudioDeviceIdentity>,
+) -> HashMap<String, VecDeque<MacosCoreAudioDeviceIdentity>> {
+    let mut identities_by_name: HashMap<String, VecDeque<MacosCoreAudioDeviceIdentity>> =
+        HashMap::new();
+    for identity in identities {
+        let Some(name_key) = normalized_device_name_lookup_key(identity.name.as_deref()) else {
+            continue;
+        };
+        identities_by_name
+            .entry(name_key)
+            .or_default()
+            .push_back(identity);
+    }
+    identities_by_name
+}
+
+fn take_macos_identity_by_device_name(
+    identities_by_name: &mut HashMap<String, VecDeque<MacosCoreAudioDeviceIdentity>>,
+    device_name: &str,
+) -> Option<MacosCoreAudioDeviceIdentity> {
+    let lookup_key = normalized_device_name_lookup_key(Some(device_name))?;
+    let identities = identities_by_name.get_mut(&lookup_key)?;
+    let identity = identities.pop_front();
+    if identities.is_empty() {
+        identities_by_name.remove(&lookup_key);
+    }
+    identity
+}
+
+fn normalized_device_name_lookup_key(name: Option<&str>) -> Option<String> {
+    let normalized = name?.trim();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized.to_lowercase())
+    }
 }
 
 fn build_microphone_device_id(
@@ -706,10 +817,11 @@ fn macos_collect_coreaudio_device_identities_in_global_order(
         kCFStringEncodingUTF8, CFStringGetCString, CFStringGetCStringPtr, CFStringRef,
     };
     use coreaudio::sys::{
-        kAudioDevicePropertyDeviceUID, kAudioHardwareNoError, kAudioHardwarePropertyDevices,
-        kAudioObjectPropertyElementMaster, kAudioObjectPropertyScopeGlobal,
-        kAudioObjectSystemObject, AudioDeviceID, AudioObjectGetPropertyData,
-        AudioObjectGetPropertyDataSize, AudioObjectPropertyAddress,
+        kAudioDevicePropertyDeviceUID, kAudioDevicePropertyStreams, kAudioHardwareNoError,
+        kAudioHardwarePropertyDevices, kAudioObjectPropertyElementMaster, kAudioObjectPropertyName,
+        kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput, kAudioObjectSystemObject,
+        AudioDeviceID, AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize,
+        AudioObjectPropertyAddress,
     };
     use std::{ffi::CStr, mem, os::raw::c_char, ptr::null};
 
@@ -808,8 +920,32 @@ fn macos_collect_coreaudio_device_identities_in_global_order(
         Some(value.to_string_lossy().into_owned())
     }
 
+    fn device_supports_input(device_id: AudioDeviceID) -> bool {
+        let property_address = AudioObjectPropertyAddress {
+            mSelector: kAudioDevicePropertyStreams,
+            mScope: kAudioObjectPropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMaster,
+        };
+        let mut data_size = 0u32;
+        let status = unsafe {
+            AudioObjectGetPropertyDataSize(
+                device_id,
+                &property_address as *const _,
+                0,
+                null(),
+                &mut data_size as *mut _,
+            )
+        };
+
+        status == kAudioHardwareNoError as i32 && data_size > 0
+    }
+
     let mut identities = Vec::new();
     for device_id in device_ids_global_order()? {
+        if !device_supports_input(device_id) {
+            continue;
+        }
+
         let uid = read_device_string_property(
             device_id,
             kAudioDevicePropertyDeviceUID,
@@ -817,10 +953,18 @@ fn macos_collect_coreaudio_device_identities_in_global_order(
         )
         .map(|uid| uid.trim().to_string())
         .filter(|uid| !uid.is_empty());
+        let name = read_device_string_property(
+            device_id,
+            kAudioObjectPropertyName,
+            kAudioObjectPropertyScopeGlobal,
+        )
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty());
 
         identities.push(MacosCoreAudioDeviceIdentity {
             device_id: device_id as u32,
             uid,
+            name,
         });
     }
 
@@ -1142,9 +1286,11 @@ mod tests {
     };
 
     use super::{
-        await_worker_startup, build_microphone_device_id, ensure_unique_device_id, float_to_pcm16,
-        legacy_device_slug, pcm16_to_wav_bytes, quantize_audio_level_for_emit, run_recording_loop,
-        slugify_device_name, RecordingLoopExit, RecordingRuntime,
+        await_worker_startup, build_macos_identity_lookup_by_name, build_microphone_device_id,
+        ensure_unique_device_id, float_to_pcm16, legacy_device_slug, pcm16_to_wav_bytes,
+        quantize_audio_level_for_emit, run_recording_loop, select_input_device_index,
+        slugify_device_name, take_macos_identity_by_device_name, InputDeviceSelectionCandidate,
+        MacosCoreAudioDeviceIdentity, RecordingLoopExit, RecordingRuntime,
     };
 
     #[test]
@@ -1213,6 +1359,56 @@ mod tests {
     }
 
     #[test]
+    fn macos_identity_matching_uses_device_name_not_global_position() {
+        let identities = vec![
+            MacosCoreAudioDeviceIdentity {
+                device_id: 101,
+                uid: Some("uid-built-in".to_string()),
+                name: Some("Built-in Mic".to_string()),
+            },
+            MacosCoreAudioDeviceIdentity {
+                device_id: 102,
+                uid: Some("uid-usb".to_string()),
+                name: Some("USB Mic".to_string()),
+            },
+        ];
+
+        let mut lookup = build_macos_identity_lookup_by_name(identities);
+        let usb = take_macos_identity_by_device_name(&mut lookup, "USB Mic")
+            .expect("USB identity should be found by name");
+        let built_in = take_macos_identity_by_device_name(&mut lookup, "Built-in Mic")
+            .expect("Built-in identity should be found by name");
+
+        assert_eq!(usb.uid.as_deref(), Some("uid-usb"));
+        assert_eq!(built_in.uid.as_deref(), Some("uid-built-in"));
+    }
+
+    #[test]
+    fn macos_identity_matching_consumes_duplicate_names_in_order() {
+        let identities = vec![
+            MacosCoreAudioDeviceIdentity {
+                device_id: 201,
+                uid: Some("uid-a".to_string()),
+                name: Some("USB Mic".to_string()),
+            },
+            MacosCoreAudioDeviceIdentity {
+                device_id: 202,
+                uid: Some("uid-b".to_string()),
+                name: Some("USB Mic".to_string()),
+            },
+        ];
+
+        let mut lookup = build_macos_identity_lookup_by_name(identities);
+        let first = take_macos_identity_by_device_name(&mut lookup, "USB Mic")
+            .expect("first duplicate should be available");
+        let second = take_macos_identity_by_device_name(&mut lookup, "USB Mic")
+            .expect("second duplicate should be available");
+
+        assert_eq!(first.uid.as_deref(), Some("uid-a"));
+        assert_eq!(second.uid.as_deref(), Some("uid-b"));
+    }
+
+    #[test]
     fn ensure_unique_device_id_suffixes_duplicate_candidates() {
         let mut id_occurrences = HashMap::new();
 
@@ -1240,6 +1436,52 @@ mod tests {
             Some("macbook-pro-microphone")
         );
         assert_eq!(legacy_device_slug("coreaudio:BuiltInMicDeviceUID"), None);
+    }
+
+    #[test]
+    fn selection_falls_back_to_default_when_preferred_device_is_missing() {
+        let devices = vec![
+            InputDeviceSelectionCandidate {
+                id: "coreaudio:built-in".to_string(),
+                name: "Built-in Mic".to_string(),
+                is_default: true,
+            },
+            InputDeviceSelectionCandidate {
+                id: "coreaudio:usb".to_string(),
+                name: "USB Mic".to_string(),
+                is_default: false,
+            },
+        ];
+
+        let selected = select_input_device_index(
+            &devices,
+            Some("coreaudio:does-not-exist"),
+            Some("Built-in Mic"),
+        )
+        .expect("selection should fall back to default input");
+
+        assert_eq!(selected, 0);
+    }
+
+    #[test]
+    fn selection_prefers_cpal_default_name_when_default_flags_are_unset() {
+        let devices = vec![
+            InputDeviceSelectionCandidate {
+                id: "name:mic-a".to_string(),
+                name: "Mic A".to_string(),
+                is_default: false,
+            },
+            InputDeviceSelectionCandidate {
+                id: "name:mic-b".to_string(),
+                name: "Mic B".to_string(),
+                is_default: false,
+            },
+        ];
+
+        let selected = select_input_device_index(&devices, None, Some("Mic B"))
+            .expect("selection should use cpal default device name");
+
+        assert_eq!(selected, 1);
     }
 
     #[test]
