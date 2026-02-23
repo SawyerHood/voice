@@ -770,7 +770,7 @@ export default function Settings() {
                 Launch at Login
               </Label>
               <p className="text-[11px] text-muted-foreground">
-                Start Voice when you log in
+                Start Buzz when you log in
               </p>
             </div>
             <Switch

@@ -226,7 +226,7 @@ function PermissionOnboardingCard({
             <CardDescription className="text-xs mt-1">
               {permissions?.allGranted
                 ? "All required permissions are granted."
-                : "Voice needs these macOS permissions to record and insert text."}
+                : "Buzz needs these macOS permissions to record and insert text."}
             </CardDescription>
           </div>
           {showDismiss && (
@@ -913,7 +913,7 @@ function App() {
               <Mic className="size-3.5 text-sidebar-primary-foreground" />
             </div>
             <div className="min-w-0 flex-1">
-              <p className="text-sm font-semibold text-sidebar-foreground tracking-tight">Voice</p>
+              <p className="text-sm font-semibold text-sidebar-foreground tracking-tight">Buzz</p>
             </div>
             <Tooltip>
               <TooltipTrigger asChild>
