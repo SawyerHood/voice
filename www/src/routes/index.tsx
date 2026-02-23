@@ -62,7 +62,6 @@ function LandingPage() {
       <Hero />
       <Features />
       <HowItWorks />
-      <Pricing />
       <Footer />
     </div>
   )
@@ -197,24 +196,6 @@ function HowItWorks() {
             </li>
           ))}
         </ol>
-      </div>
-    </section>
-  )
-}
-
-/* ─── pricing ────────────────────────────────────────────────────── */
-
-function Pricing() {
-  return (
-    <section className="py-20 md:py-28 border-t border-neutral-200">
-      <div className="max-w-3xl mx-auto px-6">
-        <h2 className="text-2xl font-semibold text-neutral-900 mb-4 tracking-tight">
-          Pricing
-        </h2>
-        <p className="text-sm text-neutral-500 leading-relaxed max-w-xl">
-          Free with a ChatGPT subscription. Or use your own OpenAI API key.
-          Either way, much cheaper than alternatives like WhisperFlow.
-        </p>
       </div>
     </section>
   )
