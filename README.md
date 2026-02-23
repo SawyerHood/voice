@@ -4,6 +4,8 @@
 
 # Buzz 🐝
 
+[![CI](https://github.com/SawyerHood/voice/actions/workflows/ci.yml/badge.svg)](https://github.com/SawyerHood/voice/actions/workflows/ci.yml)
+
 Voice-to-text with a quick buzz.
 
 Buzz is a macOS-native menubar app that turns speech into text wherever your cursor is. Press your hotkey, talk, release, and your transcript is inserted directly into the active app.
