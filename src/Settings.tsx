@@ -92,10 +92,6 @@ const HOTKEY_PRESETS = [
   { label: "Ctrl+Space", value: "Ctrl+Space" },
   { label: "Shift+Space", value: "Shift+Space" },
   { label: "Meta+Space", value: "Cmd+Space" },
-  { label: "F5", value: "F5" },
-  { label: "F6", value: "F6" },
-  { label: "F7", value: "F7" },
-  { label: "Ctrl+Shift+S", value: "Ctrl+Shift+S" },
 ] as const;
 
 const CUSTOM_SHORTCUT_PRESET_VALUE = "__custom_shortcut__";
@@ -521,7 +517,7 @@ export default function Settings() {
               <span>
                 {isRecordingShortcut
                   ? "Press the key combination you want to use, then release."
-                  : "Fn cannot be captured on macOS (system intercepts it). Use F5–F7 or another combo. Right Alt/Option is captured as Alt."}
+                  : "Fn cannot be captured on macOS (system intercepts it). Use a space-based combo or another custom shortcut. Right Alt/Option is captured as Alt."}
               </span>
             </p>
           </div>
