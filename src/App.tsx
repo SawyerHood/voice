@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import {
   Mic,
@@ -880,6 +881,13 @@ function App() {
     }
   }, [status]);
 
+  const handleOnboardingComplete = useCallback(() => {
+    setOnboardingState("completed");
+    void getCurrentWindow().hide().catch(() => {
+      // Keep onboarding completion resilient if hide fails.
+    });
+  }, []);
+
   if (onboardingState === "loading") {
     return (
       <main className="flex h-screen items-center justify-center">
@@ -889,7 +897,7 @@ function App() {
   }
 
   if (onboardingState === "required") {
-    return <Onboarding onComplete={() => setOnboardingState("completed")} />;
+    return <Onboarding onComplete={handleOnboardingComplete} />;
   }
 
   return (

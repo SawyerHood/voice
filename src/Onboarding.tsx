@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { CheckCircle2, Circle, Loader2, Mic, Shield, Sparkles } from "lucide-react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -13,6 +14,11 @@ import {
   shortcutFromKeyboardEvent,
   type RecordingMode,
 } from "./settingsUtils";
+import {
+  extractTranscriptText,
+  practiceStatusLabel,
+  type OnboardingPracticeStatus,
+} from "./onboardingUtils";
 
 type PermissionState = "not_determined" | "granted" | "denied";
 type PermissionSnapshot = {
@@ -33,18 +39,21 @@ type VoiceSettingsUpdate = {
   recording_mode?: RecordingMode;
 };
 type AuthMethod = "oauth" | "api_key";
+type TranscriptReadyEvent = { text?: string };
+type PipelineErrorEvent = { stage: string; message: string };
 
 type OnboardingProps = {
   onComplete: () => void;
 };
 
-const TOTAL_STEPS = 6;
+const TOTAL_STEPS = 7;
 const STEP_TITLES = [
   "Welcome",
   "Microphone",
   "Accessibility",
   "Authentication",
   "Shortcut + Mode",
+  "Try It Out",
   "All Done",
 ] as const;
 
@@ -134,6 +143,9 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
   const [isSavingApiKey, setIsSavingApiKey] = useState(false);
   const [isSavingShortcutSettings, setIsSavingShortcutSettings] = useState(false);
   const [isCompleting, setIsCompleting] = useState(false);
+  const [practiceStatus, setPracticeStatus] = useState<OnboardingPracticeStatus>("idle");
+  const [practiceTranscript, setPracticeTranscript] = useState("");
+  const [practiceErrorMessage, setPracticeErrorMessage] = useState("");
 
   const micGranted = permissions?.microphone === "granted";
   const accessibilityGranted = permissions?.accessibility === "granted";
@@ -164,6 +176,21 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
     }
     return "";
   }, [chatgptAuthStatus, hasApiKey]);
+  const practiceStatusDescription = useMemo(() => {
+    if (practiceStatus === "listening") {
+      return "Recording in progress...";
+    }
+    if (practiceStatus === "transcribing") {
+      return "Transcribing your speech...";
+    }
+    if (practiceStatus === "error") {
+      return practiceErrorMessage || "A recording error occurred while testing.";
+    }
+    if (practiceTranscript.length > 0) {
+      return "Test complete. Review your transcript, then continue.";
+    }
+    return "Ready to test. Trigger your shortcut and speak a short phrase.";
+  }, [practiceErrorMessage, practiceStatus, practiceTranscript]);
 
   const refreshPermissionStatus = useCallback(async () => {
     try {
@@ -255,6 +282,86 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
       window.removeEventListener("keydown", handleShortcutKeydown, true);
     };
   }, [isRecordingShortcut, step]);
+
+  useEffect(() => {
+    if (step !== 5) {
+      return undefined;
+    }
+
+    setPracticeStatus("idle");
+    setPracticeTranscript("");
+    setPracticeErrorMessage("");
+
+    let isMounted = true;
+    let unlistenFns: UnlistenFn[] = [];
+
+    async function bindPracticeEvents() {
+      try {
+        const initialStatus = await invoke<OnboardingPracticeStatus>("get_status");
+        if (isMounted) {
+          setPracticeStatus(initialStatus);
+          if (initialStatus !== "error") {
+            setPracticeErrorMessage("");
+          }
+        }
+      } catch {
+        // Keep onboarding resilient if status sync is unavailable.
+      }
+
+      try {
+        const listeners = await Promise.all([
+          listen<OnboardingPracticeStatus>("voice://status-changed", ({ payload }) => {
+            setPracticeStatus(payload);
+            if (payload !== "error") {
+              setPracticeErrorMessage("");
+            }
+          }),
+          listen<TranscriptReadyEvent>("voice://transcript-ready", ({ payload }) => {
+            const transcript = extractTranscriptText(payload);
+            if (transcript.length === 0) {
+              return;
+            }
+
+            setPracticeTranscript(transcript);
+            setPracticeStatus("idle");
+            setPracticeErrorMessage("");
+          }),
+          listen<unknown>("voice://transcription-complete", ({ payload }) => {
+            const transcript = extractTranscriptText(payload);
+            if (transcript.length === 0) {
+              return;
+            }
+
+            setPracticeTranscript(transcript);
+            setPracticeStatus("idle");
+            setPracticeErrorMessage("");
+          }),
+          listen<PipelineErrorEvent>("voice://pipeline-error", ({ payload }) => {
+            setPracticeStatus("error");
+            setPracticeErrorMessage(
+              payload.message?.trim() || "A recording error occurred while testing."
+            );
+          }),
+        ]);
+
+        if (!isMounted) {
+          listeners.forEach((dispose) => dispose());
+          return;
+        }
+
+        unlistenFns = listeners;
+      } catch {
+        // Keep onboarding usable even if events fail to bind.
+      }
+    }
+
+    void bindPracticeEvents();
+
+    return () => {
+      isMounted = false;
+      unlistenFns.forEach((dispose) => dispose());
+    };
+  }, [step]);
 
   const handleRequestMic = useCallback(async () => {
     setIsRequestingMic(true);
@@ -351,6 +458,10 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
       setIsCompleting(false);
     }
   }, [onComplete]);
+
+  const handleContinueFromPracticeStep = useCallback(() => {
+    setStep(6);
+  }, []);
 
   const renderStep = () => {
     if (step === 0) {
@@ -693,6 +804,94 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
     }
 
     const modeLabel = recordingMode === "hold_to_talk" ? "Hold to Talk" : "Toggle";
+
+    if (step === 5) {
+      const isListening = practiceStatus === "listening";
+      const isTranscribing = practiceStatus === "transcribing";
+      const hasTranscript = practiceTranscript.length > 0;
+
+      return (
+        <div className="space-y-6">
+          <div className="space-y-2">
+            <h2 className="text-xl font-semibold tracking-tight">Try it out</h2>
+            <p className="text-sm text-muted-foreground">
+              Try it now! Press {shortcutInstructionLabel} to record, then speak.
+            </p>
+          </div>
+
+          <div className="space-y-3 rounded-xl border-2 border-primary/35 bg-primary/5 p-4 text-center">
+            <p className="text-base font-semibold text-primary">
+              Try it now! Press {shortcutInstructionLabel} to record, then speak.
+            </p>
+            <ShortcutKeycaps shortcut={hotkeyShortcut} large />
+            <p className="text-sm text-muted-foreground">
+              Mode: {modeLabel}. {stopInstruction(recordingMode)} You should also see the Buzz
+              overlay while recording and transcribing.
+            </p>
+          </div>
+
+          <div className="grid gap-2 sm:grid-cols-3">
+            <div
+              className={cn(
+                "rounded-lg border px-3 py-2 text-center text-xs font-medium transition-colors",
+                isListening ? "border-emerald-500/60 bg-emerald-50 dark:bg-emerald-950/20" : "bg-muted/30",
+              )}
+            >
+              Recording
+            </div>
+            <div
+              className={cn(
+                "rounded-lg border px-3 py-2 text-center text-xs font-medium transition-colors",
+                isTranscribing ? "border-amber-500/60 bg-amber-50 dark:bg-amber-950/20" : "bg-muted/30",
+              )}
+            >
+              Transcribing
+            </div>
+            <div
+              className={cn(
+                "rounded-lg border px-3 py-2 text-center text-xs font-medium transition-colors",
+                hasTranscript && !isListening && !isTranscribing
+                  ? "border-primary/60 bg-primary/10"
+                  : "bg-muted/30",
+              )}
+            >
+              Result
+            </div>
+          </div>
+
+          <div className="space-y-2">
+            <div className="flex items-center justify-between gap-3">
+              <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                Test Transcript
+              </p>
+              <span className="rounded-full border bg-background px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                {practiceStatusLabel(practiceStatus)}
+              </span>
+            </div>
+            <textarea
+              value={practiceTranscript}
+              readOnly
+              placeholder="Your transcript will appear here after you test your shortcut."
+              className="min-h-32 w-full resize-y rounded-md border bg-background px-3 py-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            />
+            <p className="text-xs text-muted-foreground">{practiceStatusDescription}</p>
+          </div>
+
+          {practiceErrorMessage && (
+            <Alert variant="destructive" className="py-2">
+              <AlertDescription className="text-xs">{practiceErrorMessage}</AlertDescription>
+            </Alert>
+          )}
+
+          <div className="flex items-center justify-between">
+            <Button variant="ghost" onClick={handleContinueFromPracticeStep}>
+              Skip
+            </Button>
+            <Button onClick={handleContinueFromPracticeStep}>Continue</Button>
+          </div>
+        </div>
+      );
+    }
 
     return (
       <div className="space-y-6">

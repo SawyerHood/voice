@@ -2037,6 +2037,10 @@ fn hide_main_window(app: &AppHandle) {
     }
 }
 
+fn should_hide_main_window_on_startup(settings: &VoiceSettings) -> bool {
+    settings.onboarding_completed
+}
+
 fn toggle_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         match window.is_visible() {
@@ -2181,8 +2185,13 @@ pub fn run() {
                 .build(app)?;
             info!("tray icon initialized");
 
-            hide_main_window(app.handle());
-            info!("setup complete");
+            if should_hide_main_window_on_startup(&settings) {
+                hide_main_window(app.handle());
+                info!("setup complete in tray-only mode");
+            } else {
+                show_main_window(app.handle());
+                info!("setup complete with onboarding window visible");
+            }
 
             Ok(())
         })
@@ -2272,8 +2281,9 @@ mod tests {
         copy_directory_contents, handle_audio_input_stream_error_with_hooks, has_api_key,
         load_startup_settings_with_fallback, migrate_legacy_app_data_dir,
         overlay_position_from_work_area, permission_preflight_error_message,
-        should_show_overlay_for_status, spawn_pipeline_stage_error_reset, AppState,
-        PipelineRuntimeState, OVERLAY_WINDOW_TOP_MARGIN, OVERLAY_WINDOW_WIDTH,
+        should_hide_main_window_on_startup, should_show_overlay_for_status,
+        spawn_pipeline_stage_error_reset, AppState, PipelineRuntimeState,
+        OVERLAY_WINDOW_TOP_MARGIN, OVERLAY_WINDOW_WIDTH,
     };
     use crate::permission_service::{PermissionState, PermissionType};
 
@@ -3509,6 +3519,26 @@ mod tests {
                 .expect("new history should remain unchanged"),
             b"[\"new\"]"
         );
+    }
+
+    #[test]
+    fn startup_window_visibility_hides_when_onboarding_completed() {
+        let settings = VoiceSettings {
+            onboarding_completed: true,
+            ..VoiceSettings::default()
+        };
+
+        assert!(should_hide_main_window_on_startup(&settings));
+    }
+
+    #[test]
+    fn startup_window_visibility_shows_when_onboarding_not_completed() {
+        let settings = VoiceSettings {
+            onboarding_completed: false,
+            ..VoiceSettings::default()
+        };
+
+        assert!(!should_hide_main_window_on_startup(&settings));
     }
 
     #[test]
