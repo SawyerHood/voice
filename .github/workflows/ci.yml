@@ -13,6 +13,38 @@ concurrency:
 jobs:
   frontend-checks:
     name: Frontend checks
+    if: >-
+      github.event_name == 'pull_request' ||
+      contains(join(github.event.commits.*.modified, ','), 'src/') ||
+      contains(join(github.event.commits.*.added, ','), 'src/') ||
+      contains(join(github.event.commits.*.removed, ','), 'src/') ||
+      contains(join(github.event.commits.*.modified, ','), 'public/') ||
+      contains(join(github.event.commits.*.added, ','), 'public/') ||
+      contains(join(github.event.commits.*.removed, ','), 'public/') ||
+      contains(join(github.event.commits.*.modified, ','), 'index.html') ||
+      contains(join(github.event.commits.*.added, ','), 'index.html') ||
+      contains(join(github.event.commits.*.removed, ','), 'index.html') ||
+      contains(join(github.event.commits.*.modified, ','), 'package.json') ||
+      contains(join(github.event.commits.*.added, ','), 'package.json') ||
+      contains(join(github.event.commits.*.removed, ','), 'package.json') ||
+      contains(join(github.event.commits.*.modified, ','), 'pnpm-lock.yaml') ||
+      contains(join(github.event.commits.*.added, ','), 'pnpm-lock.yaml') ||
+      contains(join(github.event.commits.*.removed, ','), 'pnpm-lock.yaml') ||
+      contains(join(github.event.commits.*.modified, ','), 'vite.config.') ||
+      contains(join(github.event.commits.*.added, ','), 'vite.config.') ||
+      contains(join(github.event.commits.*.removed, ','), 'vite.config.') ||
+      contains(join(github.event.commits.*.modified, ','), 'vitest.config.') ||
+      contains(join(github.event.commits.*.added, ','), 'vitest.config.') ||
+      contains(join(github.event.commits.*.removed, ','), 'vitest.config.') ||
+      contains(join(github.event.commits.*.modified, ','), 'tsconfig') ||
+      contains(join(github.event.commits.*.added, ','), 'tsconfig') ||
+      contains(join(github.event.commits.*.removed, ','), 'tsconfig') ||
+      contains(join(github.event.commits.*.modified, ','), 'tailwind.config.') ||
+      contains(join(github.event.commits.*.added, ','), 'tailwind.config.') ||
+      contains(join(github.event.commits.*.removed, ','), 'tailwind.config.') ||
+      contains(join(github.event.commits.*.modified, ','), '.github/workflows/ci.yml') ||
+      contains(join(github.event.commits.*.added, ','), '.github/workflows/ci.yml') ||
+      contains(join(github.event.commits.*.removed, ','), '.github/workflows/ci.yml')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -42,6 +74,14 @@ jobs:
 
   rust-checks:
     name: Rust checks
+    if: >-
+      github.event_name == 'pull_request' ||
+      contains(join(github.event.commits.*.modified, ','), 'src-tauri/') ||
+      contains(join(github.event.commits.*.added, ','), 'src-tauri/') ||
+      contains(join(github.event.commits.*.removed, ','), 'src-tauri/') ||
+      contains(join(github.event.commits.*.modified, ','), '.github/workflows/ci.yml') ||
+      contains(join(github.event.commits.*.added, ','), '.github/workflows/ci.yml') ||
+      contains(join(github.event.commits.*.removed, ','), '.github/workflows/ci.yml')
     runs-on: macos-latest
     steps:
       - name: Checkout
@@ -77,6 +117,14 @@ jobs:
 
   landing-page:
     name: Landing page
+    if: >-
+      github.event_name == 'pull_request' ||
+      contains(join(github.event.commits.*.modified, ','), 'www/') ||
+      contains(join(github.event.commits.*.added, ','), 'www/') ||
+      contains(join(github.event.commits.*.removed, ','), 'www/') ||
+      contains(join(github.event.commits.*.modified, ','), '.github/workflows/ci.yml') ||
+      contains(join(github.event.commits.*.added, ','), '.github/workflows/ci.yml') ||
+      contains(join(github.event.commits.*.removed, ','), '.github/workflows/ci.yml')
     runs-on: ubuntu-latest
     defaults:
       run:
