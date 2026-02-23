@@ -96,6 +96,8 @@ function normalizeOnboardingRecordingMode(value: string): RecordingMode {
   return normalizeRecordingMode(value);
 }
 
+/* ─── Keycap badges ─────────────────────────────────── */
+
 function ShortcutKeycaps({
   shortcut,
   large = false,
@@ -109,21 +111,135 @@ function ShortcutKeycaps({
   }
 
   return (
-    <div className="flex flex-wrap items-center justify-center gap-2">
+    <div className="flex flex-wrap items-center justify-center gap-1.5">
       {parts.map((part, index) => (
-        <kbd
-          key={`${part}-${index}`}
-          className={cn(
-            "inline-flex items-center justify-center rounded-md border border-border/80 bg-background font-mono font-medium text-foreground shadow-[0_1px_0_1px_hsl(var(--border)/0.45)]",
-            large ? "min-w-[52px] px-3 py-1.5 text-sm" : "min-w-[30px] px-2 py-0.5 text-xs"
+        <span key={`${part}-${index}`} className="flex items-center gap-1.5">
+          <kbd
+            className={cn(
+              "inline-flex items-center justify-center rounded-lg border font-mono font-semibold",
+              "border-gray-300 bg-gradient-to-b from-white to-gray-50 text-gray-800",
+              "shadow-[0_1px_0_1px_rgb(209,213,219),0_1px_2px_rgba(0,0,0,0.06)]",
+              "dark:border-gray-600 dark:from-gray-800 dark:to-gray-850 dark:text-gray-200",
+              "dark:shadow-[0_1px_0_1px_rgb(75,85,99),0_1px_2px_rgba(0,0,0,0.2)]",
+              large
+                ? "min-w-[52px] px-3.5 py-2 text-sm tracking-wide"
+                : "min-w-[30px] px-2 py-0.5 text-xs",
+            )}
+          >
+            {keyDisplayLabel(part)}
+          </kbd>
+          {index < parts.length - 1 && (
+            <span className={cn("font-medium text-muted-foreground/50", large ? "text-sm" : "text-[10px]")}>
+              +
+            </span>
           )}
-        >
-          {keyDisplayLabel(part)}
-        </kbd>
+        </span>
       ))}
     </div>
   );
 }
+
+/* ─── Selectable card wrapper ───────────────────────── */
+
+function SelectableCard({
+  selected,
+  onClick,
+  disabled,
+  children,
+  className,
+}: {
+  selected: boolean;
+  onClick: () => void;
+  disabled?: boolean;
+  children: React.ReactNode;
+  className?: string;
+}) {
+  return (
+    <button
+      type="button"
+      className={cn("text-left w-full", className)}
+      onClick={onClick}
+      disabled={disabled}
+    >
+      <Card
+        className={cn(
+          "h-full border transition-all duration-200 cursor-pointer",
+          selected
+            ? "border-amber-400 bg-amber-50/70 ring-1 ring-amber-400/25 dark:border-amber-500/60 dark:bg-amber-950/25"
+            : "border-border hover:border-amber-300/60 hover:bg-amber-50/30 dark:hover:border-amber-600/40 dark:hover:bg-amber-950/15",
+        )}
+      >
+        {children}
+      </Card>
+    </button>
+  );
+}
+
+/* ─── Progress dots ─────────────────────────────────── */
+
+function ProgressDots({ currentStep }: { currentStep: number }) {
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-center gap-1.5">
+        {STEP_TITLES.map((title, index) => (
+          <div key={title} className="flex items-center gap-1.5">
+            <div
+              className={cn(
+                "size-2 rounded-full transition-all duration-300",
+                index < currentStep && "bg-amber-500",
+                index === currentStep && "bg-amber-500 ring-[3px] ring-amber-500/20",
+                index > currentStep && "bg-border",
+              )}
+            />
+            {index < STEP_TITLES.length - 1 && (
+              <div
+                className={cn(
+                  "h-px w-5 transition-all duration-300",
+                  index < currentStep ? "bg-amber-400/60" : "bg-border",
+                )}
+              />
+            )}
+          </div>
+        ))}
+      </div>
+      <p className="text-center text-[11px] font-medium text-muted-foreground/70">
+        Step {currentStep + 1} of {TOTAL_STEPS} &middot; {STEP_TITLES[currentStep]}
+      </p>
+    </div>
+  );
+}
+
+/* ─── Permission status row ─────────────────────────── */
+
+function PermissionStatusRow({
+  granted,
+  label,
+}: {
+  granted: boolean;
+  label: string;
+}) {
+  return (
+    <div
+      className={cn(
+        "flex items-center gap-2.5 rounded-lg border px-3.5 py-2.5 text-sm transition-colors",
+        granted
+          ? "border-emerald-200 bg-emerald-50/60 dark:border-emerald-800/40 dark:bg-emerald-950/20"
+          : "border-border bg-muted/20",
+      )}
+    >
+      {granted ? (
+        <CheckCircle2 className="size-4 shrink-0 text-emerald-500" />
+      ) : (
+        <Circle className="size-4 shrink-0 text-muted-foreground/50" />
+      )}
+      <span className={granted ? "text-emerald-700 dark:text-emerald-300" : "text-muted-foreground"}>
+        {label}
+      </span>
+    </div>
+  );
+}
+
+/* ─── Main onboarding component ─────────────────────── */
 
 export default function Onboarding({ onComplete }: OnboardingProps) {
   const [step, setStep] = useState(0);
@@ -178,7 +294,7 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
   }, [chatgptAuthStatus, hasApiKey]);
   const practiceStatusDescription = useMemo(() => {
     if (practiceStatus === "listening") {
-      return "Recording in progress...";
+      return "Recording in progress — speak into your mic.";
     }
     if (practiceStatus === "transcribing") {
       return "Transcribing your speech...";
@@ -187,9 +303,9 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
       return practiceErrorMessage || "A recording error occurred while testing.";
     }
     if (practiceTranscript.length > 0) {
-      return "Test complete. Review your transcript, then continue.";
+      return "Looks good! Review your transcript, then continue.";
     }
-    return "Ready to test. Trigger your shortcut and speak a short phrase.";
+    return "Press your shortcut and speak a short phrase to test.";
   }, [practiceErrorMessage, practiceStatus, practiceTranscript]);
 
   const refreshPermissionStatus = useCallback(async () => {
@@ -463,57 +579,81 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
     setStep(6);
   }, []);
 
+  /* ─── Step renderers ─────────────────────────────── */
+
   const renderStep = () => {
+    /* ── Welcome ── */
     if (step === 0) {
       return (
-        <div className="space-y-6 text-center">
+        <div className="flex flex-col items-center gap-6 py-4 text-center">
+          <div className="flex size-16 items-center justify-center rounded-2xl bg-amber-100/80 dark:bg-amber-900/25">
+            <span className="text-3xl" role="img" aria-label="bee">
+              🐝
+            </span>
+          </div>
           <div className="space-y-2">
-            <h2 className="text-2xl font-semibold tracking-tight">Welcome to Buzz 🐝</h2>
-            <p className="text-sm text-muted-foreground">
-              Voice-to-text with a quick buzz. Let&apos;s get your setup dialed in.
+            <h2 className="text-2xl font-semibold tracking-tight">Welcome to Buzz</h2>
+            <p className="mx-auto max-w-sm text-sm leading-relaxed text-muted-foreground">
+              Voice-to-text, anywhere on your Mac. Let&apos;s get you set up in about a minute.
             </p>
           </div>
-          <Button onClick={() => setStep(1)} size="sm">
+          <Button
+            onClick={() => setStep(1)}
+            className="bg-amber-500 text-white shadow-sm hover:bg-amber-600 dark:bg-amber-600 dark:hover:bg-amber-500"
+          >
             Get Started
           </Button>
         </div>
       );
     }
 
+    /* ── Microphone ── */
     if (step === 1) {
       return (
         <div className="space-y-5">
-          <div className="space-y-2">
-            <h2 className="text-xl font-semibold tracking-tight">Allow microphone access</h2>
-            <p className="text-sm text-muted-foreground">
-              Buzz needs microphone access to capture your voice and transcribe it to text.
+          <div className="space-y-1.5">
+            <h2 className="text-xl font-semibold tracking-tight">Microphone access</h2>
+            <p className="text-sm leading-relaxed text-muted-foreground">
+              Buzz needs your microphone to capture speech and turn it into text.
             </p>
           </div>
 
-          <div className="flex items-center gap-2 rounded-lg border bg-muted/30 px-3 py-2 text-sm">
-            {micGranted ? (
-              <CheckCircle2 className="size-4 text-emerald-500" />
-            ) : (
-              <Circle className="size-4 text-muted-foreground" />
-            )}
-            <span>{micGranted ? "Microphone permission granted" : "Waiting for microphone access"}</span>
-          </div>
+          <PermissionStatusRow
+            granted={Boolean(micGranted)}
+            label={micGranted ? "Microphone permission granted" : "Waiting for microphone access"}
+          />
 
-          <div className="flex items-center justify-between">
-            <Button variant="outline" onClick={handleRequestMic} disabled={isRequestingMic}>
+          <div className="flex items-center justify-between pt-1">
+            <Button
+              variant="outline"
+              onClick={handleRequestMic}
+              disabled={isRequestingMic || Boolean(micGranted)}
+            >
               {isRequestingMic ? (
                 <>
                   <Loader2 className="size-4 animate-spin" />
-                  Requesting...
+                  Requesting…
+                </>
+              ) : micGranted ? (
+                <>
+                  <CheckCircle2 className="size-4 text-emerald-500" />
+                  Granted
                 </>
               ) : (
                 <>
                   <Mic className="size-4" />
-                  Grant Microphone Access
+                  Grant Access
                 </>
               )}
             </Button>
-            <Button onClick={() => setStep(2)} disabled={!micGranted}>
+            <Button
+              onClick={() => setStep(2)}
+              disabled={!micGranted}
+              className={cn(
+                micGranted &&
+                  "bg-amber-500 text-white shadow-sm hover:bg-amber-600 dark:bg-amber-600 dark:hover:bg-amber-500",
+              )}
+            >
               Continue
             </Button>
           </div>
@@ -521,43 +661,47 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
       );
     }
 
+    /* ── Accessibility ── */
     if (step === 2) {
       return (
         <div className="space-y-5">
-          <div className="space-y-2">
-            <h2 className="text-xl font-semibold tracking-tight">Allow accessibility access</h2>
-            <p className="text-sm text-muted-foreground">
-              Buzz uses Accessibility to insert transcribed text at your cursor in other apps.
+          <div className="space-y-1.5">
+            <h2 className="text-xl font-semibold tracking-tight">Accessibility access</h2>
+            <p className="text-sm leading-relaxed text-muted-foreground">
+              Buzz uses Accessibility to paste transcribed text at your cursor in any app.
             </p>
           </div>
 
-          <div className="flex items-center gap-2 rounded-lg border bg-muted/30 px-3 py-2 text-sm">
-            {accessibilityGranted ? (
-              <CheckCircle2 className="size-4 text-emerald-500" />
-            ) : (
-              <Circle className="size-4 text-muted-foreground" />
-            )}
-            <span>
-              {accessibilityGranted
+          <PermissionStatusRow
+            granted={Boolean(accessibilityGranted)}
+            label={
+              accessibilityGranted
                 ? "Accessibility permission granted"
-                : "Waiting for accessibility access"}
-            </span>
-          </div>
+                : "Waiting for accessibility access"
+            }
+          />
 
-          <p className="text-xs text-muted-foreground">
-            macOS requires you to manually enable Buzz in System Settings after opening the panel.
+          <p className="rounded-lg border border-amber-200/60 bg-amber-50/40 px-3 py-2 text-xs leading-relaxed text-amber-800 dark:border-amber-800/30 dark:bg-amber-950/15 dark:text-amber-300/90">
+            macOS requires you to manually enable Buzz in{" "}
+            <span className="font-medium">System Settings → Privacy & Security → Accessibility</span>{" "}
+            after opening the panel.
           </p>
 
-          <div className="flex items-center justify-between">
+          <div className="flex items-center justify-between pt-1">
             <Button
               variant="outline"
               onClick={handleOpenAccessibilitySettings}
-              disabled={isOpeningAccessibilitySettings}
+              disabled={isOpeningAccessibilitySettings || Boolean(accessibilityGranted)}
             >
               {isOpeningAccessibilitySettings ? (
                 <>
                   <Loader2 className="size-4 animate-spin" />
-                  Opening...
+                  Opening…
+                </>
+              ) : accessibilityGranted ? (
+                <>
+                  <CheckCircle2 className="size-4 text-emerald-500" />
+                  Granted
                 </>
               ) : (
                 <>
@@ -566,7 +710,14 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
                 </>
               )}
             </Button>
-            <Button onClick={() => setStep(3)} disabled={!accessibilityGranted}>
+            <Button
+              onClick={() => setStep(3)}
+              disabled={!accessibilityGranted}
+              className={cn(
+                accessibilityGranted &&
+                  "bg-amber-500 text-white shadow-sm hover:bg-amber-600 dark:bg-amber-600 dark:hover:bg-amber-500",
+              )}
+            >
               Continue
             </Button>
           </div>
@@ -574,79 +725,62 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
       );
     }
 
+    /* ── Authentication ── */
     if (step === 3) {
       return (
         <div className="space-y-5">
-          <div className="space-y-2">
-            <h2 className="text-xl font-semibold tracking-tight">Choose authentication</h2>
-            <p className="text-sm text-muted-foreground">
-              Click a card to continue with ChatGPT OAuth or API key authentication.
+          <div className="space-y-1.5">
+            <h2 className="text-xl font-semibold tracking-tight">Connect to OpenAI</h2>
+            <p className="text-sm leading-relaxed text-muted-foreground">
+              Choose how Buzz authenticates with OpenAI for transcription.
             </p>
           </div>
 
-          <div className="grid gap-3 md:grid-cols-2">
-            <button
-              type="button"
-              className="text-left"
-              onClick={() => {
-                void handleStartOauth();
-              }}
+          <div className="grid gap-3 sm:grid-cols-2">
+            <SelectableCard
+              selected={selectedAuthMethod === "oauth"}
+              onClick={() => void handleStartOauth()}
               disabled={isStartingOauth}
             >
-              <Card
-                className={cn(
-                  "h-full border transition-all hover:border-primary/60",
-                  selectedAuthMethod === "oauth" ? "border-primary bg-primary/5" : "border-border"
+              <CardHeader className="pb-2">
+                <CardTitle className="text-sm">Sign in with ChatGPT</CardTitle>
+                <CardDescription className="text-xs">
+                  Opens your browser for a quick OAuth login.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="pt-0 text-xs text-muted-foreground">
+                {isStartingOauth && selectedAuthMethod === "oauth" ? (
+                  <span className="inline-flex items-center gap-2 text-amber-600 dark:text-amber-400">
+                    <Loader2 className="size-3.5 animate-spin" />
+                    Opening browser…
+                  </span>
+                ) : (
+                  "Recommended — no API key needed"
                 )}
-              >
-                <CardHeader className="pb-2">
-                  <CardTitle className="text-sm">Sign in with ChatGPT</CardTitle>
-                  <CardDescription>
-                    Use your ChatGPT account. This opens your browser for OAuth login.
-                  </CardDescription>
-                </CardHeader>
-                <CardContent className="pt-0 text-xs text-muted-foreground">
-                  {isStartingOauth && selectedAuthMethod === "oauth" ? (
-                    <span className="inline-flex items-center gap-2 text-primary">
-                      <Loader2 className="size-3.5 animate-spin" />
-                      Opening browser...
-                    </span>
-                  ) : (
-                    "Click to continue with ChatGPT"
-                  )}
-                </CardContent>
-              </Card>
-            </button>
+              </CardContent>
+            </SelectableCard>
 
-            <button
-              type="button"
-              className="text-left"
+            <SelectableCard
+              selected={selectedAuthMethod === "api_key"}
               onClick={() => {
                 setSelectedAuthMethod("api_key");
                 setErrorMessage("");
               }}
             >
-              <Card
-                className={cn(
-                  "h-full border transition-all hover:border-primary/60",
-                  selectedAuthMethod === "api_key" ? "border-primary bg-primary/5" : "border-border"
-                )}
-              >
-                <CardHeader className="pb-2">
-                  <CardTitle className="text-sm">Use API Key</CardTitle>
-                  <CardDescription>
-                    Paste an OpenAI key directly if you prefer key-based auth.
-                  </CardDescription>
-                </CardHeader>
-                <CardContent className="pt-0 text-xs text-muted-foreground">
-                  Click to enter your API key
-                </CardContent>
-              </Card>
-            </button>
+              <CardHeader className="pb-2">
+                <CardTitle className="text-sm">Use API Key</CardTitle>
+                <CardDescription className="text-xs">
+                  Paste an OpenAI API key if you prefer key-based auth.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="pt-0 text-xs text-muted-foreground">
+                For developers and power users
+              </CardContent>
+            </SelectableCard>
           </div>
 
           {selectedAuthMethod === "api_key" && !hasApiKey && (
-            <div className="space-y-2 rounded-lg border bg-muted/30 p-3">
+            <div className="space-y-2.5 rounded-lg border bg-muted/20 p-3.5">
               <Input
                 value={apiKeyDraft}
                 onChange={(event) => setApiKeyDraft(event.currentTarget.value)}
@@ -656,14 +790,14 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
               />
               <Button
                 size="sm"
-                className="w-full"
+                className="w-full bg-amber-500 text-white hover:bg-amber-600 dark:bg-amber-600 dark:hover:bg-amber-500"
                 onClick={handleSaveApiKey}
                 disabled={isSavingApiKey}
               >
                 {isSavingApiKey ? (
                   <>
                     <Loader2 className="size-4 animate-spin" />
-                    Saving...
+                    Saving…
                   </>
                 ) : (
                   "Save API Key"
@@ -673,126 +807,131 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
           )}
 
           {authConfigured && (
-            <Alert className="border-emerald-500/30 bg-emerald-50/60 dark:bg-emerald-950/20">
-              <AlertDescription className="flex items-center gap-2 text-emerald-700 dark:text-emerald-300">
-                <CheckCircle2 className="size-4" />
-                {authSuccessMessage} Moving to shortcut setup...
-              </AlertDescription>
-            </Alert>
+            <div className="flex items-center gap-2.5 rounded-lg border border-emerald-200 bg-emerald-50/60 px-3.5 py-2.5 text-sm text-emerald-700 dark:border-emerald-800/40 dark:bg-emerald-950/20 dark:text-emerald-300">
+              <CheckCircle2 className="size-4 shrink-0" />
+              <span>{authSuccessMessage} Moving on…</span>
+            </div>
           )}
         </div>
       );
     }
 
+    /* ── Shortcut + Mode ── */
     if (step === 4) {
       return (
         <div className="space-y-6">
-          <div className="space-y-2">
-            <h2 className="text-xl font-semibold tracking-tight">Set your recording controls</h2>
-            <p className="text-sm text-muted-foreground">
-              Choose your mode and shortcut. You can change these anytime in Settings.
+          <div className="space-y-1.5">
+            <h2 className="text-xl font-semibold tracking-tight">Recording controls</h2>
+            <p className="text-sm leading-relaxed text-muted-foreground">
+              Pick your recording mode and shortcut. You can change these anytime in Settings.
             </p>
           </div>
 
-          <div className="space-y-3">
-            <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-              Recording mode
+          {/* Mode selection */}
+          <div className="space-y-2.5">
+            <p className="text-[11px] font-semibold uppercase tracking-widest text-muted-foreground/70">
+              Recording Mode
             </p>
-            <div className="grid gap-3 md:grid-cols-2">
-              <button
-                type="button"
-                className="text-left"
+            <div className="grid gap-3 sm:grid-cols-2">
+              <SelectableCard
+                selected={recordingMode === "toggle"}
                 onClick={() => setRecordingMode("toggle")}
               >
-                <Card
-                  className={cn(
-                    "h-full border transition-all hover:border-primary/60",
-                    recordingMode === "toggle" ? "border-primary bg-primary/5" : "border-border"
-                  )}
-                >
-                  <CardHeader className="pb-2">
-                    <CardTitle className="text-base">Toggle</CardTitle>
-                    <CardDescription>
-                      Press once to start, press again to stop.
-                    </CardDescription>
-                  </CardHeader>
-                </Card>
-              </button>
+                <CardHeader className="p-4">
+                  <CardTitle className="text-sm">Toggle</CardTitle>
+                  <CardDescription className="text-xs">
+                    Press once to start, press again to stop.
+                  </CardDescription>
+                </CardHeader>
+              </SelectableCard>
 
-              <button
-                type="button"
-                className="text-left"
+              <SelectableCard
+                selected={recordingMode === "hold_to_talk"}
                 onClick={() => setRecordingMode("hold_to_talk")}
               >
-                <Card
-                  className={cn(
-                    "h-full border transition-all hover:border-primary/60",
-                    recordingMode === "hold_to_talk" ? "border-primary bg-primary/5" : "border-border"
-                  )}
-                >
-                  <CardHeader className="pb-2">
-                    <CardTitle className="text-base">Hold to Talk</CardTitle>
-                    <CardDescription>
-                      Hold the key while speaking, release to stop.
-                    </CardDescription>
-                  </CardHeader>
-                </Card>
-              </button>
+                <CardHeader className="p-4">
+                  <CardTitle className="text-sm">Hold to Talk</CardTitle>
+                  <CardDescription className="text-xs">
+                    Hold while speaking, release to stop.
+                  </CardDescription>
+                </CardHeader>
+              </SelectableCard>
             </div>
           </div>
 
-          <div className="space-y-3">
-            <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-              Recording shortcut
+          {/* Shortcut selection */}
+          <div className="space-y-2.5">
+            <p className="text-[11px] font-semibold uppercase tracking-widest text-muted-foreground/70">
+              Recording Shortcut
             </p>
 
             <div className="grid gap-2 sm:grid-cols-2">
-              {HOTKEY_PRESETS.map((preset) => (
-                <Button
-                  key={preset.value}
-                  type="button"
-                  variant={selectedShortcutPreset === preset.value ? "default" : "outline"}
-                  className="justify-between"
-                  onClick={() => {
-                    setIsRecordingShortcut(false);
-                    setHotkeyShortcut(preset.value);
-                  }}
-                >
-                  <span>{preset.label}</span>
-                </Button>
-              ))}
+              {HOTKEY_PRESETS.map((preset) => {
+                const isActive = selectedShortcutPreset === preset.value;
+                return (
+                  <Button
+                    key={preset.value}
+                    type="button"
+                    variant={isActive ? "default" : "outline"}
+                    className={cn(
+                      "justify-center font-medium",
+                      isActive &&
+                        "bg-amber-500 text-white hover:bg-amber-600 dark:bg-amber-600 dark:hover:bg-amber-500",
+                    )}
+                    onClick={() => {
+                      setIsRecordingShortcut(false);
+                      setHotkeyShortcut(preset.value);
+                    }}
+                  >
+                    {preset.label}
+                  </Button>
+                );
+              })}
             </div>
 
             <Button
               type="button"
-              variant={isRecordingShortcut || selectedShortcutPreset === CUSTOM_SHORTCUT_PRESET_VALUE ? "default" : "outline"}
-              className="w-full"
+              variant={
+                isRecordingShortcut || selectedShortcutPreset === CUSTOM_SHORTCUT_PRESET_VALUE
+                  ? "default"
+                  : "outline"
+              }
+              className={cn(
+                "w-full",
+                (isRecordingShortcut || selectedShortcutPreset === CUSTOM_SHORTCUT_PRESET_VALUE) &&
+                  "bg-amber-500 text-white hover:bg-amber-600 dark:bg-amber-600 dark:hover:bg-amber-500",
+              )}
               onClick={() => setIsRecordingShortcut((active) => !active)}
             >
-              {isRecordingShortcut ? "Cancel Custom Shortcut" : "Record Custom Shortcut"}
+              {isRecordingShortcut ? "Press your key combination…" : "Record Custom Shortcut"}
             </Button>
 
             {isRecordingShortcut && (
-              <p className="text-xs text-primary">
-                Press the key combination you want to use...
+              <p className="text-center text-xs font-medium text-amber-600 dark:text-amber-400">
+                Listening for key combination…
               </p>
             )}
           </div>
 
-          <div className="space-y-3 rounded-xl border-2 border-primary/35 bg-primary/5 p-4 text-center">
-            <p className="text-base font-semibold text-primary">
-              Press {shortcutInstructionLabel} to start recording
+          {/* Current shortcut preview */}
+          <div className="space-y-3 rounded-xl border border-amber-200/70 bg-amber-50/50 p-5 text-center dark:border-amber-800/30 dark:bg-amber-950/15">
+            <p className="text-xs font-semibold uppercase tracking-widest text-amber-700/70 dark:text-amber-400/70">
+              Your shortcut
             </p>
             <ShortcutKeycaps shortcut={hotkeyShortcut} large />
-            <p className="text-sm text-muted-foreground">{stopInstruction(recordingMode)}</p>
+            <p className="text-xs text-muted-foreground">{stopInstruction(recordingMode)}</p>
           </div>
 
           <div className="flex justify-end">
-            <Button onClick={handleSaveShortcutAndMode} disabled={isSavingShortcutSettings}>
+            <Button
+              onClick={handleSaveShortcutAndMode}
+              disabled={isSavingShortcutSettings}
+              className="bg-amber-500 text-white shadow-sm hover:bg-amber-600 dark:bg-amber-600 dark:hover:bg-amber-500"
+            >
               {isSavingShortcutSettings ? (
                 <>
                   <Loader2 className="size-4 animate-spin" />
-                  Saving...
+                  Saving…
                 </>
               ) : (
                 "Continue"
@@ -803,6 +942,7 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
       );
     }
 
+    /* ── Try It Out ── */
     const modeLabel = recordingMode === "hold_to_talk" ? "Hold to Talk" : "Toggle";
 
     if (step === 5) {
@@ -811,70 +951,96 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
       const hasTranscript = practiceTranscript.length > 0;
 
       return (
-        <div className="space-y-6">
-          <div className="space-y-2">
+        <div className="space-y-5">
+          <div className="space-y-1.5">
             <h2 className="text-xl font-semibold tracking-tight">Try it out</h2>
-            <p className="text-sm text-muted-foreground">
-              Try it now! Press {shortcutInstructionLabel} to record, then speak.
+            <p className="text-sm leading-relaxed text-muted-foreground">
+              Give it a spin — trigger your shortcut, say something, and watch the magic.
             </p>
           </div>
 
-          <div className="space-y-3 rounded-xl border-2 border-primary/35 bg-primary/5 p-4 text-center">
-            <p className="text-base font-semibold text-primary">
-              Try it now! Press {shortcutInstructionLabel} to record, then speak.
+          {/* Prominent instruction box */}
+          <div
+            className={cn(
+              "space-y-3 rounded-xl border p-5 text-center transition-all duration-300",
+              isListening
+                ? "border-amber-400 bg-amber-50/70 animate-recording-pulse dark:border-amber-500/60 dark:bg-amber-950/25"
+                : "border-amber-200/70 bg-amber-50/50 dark:border-amber-800/30 dark:bg-amber-950/15",
+            )}
+          >
+            <p className="text-sm font-semibold text-amber-800 dark:text-amber-300">
+              Press {shortcutInstructionLabel} to start recording
             </p>
             <ShortcutKeycaps shortcut={hotkeyShortcut} large />
-            <p className="text-sm text-muted-foreground">
-              Mode: {modeLabel}. {stopInstruction(recordingMode)} You should also see the Buzz
-              overlay while recording and transcribing.
+            <p className="text-xs text-muted-foreground">
+              {modeLabel} mode &middot; {stopInstruction(recordingMode)}
             </p>
           </div>
 
+          {/* Status pipeline indicators */}
           <div className="grid gap-2 sm:grid-cols-3">
             <div
               className={cn(
-                "rounded-lg border px-3 py-2 text-center text-xs font-medium transition-colors",
-                isListening ? "border-emerald-500/60 bg-emerald-50 dark:bg-emerald-950/20" : "bg-muted/30",
+                "flex items-center justify-center gap-2 rounded-lg border px-3 py-2.5 text-xs font-medium transition-all duration-200",
+                isListening
+                  ? "border-emerald-400/60 bg-emerald-50 text-emerald-700 dark:border-emerald-600/40 dark:bg-emerald-950/25 dark:text-emerald-300"
+                  : "border-border bg-muted/20 text-muted-foreground",
               )}
             >
+              {isListening && <span className="size-1.5 shrink-0 animate-pulse rounded-full bg-emerald-500" />}
               Recording
             </div>
             <div
               className={cn(
-                "rounded-lg border px-3 py-2 text-center text-xs font-medium transition-colors",
-                isTranscribing ? "border-amber-500/60 bg-amber-50 dark:bg-amber-950/20" : "bg-muted/30",
+                "flex items-center justify-center gap-2 rounded-lg border px-3 py-2.5 text-xs font-medium transition-all duration-200",
+                isTranscribing
+                  ? "border-amber-400/60 bg-amber-50 text-amber-700 dark:border-amber-600/40 dark:bg-amber-950/25 dark:text-amber-300"
+                  : "border-border bg-muted/20 text-muted-foreground",
               )}
             >
+              {isTranscribing && <Loader2 className="size-3 shrink-0 animate-spin text-amber-500" />}
               Transcribing
             </div>
             <div
               className={cn(
-                "rounded-lg border px-3 py-2 text-center text-xs font-medium transition-colors",
+                "flex items-center justify-center gap-2 rounded-lg border px-3 py-2.5 text-xs font-medium transition-all duration-200",
                 hasTranscript && !isListening && !isTranscribing
-                  ? "border-primary/60 bg-primary/10"
-                  : "bg-muted/30",
+                  ? "border-emerald-400/60 bg-emerald-50 text-emerald-700 dark:border-emerald-600/40 dark:bg-emerald-950/25 dark:text-emerald-300"
+                  : "border-border bg-muted/20 text-muted-foreground",
               )}
             >
+              {hasTranscript && !isListening && !isTranscribing && (
+                <CheckCircle2 className="size-3 shrink-0 text-emerald-500" />
+              )}
               Result
             </div>
           </div>
 
+          {/* Transcript area */}
           <div className="space-y-2">
-            <div className="flex items-center justify-between gap-3">
-              <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                Test Transcript
+            <div className="flex items-center justify-between">
+              <p className="text-[11px] font-semibold uppercase tracking-widest text-muted-foreground/70">
+                Transcript
               </p>
-              <span className="rounded-full border bg-background px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+              <span
+                className={cn(
+                  "rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider",
+                  practiceStatus === "listening" && "border-emerald-300 bg-emerald-50 text-emerald-600 dark:border-emerald-700 dark:bg-emerald-950/30 dark:text-emerald-400",
+                  practiceStatus === "transcribing" && "border-amber-300 bg-amber-50 text-amber-600 dark:border-amber-700 dark:bg-amber-950/30 dark:text-amber-400",
+                  practiceStatus === "error" && "border-red-300 bg-red-50 text-red-600 dark:border-red-700 dark:bg-red-950/30 dark:text-red-400",
+                  practiceStatus === "idle" && "border-border bg-muted/30 text-muted-foreground",
+                )}
+              >
                 {practiceStatusLabel(practiceStatus)}
               </span>
             </div>
             <textarea
               value={practiceTranscript}
               readOnly
-              placeholder="Your transcript will appear here after you test your shortcut."
-              className="min-h-32 w-full resize-y rounded-md border bg-background px-3 py-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              placeholder="Your transcript will appear here…"
+              className="min-h-[100px] w-full resize-none rounded-lg border bg-muted/15 px-3.5 py-2.5 text-sm leading-relaxed placeholder:text-muted-foreground/40 outline-none transition-colors focus-visible:ring-2 focus-visible:ring-amber-500/30 focus-visible:border-amber-400"
             />
-            <p className="text-xs text-muted-foreground">{practiceStatusDescription}</p>
+            <p className="text-xs leading-relaxed text-muted-foreground">{practiceStatusDescription}</p>
           </div>
 
           {practiceErrorMessage && (
@@ -883,108 +1049,102 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
             </Alert>
           )}
 
-          <div className="flex items-center justify-between">
-            <Button variant="ghost" onClick={handleContinueFromPracticeStep}>
-              Skip
+          <div className="flex items-center justify-between pt-1">
+            <Button variant="ghost" size="sm" onClick={handleContinueFromPracticeStep}>
+              Skip for now
             </Button>
-            <Button onClick={handleContinueFromPracticeStep}>Continue</Button>
+            <Button
+              onClick={handleContinueFromPracticeStep}
+              className="bg-amber-500 text-white shadow-sm hover:bg-amber-600 dark:bg-amber-600 dark:hover:bg-amber-500"
+            >
+              Continue
+            </Button>
           </div>
         </div>
       );
     }
 
+    /* ── All Done ── */
     return (
-      <div className="space-y-6">
-        <div className="space-y-2 text-center">
-          <h2 className="text-2xl font-semibold tracking-tight">You&apos;re all set! 🐝</h2>
-          <p className="text-sm text-muted-foreground">Here&apos;s how to start recording with Buzz.</p>
+      <div className="flex flex-col items-center gap-6 py-2 text-center">
+        <div className="flex size-16 items-center justify-center rounded-2xl bg-amber-100/80 dark:bg-amber-900/25">
+          <span className="text-3xl" role="img" aria-label="party">
+            🎉
+          </span>
         </div>
 
-        <div className="space-y-3 rounded-xl border bg-muted/30 p-4">
-          <div className="space-y-2 text-center">
-            <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-              Shortcut
+        <div className="space-y-2">
+          <h2 className="text-2xl font-semibold tracking-tight">You&apos;re all set!</h2>
+          <p className="mx-auto max-w-xs text-sm leading-relaxed text-muted-foreground">
+            Buzz is ready to go. Here&apos;s your recording shortcut for quick reference.
+          </p>
+        </div>
+
+        <div className="w-full max-w-sm space-y-4 rounded-xl border border-amber-200/70 bg-amber-50/50 p-5 dark:border-amber-800/30 dark:bg-amber-950/15">
+          <div className="space-y-2.5">
+            <p className="text-[11px] font-semibold uppercase tracking-widest text-amber-700/70 dark:text-amber-400/70">
+              Your shortcut
             </p>
             <ShortcutKeycaps shortcut={hotkeyShortcut} large />
           </div>
 
           <div className="flex items-center justify-center">
-            <span className="rounded-full border bg-background px-3 py-1 text-xs font-medium">
-              Mode: {modeLabel}
+            <span className="rounded-full border border-amber-200/60 bg-white/60 px-3 py-1 text-xs font-medium text-amber-800 dark:border-amber-700/40 dark:bg-amber-950/30 dark:text-amber-300">
+              {modeLabel} &middot; {stopInstruction(recordingMode)}
             </span>
           </div>
-
-          <p className="text-center text-sm text-muted-foreground">
-            Press {shortcutInstructionLabel} to start recording. {stopInstruction(recordingMode)}
-          </p>
         </div>
 
-        <div className="flex justify-center">
-          <Button onClick={handleCompleteOnboarding} disabled={isCompleting}>
-            {isCompleting ? (
-              <>
-                <Loader2 className="size-4 animate-spin" />
-                Finalizing...
-              </>
-            ) : (
-              "Start Using Buzz"
-            )}
-          </Button>
-        </div>
+        <Button
+          onClick={handleCompleteOnboarding}
+          disabled={isCompleting}
+          size="lg"
+          className="bg-amber-500 text-white shadow-sm hover:bg-amber-600 dark:bg-amber-600 dark:hover:bg-amber-500"
+        >
+          {isCompleting ? (
+            <>
+              <Loader2 className="size-4 animate-spin" />
+              Finishing up…
+            </>
+          ) : (
+            <>
+              <Sparkles className="size-4" />
+              Start Using Buzz
+            </>
+          )}
+        </Button>
       </div>
     );
   };
 
+  /* ─── Shell layout ───────────────────────────────── */
+
   return (
-    <main className="flex min-h-screen items-center justify-center bg-gradient-to-b from-background to-muted/30 px-4 py-8">
-      <Card className="w-full max-w-2xl border-border/70 shadow-sm">
-        <CardHeader className="space-y-4 pb-1">
-          <div className="flex items-center justify-center gap-2 text-xs text-muted-foreground">
-            <Sparkles className="size-3.5" />
+    <main className="flex min-h-screen items-center justify-center bg-gradient-to-b from-amber-50/50 via-background to-background px-6 py-8 dark:from-amber-950/15 dark:via-background">
+      <Card className="w-full max-w-2xl border-border/50 shadow-lg shadow-amber-900/[0.03] dark:shadow-none">
+        <CardHeader className="space-y-4 pb-0">
+          <div className="flex items-center justify-center gap-1.5 text-[11px] font-medium text-muted-foreground/60">
+            <Sparkles className="size-3" />
             First-run setup
           </div>
 
-          <div className="space-y-2">
-            <div className="flex items-center justify-center gap-2">
-              {STEP_TITLES.map((title, index) => (
-                <div key={title} className="flex items-center gap-2">
-                  <div
-                    className={cn(
-                      "size-2.5 rounded-full transition-colors",
-                      index <= step ? "bg-primary" : "bg-muted"
-                    )}
-                  />
-                  {index < STEP_TITLES.length - 1 && (
-                    <div
-                      className={cn(
-                        "h-px w-5 transition-colors",
-                        index < step ? "bg-primary/70" : "bg-border"
-                      )}
-                    />
-                  )}
-                </div>
-              ))}
-            </div>
-            <p className="text-center text-xs text-muted-foreground">
-              Step {step + 1} of {TOTAL_STEPS}: {STEP_TITLES[step]}
-            </p>
-          </div>
+          <ProgressDots currentStep={step} />
         </CardHeader>
 
-        <CardContent className="py-6">
+        <CardContent className="px-8 py-6">
           {isLoadingInitialState ? (
-            <div className="flex items-center justify-center gap-2 py-12 text-sm text-muted-foreground">
-              <Loader2 className="size-4 animate-spin" />
-              Loading onboarding...
+            <div className="flex flex-col items-center justify-center gap-3 py-16 text-sm text-muted-foreground">
+              <Loader2 className="size-5 animate-spin text-amber-500" />
+              <span>Preparing setup…</span>
             </div>
           ) : (
-            <div key={step} className="animate-in fade-in-0 slide-in-from-bottom-1 duration-300">
+            <div key={step} className="animate-step-enter">
               {renderStep()}
             </div>
           )}
 
           {errorMessage && (
-            <Alert variant="destructive" className="mt-5 py-2">
+            <Alert variant="destructive" className="mt-5 py-2.5">
               <AlertDescription className="text-xs">{errorMessage}</AlertDescription>
             </Alert>
           )}
