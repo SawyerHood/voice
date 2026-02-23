@@ -7,27 +7,31 @@ export const Route = createFileRoute('/')({ component: LandingPage })
 const features = [
   {
     title: 'Instant Transcription',
-    desc: 'OpenAI-powered speech-to-text with realtime streaming. Words appear as fast as you speak.',
+    desc: 'Fast transcription powered by OpenAI. Results appear as soon as you stop talking.',
   },
   {
     title: 'Global Hotkeys',
-    desc: 'Hold-to-talk or toggle. Supports Fn key, Right Alt, and custom combos.',
+    desc: 'Hold to talk or toggle recording with a customizable shortcut, including Fn and Right Alt.',
   },
   {
     title: 'Auto-Insert',
-    desc: 'Text appears right where your cursor is — editors, browsers, Slack, everywhere.',
+    desc: 'Text appears right where your cursor is - editors, browsers, Slack, everywhere.',
   },
   {
     title: 'Flexible Auth',
-    desc: 'Log in with your ChatGPT subscription via OAuth, or bring your own API key.',
+    desc: 'Sign in with your ChatGPT account or use an OpenAI API key. Free with a ChatGPT subscription - much cheaper than WhisperFlow.',
   },
   {
     title: 'Usage Stats',
     desc: 'Track words dictated, words-per-minute, and daily streaks in a built-in dashboard.',
   },
   {
-    title: 'Lightweight & Native',
-    desc: 'A lightweight native macOS app with a tiny footprint and instant launch.',
+    title: 'Lightweight',
+    desc: 'A lightweight native macOS app. No Electron bloat.',
+  },
+  {
+    title: 'Open Source',
+    desc: '100% open source. Read the code, contribute, or fork it.',
   },
 ]
 
@@ -40,12 +44,12 @@ const steps = [
   {
     num: '2',
     title: 'Speak naturally',
-    desc: 'Talk at your normal pace — Buzz streams to OpenAI in realtime.',
+    desc: 'Talk at your normal pace. Buzz sends audio to OpenAI for transcription.',
   },
   {
     num: '3',
     title: 'Text appears',
-    desc: 'Your transcript is inserted at the cursor position, instantly.',
+    desc: 'Your transcript is inserted at the cursor position.',
   },
 ]
 
@@ -56,9 +60,9 @@ function LandingPage() {
     <div className="min-h-screen">
       <Nav />
       <Hero />
-      <ChatGptCallout />
       <Features />
       <HowItWorks />
+      <Pricing />
       <Footer />
     </div>
   )
@@ -95,15 +99,11 @@ function Hero() {
   return (
     <header className="pt-28 pb-24 md:pt-36 md:pb-32">
       <div className="max-w-3xl mx-auto px-6">
-        {/* Header image */}
+        {/* Video placeholder */}
         <div className="mb-12 animate-fade-up">
-          <img
-            src="/header.png"
-            alt="Buzz — a friendly bee mascot with headphones"
-            width={1376}
-            height={768}
-            className="w-full rounded-xl"
-          />
+          <div className="aspect-video w-full max-w-3xl mx-auto rounded-lg bg-gray-100 border border-gray-200 flex items-center justify-center">
+            <span className="text-gray-400 text-sm">Product video coming soon</span>
+          </div>
         </div>
 
         <div className="animate-fade-up" style={{ animationDelay: '100ms' }}>
@@ -111,9 +111,13 @@ function Hero() {
             Voice-to-text, instantly.
           </h1>
 
-          <p className="text-lg text-neutral-500 mb-10 max-w-xl leading-relaxed">
-            A tiny macOS menubar app that turns speech into text — right where
+          <p className="text-lg text-neutral-500 mb-3 max-w-xl leading-relaxed">
+            A tiny macOS menubar app that turns speech into text, right where
             your cursor is. Press a hotkey, talk, done.
+          </p>
+
+          <p className="text-sm text-neutral-400 mb-10">
+            Open source and free to use.
           </p>
 
           <div className="flex items-center gap-3">
@@ -136,29 +140,6 @@ function Hero() {
         </div>
       </div>
     </header>
-  )
-}
-
-/* ─── chatgpt callout ────────────────────────────────────────────── */
-
-function ChatGptCallout() {
-  return (
-    <section className="pb-8 md:pb-12">
-      <div className="max-w-3xl mx-auto px-6">
-        <div className="rounded-2xl border border-neutral-200 bg-white/90 px-6 py-6 sm:px-7 sm:py-7">
-          <p className="text-xs font-medium uppercase tracking-[0.14em] text-neutral-500 mb-3">
-            New: ChatGPT login
-          </p>
-          <h2 className="text-xl sm:text-2xl font-semibold tracking-tight text-neutral-900 leading-snug">
-            Sign in with your ChatGPT account — no API key required.
-          </h2>
-          <p className="mt-3 text-sm sm:text-base text-neutral-600 leading-relaxed max-w-2xl">
-            If you already have a ChatGPT subscription, just log in and start using Buzz immediately.
-            No key generation or copy-paste setup.
-          </p>
-        </div>
-      </div>
-    </section>
   )
 }
 
@@ -216,6 +197,24 @@ function HowItWorks() {
             </li>
           ))}
         </ol>
+      </div>
+    </section>
+  )
+}
+
+/* ─── pricing ────────────────────────────────────────────────────── */
+
+function Pricing() {
+  return (
+    <section className="py-20 md:py-28 border-t border-neutral-200">
+      <div className="max-w-3xl mx-auto px-6">
+        <h2 className="text-2xl font-semibold text-neutral-900 mb-4 tracking-tight">
+          Pricing
+        </h2>
+        <p className="text-sm text-neutral-500 leading-relaxed max-w-xl">
+          Free with a ChatGPT subscription. Or use your own OpenAI API key.
+          Either way, much cheaper than alternatives like WhisperFlow.
+        </p>
       </div>
     </section>
   )
