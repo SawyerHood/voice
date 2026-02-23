@@ -117,6 +117,12 @@ impl VoicePipeline {
             }
         };
 
+        if wav_bytes.is_empty() {
+            info!("recording produced no audio; returning to idle");
+            delegate.set_status(AppStatus::Idle);
+            return;
+        }
+
         let transcript = match delegate.transcribe(wav_bytes).await {
             Ok(transcript) => {
                 info!(
@@ -434,6 +440,28 @@ mod tests {
                 provider: "openai".to_string(),
             }]
         );
+        assert!(delegate.errors().is_empty());
+    }
+
+    #[tokio::test]
+    async fn hotkey_stop_with_empty_audio_skips_transcription_and_returns_to_idle() {
+        let pipeline = VoicePipeline::new(Duration::ZERO);
+        let delegate = MockDelegate {
+            stop_result: Ok(Vec::new()),
+            ..MockDelegate::default()
+        };
+
+        pipeline.handle_hotkey_stopped(&delegate).await;
+
+        assert_eq!(delegate.call_order(), vec!["stop_recording"]);
+        assert!(delegate.start_acknowledgements().is_empty());
+        assert_eq!(delegate.stop_acknowledgements(), vec![true]);
+        assert_eq!(
+            delegate.statuses(),
+            vec![AppStatus::Transcribing, AppStatus::Idle]
+        );
+        assert!(delegate.transcripts().is_empty());
+        assert!(delegate.saved_history().is_empty());
         assert!(delegate.errors().is_empty());
     }
 

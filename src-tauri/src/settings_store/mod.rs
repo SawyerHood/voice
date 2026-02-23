@@ -35,7 +35,7 @@ impl Default for VoiceSettings {
     fn default() -> Self {
         Self {
             hotkey_shortcut: DEFAULT_HOTKEY_SHORTCUT.to_string(),
-            recording_mode: RECORDING_MODE_HOLD_TO_TALK.to_string(),
+            recording_mode: RECORDING_MODE_TOGGLE.to_string(),
             microphone_id: None,
             language: None,
             transcription_provider: DEFAULT_TRANSCRIPTION_PROVIDER.to_string(),
@@ -464,7 +464,7 @@ mod tests {
         let defaults = VoiceSettings::default();
 
         assert_eq!(defaults.hotkey_shortcut, DEFAULT_HOTKEY_SHORTCUT);
-        assert_eq!(defaults.recording_mode, RECORDING_MODE_HOLD_TO_TALK);
+        assert_eq!(defaults.recording_mode, RECORDING_MODE_TOGGLE);
         assert_eq!(defaults.microphone_id, None);
         assert_eq!(defaults.language, None);
         assert_eq!(

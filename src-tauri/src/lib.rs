@@ -67,6 +67,7 @@ const EVENT_TRANSCRIPTION_DELTA: &str = "voice://transcription-delta";
 const EVENT_PIPELINE_ERROR: &str = "voice://pipeline-error";
 const EVENT_OVERLAY_AUDIO_LEVEL: &str = "voice://overlay-audio-level";
 const AUDIO_STREAM_ERROR_RESET_DELAY_MS: u64 = 1_500;
+const MIN_RECORDING_DURATION_MS: u64 = 200;
 const DEFAULT_HISTORY_PAGE_SIZE: usize = 50;
 const OVERLAY_WINDOW_LABEL: &str = "recording-overlay";
 // Keep these values aligned with src/Overlay.css so the overlay shadow remains inside the window.
@@ -91,6 +92,10 @@ fn sanitize_recording_duration_secs(duration_secs: f64) -> f64 {
     } else {
         0.0
     }
+}
+
+fn should_discard_recording(duration_ms: u64) -> bool {
+    duration_ms < MIN_RECORDING_DURATION_MS
 }
 
 fn recording_mode_from_settings_value(value: &str) -> Result<RecordingMode, String> {
@@ -790,6 +795,17 @@ impl VoicePipelineDelegate for AppPipelineDelegate {
             .audio_capture_service
             .stop_recording(self.app.clone())
             .map(|recorded| {
+                if should_discard_recording(recorded.duration_ms) {
+                    debug!(
+                        session_id = ?self.session_id,
+                        duration_ms = recorded.duration_ms,
+                        min_duration_ms = MIN_RECORDING_DURATION_MS,
+                        "recording too short, discarding"
+                    );
+                    self.clear_realtime_session();
+                    self.clear_recording_duration_secs();
+                    return Vec::new();
+                }
                 let duration_secs = recorded.duration_ms as f64 / 1000.0;
                 self.store_recording_duration_secs(Some(duration_secs));
                 recorded.wav_bytes
@@ -2706,6 +2722,19 @@ mod tests {
     fn active_pipeline_session_id_is_none_before_any_session_starts() {
         let runtime = PipelineRuntimeState::default();
         assert_eq!(active_pipeline_session_id(&runtime), None);
+    }
+
+    #[test]
+    fn short_recordings_are_discarded_before_transcription() {
+        assert!(crate::should_discard_recording(
+            crate::MIN_RECORDING_DURATION_MS - 1
+        ));
+        assert!(!crate::should_discard_recording(
+            crate::MIN_RECORDING_DURATION_MS
+        ));
+        assert!(!crate::should_discard_recording(
+            crate::MIN_RECORDING_DURATION_MS + 1
+        ));
     }
 
     #[tokio::test]

@@ -129,7 +129,7 @@ export default function Settings() {
   const skipNextDebouncedSaveRef = useRef(false);
 
   const [hotkeyShortcut, setHotkeyShortcut] = useState("");
-  const [recordingMode, setRecordingMode] = useState<RecordingMode>("hold_to_talk");
+  const [recordingMode, setRecordingMode] = useState<RecordingMode>("toggle");
   const [microphones, setMicrophones] = useState<MicrophoneInfo[]>([]);
   const [microphoneId, setMicrophoneId] = useState("");
   const [language, setLanguage] = useState("");
