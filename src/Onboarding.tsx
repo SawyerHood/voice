@@ -515,7 +515,6 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
   }, []);
 
   const handleStartOauth = useCallback(async () => {
-    setSelectedAuthMethod("oauth");
     setIsStartingOauth(true);
     setErrorMessage("");
     try {
@@ -536,7 +535,6 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
       return;
     }
 
-    setSelectedAuthMethod("api_key");
     setIsSavingApiKey(true);
     setErrorMessage("");
     try {
@@ -598,9 +596,7 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
       return (
         <div className="flex flex-col items-center gap-6 py-4 text-center">
           <div className="flex size-16 items-center justify-center rounded-2xl border bg-muted/30">
-            <span className="text-3xl" role="img" aria-label="bee">
-              🐝
-            </span>
+            <img src="/icon.png" alt="Buzz app icon" className="size-10 rounded-lg" />
           </div>
           <div className="space-y-2">
             <h2 className="text-2xl font-semibold tracking-tight">Welcome to Buzz</h2>
@@ -743,8 +739,10 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
           <div className="grid gap-3 sm:grid-cols-2">
             <SelectableCard
               selected={selectedAuthMethod === "oauth"}
-              onClick={() => void handleStartOauth()}
-              disabled={isStartingOauth}
+              onClick={() => {
+                setSelectedAuthMethod("oauth");
+                setErrorMessage("");
+              }}
             >
               <CardHeader className="pb-2">
                 <CardTitle className="text-sm">Sign in with ChatGPT</CardTitle>
@@ -752,16 +750,6 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
                   Opens your browser for a quick OAuth login.
                 </CardDescription>
               </CardHeader>
-              <CardContent className="pt-0 text-xs text-muted-foreground">
-                {isStartingOauth && selectedAuthMethod === "oauth" ? (
-                  <span className="inline-flex items-center gap-2 text-primary">
-                    <Loader2 className="size-3.5 animate-spin" />
-                    Opening browser…
-                  </span>
-                ) : (
-                  "Recommended - no API key needed"
-                )}
-              </CardContent>
             </SelectableCard>
 
             <SelectableCard
@@ -777,11 +765,28 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
                   Paste an OpenAI API key if you prefer key-based auth.
                 </CardDescription>
               </CardHeader>
-              <CardContent className="pt-0 text-xs text-muted-foreground">
-                For developers and power users
-              </CardContent>
             </SelectableCard>
           </div>
+
+          {selectedAuthMethod === "oauth" && (
+            <div className="space-y-2.5 rounded-lg border bg-muted/20 p-3.5">
+              <Button
+                size="sm"
+                className="w-full"
+                onClick={handleStartOauth}
+                disabled={isStartingOauth}
+              >
+                {isStartingOauth ? (
+                  <>
+                    <Loader2 className="size-4 animate-spin" />
+                    Opening browser…
+                  </>
+                ) : (
+                  "Sign in with ChatGPT"
+                )}
+              </Button>
+            </div>
+          )}
 
           {shouldShowOnboardingApiKeyInput(selectedAuthMethod) && (
             <div className="space-y-2.5 rounded-lg border bg-muted/20 p-3.5">
@@ -1131,8 +1136,7 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
     <main className="flex min-h-screen items-center justify-center bg-background px-6 py-8">
       <Card className="w-full max-w-2xl border-border/60 bg-card">
         <CardHeader className="space-y-4 pb-0">
-          <div className="flex items-center justify-center gap-1.5 text-[11px] font-medium text-muted-foreground/60">
-            <Sparkles className="size-3" />
+          <div className="flex items-center justify-center text-[11px] font-medium text-muted-foreground/60">
             First-run setup
           </div>
 
