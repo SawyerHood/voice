@@ -588,8 +588,8 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
     if (step === 0) {
       return (
         <div className="flex flex-col items-center gap-4 py-1 text-center">
-          <div className="flex size-12 items-center justify-center rounded-xl border bg-muted/30">
-            <img src="/icon.png" alt="Buzz app icon" className="size-20 rounded-xl" />
+          <div className="flex items-center justify-center">
+            <img src="/icon.png" alt="Buzz app icon" className="size-16 rounded-xl" />
           </div>
           <div className="space-y-1">
             <h2 className="text-xl font-semibold tracking-tight">Welcome to Buzz</h2>
