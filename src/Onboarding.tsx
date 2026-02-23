@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { CheckCircle2, Circle, Loader2, Mic, Shield, Sparkles } from "lucide-react";
+import { CheckCircle2, ChevronLeft, Circle, Loader2, Mic, Shield, Sparkles } from "lucide-react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -117,10 +117,7 @@ function ShortcutKeycaps({
           <kbd
             className={cn(
               "inline-flex items-center justify-center rounded-lg border font-mono font-semibold",
-              "border-gray-300 bg-gradient-to-b from-white to-gray-50 text-gray-800",
-              "shadow-[0_1px_0_1px_rgb(209,213,219),0_1px_2px_rgba(0,0,0,0.06)]",
-              "dark:border-gray-600 dark:from-gray-800 dark:to-gray-850 dark:text-gray-200",
-              "dark:shadow-[0_1px_0_1px_rgb(75,85,99),0_1px_2px_rgba(0,0,0,0.2)]",
+              "border-border bg-background text-foreground shadow-sm",
               large
                 ? "min-w-[52px] px-3.5 py-2 text-sm tracking-wide"
                 : "min-w-[30px] px-2 py-0.5 text-xs",
@@ -165,8 +162,8 @@ function SelectableCard({
         className={cn(
           "h-full border transition-all duration-200 cursor-pointer",
           selected
-            ? "border-amber-400 bg-amber-50/70 ring-1 ring-amber-400/25 dark:border-amber-500/60 dark:bg-amber-950/25"
-            : "border-border hover:border-amber-300/60 hover:bg-amber-50/30 dark:hover:border-amber-600/40 dark:hover:bg-amber-950/15",
+            ? "border-primary/50 bg-accent/40 ring-1 ring-primary/20"
+            : "border-border hover:border-primary/30 hover:bg-accent/20",
         )}
       >
         {children}
@@ -186,16 +183,16 @@ function ProgressDots({ currentStep }: { currentStep: number }) {
             <div
               className={cn(
                 "size-2 rounded-full transition-all duration-300",
-                index < currentStep && "bg-amber-500",
-                index === currentStep && "bg-amber-500 ring-[3px] ring-amber-500/20",
-                index > currentStep && "bg-border",
+                index < currentStep && "bg-primary/70",
+                index === currentStep && "bg-primary ring-[2px] ring-primary/20",
+                index > currentStep && "bg-muted",
               )}
             />
             {index < STEP_TITLES.length - 1 && (
               <div
                 className={cn(
                   "h-px w-5 transition-all duration-300",
-                  index < currentStep ? "bg-amber-400/60" : "bg-border",
+                  index < currentStep ? "bg-primary/40" : "bg-border",
                 )}
               />
             )}
@@ -259,6 +256,7 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
   const [isSavingApiKey, setIsSavingApiKey] = useState(false);
   const [isSavingShortcutSettings, setIsSavingShortcutSettings] = useState(false);
   const [isCompleting, setIsCompleting] = useState(false);
+  const [authActionCompleted, setAuthActionCompleted] = useState(false);
   const [practiceStatus, setPracticeStatus] = useState<OnboardingPracticeStatus>("idle");
   const [practiceTranscript, setPracticeTranscript] = useState("");
   const [practiceErrorMessage, setPracticeErrorMessage] = useState("");
@@ -362,14 +360,20 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
   }, [refreshPermissionStatus]);
 
   useEffect(() => {
-    if (step !== 3 || !authConfigured) return undefined;
+    if (step !== 3 || !authConfigured || !authActionCompleted) return undefined;
 
     const timeoutId = window.setTimeout(() => {
       setStep((current) => (current === 3 ? 4 : current));
-    }, 450);
+      setAuthActionCompleted(false);
+    }, 250);
 
     return () => window.clearTimeout(timeoutId);
-  }, [authConfigured, step]);
+  }, [authActionCompleted, authConfigured, step]);
+
+  useEffect(() => {
+    if (step === 3 || !authActionCompleted) return;
+    setAuthActionCompleted(false);
+  }, [authActionCompleted, step]);
 
   useEffect(() => {
     if (!isRecordingShortcut || step !== 4) {
@@ -505,6 +509,11 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
     }
   }, [refreshPermissionStatus]);
 
+  const handleBack = useCallback(() => {
+    setErrorMessage("");
+    setStep((current) => Math.max(0, current - 1));
+  }, []);
+
   const handleStartOauth = useCallback(async () => {
     setSelectedAuthMethod("oauth");
     setIsStartingOauth(true);
@@ -512,6 +521,7 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
     try {
       const status = await invoke<ChatGptAuthStatus>("start_oauth_login");
       setChatgptAuthStatus(status);
+      setAuthActionCompleted(true);
     } catch (error) {
       setErrorMessage(toErrorMessage(error, "ChatGPT login failed."));
     } finally {
@@ -533,6 +543,7 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
       await invoke("save_api_key", { provider: OPENAI_PROVIDER, key });
       setHasApiKey(true);
       setApiKeyDraft("");
+      setAuthActionCompleted(true);
     } catch (error) {
       setErrorMessage(toErrorMessage(error, "Unable to save API key."));
     } finally {
@@ -586,7 +597,7 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
     if (step === 0) {
       return (
         <div className="flex flex-col items-center gap-6 py-4 text-center">
-          <div className="flex size-16 items-center justify-center rounded-2xl bg-amber-100/80 dark:bg-amber-900/25">
+          <div className="flex size-16 items-center justify-center rounded-2xl border bg-muted/30">
             <span className="text-3xl" role="img" aria-label="bee">
               🐝
             </span>
@@ -597,12 +608,7 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
               Voice-to-text, anywhere on your Mac. Let&apos;s get you set up in about a minute.
             </p>
           </div>
-          <Button
-            onClick={() => setStep(1)}
-            className="bg-amber-500 text-white shadow-sm hover:bg-amber-600 dark:bg-amber-600 dark:hover:bg-amber-500"
-          >
-            Get Started
-          </Button>
+          <Button onClick={() => setStep(1)}>Get Started</Button>
         </div>
       );
     }
@@ -623,7 +629,7 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
             label={micGranted ? "Microphone permission granted" : "Waiting for microphone access"}
           />
 
-          <div className="flex items-center justify-between pt-1">
+          <div className="flex justify-start pt-1">
             <Button
               variant="outline"
               onClick={handleRequestMic}
@@ -646,14 +652,13 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
                 </>
               )}
             </Button>
-            <Button
-              onClick={() => setStep(2)}
-              disabled={!micGranted}
-              className={cn(
-                micGranted &&
-                  "bg-amber-500 text-white shadow-sm hover:bg-amber-600 dark:bg-amber-600 dark:hover:bg-amber-500",
-              )}
-            >
+          </div>
+          <div className="flex items-center justify-between pt-1">
+            <Button variant="ghost" onClick={handleBack}>
+              <ChevronLeft className="size-4" />
+              Back
+            </Button>
+            <Button onClick={() => setStep(2)} disabled={!micGranted}>
               Continue
             </Button>
           </div>
@@ -681,13 +686,13 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
             }
           />
 
-          <p className="rounded-lg border border-amber-200/60 bg-amber-50/40 px-3 py-2 text-xs leading-relaxed text-amber-800 dark:border-amber-800/30 dark:bg-amber-950/15 dark:text-amber-300/90">
+          <p className="rounded-lg border bg-muted/20 px-3 py-2 text-xs leading-relaxed text-muted-foreground">
             macOS requires you to manually enable Buzz in{" "}
             <span className="font-medium">System Settings → Privacy & Security → Accessibility</span>{" "}
             after opening the panel.
           </p>
 
-          <div className="flex items-center justify-between pt-1">
+          <div className="flex justify-start pt-1">
             <Button
               variant="outline"
               onClick={handleOpenAccessibilitySettings}
@@ -710,14 +715,13 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
                 </>
               )}
             </Button>
-            <Button
-              onClick={() => setStep(3)}
-              disabled={!accessibilityGranted}
-              className={cn(
-                accessibilityGranted &&
-                  "bg-amber-500 text-white shadow-sm hover:bg-amber-600 dark:bg-amber-600 dark:hover:bg-amber-500",
-              )}
-            >
+          </div>
+          <div className="flex items-center justify-between pt-1">
+            <Button variant="ghost" onClick={handleBack}>
+              <ChevronLeft className="size-4" />
+              Back
+            </Button>
+            <Button onClick={() => setStep(3)} disabled={!accessibilityGranted}>
               Continue
             </Button>
           </div>
@@ -750,7 +754,7 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
               </CardHeader>
               <CardContent className="pt-0 text-xs text-muted-foreground">
                 {isStartingOauth && selectedAuthMethod === "oauth" ? (
-                  <span className="inline-flex items-center gap-2 text-amber-600 dark:text-amber-400">
+                  <span className="inline-flex items-center gap-2 text-primary">
                     <Loader2 className="size-3.5 animate-spin" />
                     Opening browser…
                   </span>
@@ -790,7 +794,7 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
               />
               <Button
                 size="sm"
-                className="w-full bg-amber-500 text-white hover:bg-amber-600 dark:bg-amber-600 dark:hover:bg-amber-500"
+                className="w-full"
                 onClick={handleSaveApiKey}
                 disabled={isSavingApiKey}
               >
@@ -809,9 +813,19 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
           {authConfigured && (
             <div className="flex items-center gap-2.5 rounded-lg border border-emerald-200 bg-emerald-50/60 px-3.5 py-2.5 text-sm text-emerald-700 dark:border-emerald-800/40 dark:bg-emerald-950/20 dark:text-emerald-300">
               <CheckCircle2 className="size-4 shrink-0" />
-              <span>{authSuccessMessage} Moving on…</span>
+              <span>{authSuccessMessage}</span>
             </div>
           )}
+
+          <div className="flex items-center justify-between pt-1">
+            <Button variant="ghost" onClick={handleBack}>
+              <ChevronLeft className="size-4" />
+              Back
+            </Button>
+            <Button onClick={() => setStep(4)} disabled={!authConfigured}>
+              Continue
+            </Button>
+          </div>
         </div>
       );
     }
@@ -873,11 +887,7 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
                     key={preset.value}
                     type="button"
                     variant={isActive ? "default" : "outline"}
-                    className={cn(
-                      "justify-center font-medium",
-                      isActive &&
-                        "bg-amber-500 text-white hover:bg-amber-600 dark:bg-amber-600 dark:hover:bg-amber-500",
-                    )}
+                    className="justify-center font-medium"
                     onClick={() => {
                       setIsRecordingShortcut(false);
                       setHotkeyShortcut(preset.value);
@@ -896,37 +906,36 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
                   ? "default"
                   : "outline"
               }
-              className={cn(
-                "w-full",
-                (isRecordingShortcut || selectedShortcutPreset === CUSTOM_SHORTCUT_PRESET_VALUE) &&
-                  "bg-amber-500 text-white hover:bg-amber-600 dark:bg-amber-600 dark:hover:bg-amber-500",
-              )}
+              className="w-full"
               onClick={() => setIsRecordingShortcut((active) => !active)}
             >
               {isRecordingShortcut ? "Press your key combination…" : "Record Custom Shortcut"}
             </Button>
 
             {isRecordingShortcut && (
-              <p className="text-center text-xs font-medium text-amber-600 dark:text-amber-400">
+              <p className="text-center text-xs font-medium text-primary">
                 Listening for key combination…
               </p>
             )}
           </div>
 
           {/* Current shortcut preview */}
-          <div className="space-y-3 rounded-xl border border-amber-200/70 bg-amber-50/50 p-5 text-center dark:border-amber-800/30 dark:bg-amber-950/15">
-            <p className="text-xs font-semibold uppercase tracking-widest text-amber-700/70 dark:text-amber-400/70">
+          <div className="space-y-3 rounded-xl border bg-muted/20 p-5 text-center">
+            <p className="text-xs font-semibold uppercase tracking-widest text-muted-foreground/80">
               Your shortcut
             </p>
             <ShortcutKeycaps shortcut={hotkeyShortcut} large />
             <p className="text-xs text-muted-foreground">{stopInstruction(recordingMode)}</p>
           </div>
 
-          <div className="flex justify-end">
+          <div className="flex items-center justify-between">
+            <Button variant="ghost" onClick={handleBack}>
+              <ChevronLeft className="size-4" />
+              Back
+            </Button>
             <Button
               onClick={handleSaveShortcutAndMode}
               disabled={isSavingShortcutSettings}
-              className="bg-amber-500 text-white shadow-sm hover:bg-amber-600 dark:bg-amber-600 dark:hover:bg-amber-500"
             >
               {isSavingShortcutSettings ? (
                 <>
@@ -964,11 +973,11 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
             className={cn(
               "space-y-3 rounded-xl border p-5 text-center transition-all duration-300",
               isListening
-                ? "border-amber-400 bg-amber-50/70 animate-recording-pulse dark:border-amber-500/60 dark:bg-amber-950/25"
-                : "border-amber-200/70 bg-amber-50/50 dark:border-amber-800/30 dark:bg-amber-950/15",
+                ? "border-primary/60 bg-primary/5"
+                : "border-border bg-muted/20",
             )}
           >
-            <p className="text-sm font-semibold text-amber-800 dark:text-amber-300">
+            <p className="text-sm font-semibold text-foreground">
               Press {shortcutInstructionLabel} to start recording
             </p>
             <ShortcutKeycaps shortcut={hotkeyShortcut} large />
@@ -994,11 +1003,11 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
               className={cn(
                 "flex items-center justify-center gap-2 rounded-lg border px-3 py-2.5 text-xs font-medium transition-all duration-200",
                 isTranscribing
-                  ? "border-amber-400/60 bg-amber-50 text-amber-700 dark:border-amber-600/40 dark:bg-amber-950/25 dark:text-amber-300"
+                  ? "border-primary/40 bg-primary/10 text-foreground"
                   : "border-border bg-muted/20 text-muted-foreground",
               )}
             >
-              {isTranscribing && <Loader2 className="size-3 shrink-0 animate-spin text-amber-500" />}
+              {isTranscribing && <Loader2 className="size-3 shrink-0 animate-spin text-primary" />}
               Transcribing
             </div>
             <div
@@ -1026,7 +1035,7 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
                 className={cn(
                   "rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider",
                   practiceStatus === "listening" && "border-emerald-300 bg-emerald-50 text-emerald-600 dark:border-emerald-700 dark:bg-emerald-950/30 dark:text-emerald-400",
-                  practiceStatus === "transcribing" && "border-amber-300 bg-amber-50 text-amber-600 dark:border-amber-700 dark:bg-amber-950/30 dark:text-amber-400",
+                  practiceStatus === "transcribing" && "border-primary/40 bg-primary/10 text-foreground",
                   practiceStatus === "error" && "border-red-300 bg-red-50 text-red-600 dark:border-red-700 dark:bg-red-950/30 dark:text-red-400",
                   practiceStatus === "idle" && "border-border bg-muted/30 text-muted-foreground",
                 )}
@@ -1038,7 +1047,7 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
               value={practiceTranscript}
               readOnly
               placeholder="Your transcript will appear here…"
-              className="min-h-[100px] w-full resize-none rounded-lg border bg-muted/15 px-3.5 py-2.5 text-sm leading-relaxed placeholder:text-muted-foreground/40 outline-none transition-colors focus-visible:ring-2 focus-visible:ring-amber-500/30 focus-visible:border-amber-400"
+              className="min-h-[100px] w-full resize-none rounded-lg border bg-muted/15 px-3.5 py-2.5 text-sm leading-relaxed placeholder:text-muted-foreground/40 outline-none transition-colors focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30"
             />
             <p className="text-xs leading-relaxed text-muted-foreground">{practiceStatusDescription}</p>
           </div>
@@ -1050,13 +1059,11 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
           )}
 
           <div className="flex items-center justify-between pt-1">
-            <Button variant="ghost" size="sm" onClick={handleContinueFromPracticeStep}>
-              Skip for now
+            <Button variant="ghost" onClick={handleBack}>
+              <ChevronLeft className="size-4" />
+              Back
             </Button>
-            <Button
-              onClick={handleContinueFromPracticeStep}
-              className="bg-amber-500 text-white shadow-sm hover:bg-amber-600 dark:bg-amber-600 dark:hover:bg-amber-500"
-            >
+            <Button onClick={handleContinueFromPracticeStep}>
               Continue
             </Button>
           </div>
@@ -1067,7 +1074,7 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
     /* ── All Done ── */
     return (
       <div className="flex flex-col items-center gap-6 py-2 text-center">
-        <div className="flex size-16 items-center justify-center rounded-2xl bg-amber-100/80 dark:bg-amber-900/25">
+        <div className="flex size-16 items-center justify-center rounded-2xl border bg-muted/30">
           <span className="text-3xl" role="img" aria-label="party">
             🎉
           </span>
@@ -1080,39 +1087,40 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
           </p>
         </div>
 
-        <div className="w-full max-w-sm space-y-4 rounded-xl border border-amber-200/70 bg-amber-50/50 p-5 dark:border-amber-800/30 dark:bg-amber-950/15">
+        <div className="w-full max-w-sm space-y-4 rounded-xl border bg-muted/20 p-5">
           <div className="space-y-2.5">
-            <p className="text-[11px] font-semibold uppercase tracking-widest text-amber-700/70 dark:text-amber-400/70">
+            <p className="text-[11px] font-semibold uppercase tracking-widest text-muted-foreground/80">
               Your shortcut
             </p>
             <ShortcutKeycaps shortcut={hotkeyShortcut} large />
           </div>
 
           <div className="flex items-center justify-center">
-            <span className="rounded-full border border-amber-200/60 bg-white/60 px-3 py-1 text-xs font-medium text-amber-800 dark:border-amber-700/40 dark:bg-amber-950/30 dark:text-amber-300">
+            <span className="rounded-full border bg-background/70 px-3 py-1 text-xs font-medium text-foreground/90">
               {modeLabel} &middot; {stopInstruction(recordingMode)}
             </span>
           </div>
         </div>
 
-        <Button
-          onClick={handleCompleteOnboarding}
-          disabled={isCompleting}
-          size="lg"
-          className="bg-amber-500 text-white shadow-sm hover:bg-amber-600 dark:bg-amber-600 dark:hover:bg-amber-500"
-        >
-          {isCompleting ? (
-            <>
-              <Loader2 className="size-4 animate-spin" />
-              Finishing up…
-            </>
-          ) : (
-            <>
-              <Sparkles className="size-4" />
-              Start Using Buzz
-            </>
-          )}
-        </Button>
+        <div className="flex w-full max-w-sm items-center justify-between">
+          <Button variant="ghost" onClick={handleBack}>
+            <ChevronLeft className="size-4" />
+            Back
+          </Button>
+          <Button onClick={handleCompleteOnboarding} disabled={isCompleting} size="lg">
+            {isCompleting ? (
+              <>
+                <Loader2 className="size-4 animate-spin" />
+                Finishing up…
+              </>
+            ) : (
+              <>
+                <Sparkles className="size-4" />
+                Start Using Buzz
+              </>
+            )}
+          </Button>
+        </div>
       </div>
     );
   };
@@ -1120,8 +1128,8 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
   /* ─── Shell layout ───────────────────────────────── */
 
   return (
-    <main className="flex min-h-screen items-center justify-center bg-gradient-to-b from-amber-50/50 via-background to-background px-6 py-8 dark:from-amber-950/15 dark:via-background">
-      <Card className="w-full max-w-2xl border-border/50 shadow-lg shadow-amber-900/[0.03] dark:shadow-none">
+    <main className="flex min-h-screen items-center justify-center bg-background px-6 py-8">
+      <Card className="w-full max-w-2xl border-border/60 bg-card">
         <CardHeader className="space-y-4 pb-0">
           <div className="flex items-center justify-center gap-1.5 text-[11px] font-medium text-muted-foreground/60">
             <Sparkles className="size-3" />
@@ -1134,7 +1142,7 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
         <CardContent className="px-8 py-6">
           {isLoadingInitialState ? (
             <div className="flex flex-col items-center justify-center gap-3 py-16 text-sm text-muted-foreground">
-              <Loader2 className="size-5 animate-spin text-amber-500" />
+              <Loader2 className="size-5 animate-spin text-primary" />
               <span>Preparing setup…</span>
             </div>
           ) : (
