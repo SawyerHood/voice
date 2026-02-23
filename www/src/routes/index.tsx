@@ -11,7 +11,7 @@ const features = [
   },
   {
     title: 'Global Hotkeys',
-    desc: 'Hold-to-talk, toggle, or double-tap. Supports Fn key, Right Alt, and custom combos.',
+    desc: 'Hold-to-talk or toggle. Supports Fn key, Right Alt, and custom combos.',
   },
   {
     title: 'Auto-Insert',

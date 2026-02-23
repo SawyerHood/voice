@@ -17,7 +17,7 @@ Buzz is a macOS-native menubar app that turns speech into text wherever your cur
 
 ## Key Features
 
-- Global hotkey support with hold-to-talk, toggle, and double-tap modes
+- Global hotkey support with hold-to-talk and toggle modes
 - OpenAI transcription with `gpt-4o-mini-transcribe`
 - Realtime streaming audio input via WebSocket for low latency
 - ChatGPT OAuth login (use your ChatGPT subscription, no API key required)

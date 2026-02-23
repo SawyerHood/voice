@@ -34,7 +34,7 @@ describe("settingsUtils", () => {
 
   it("normalizes recording mode with a safe fallback", () => {
     expect(normalizeRecordingMode("toggle")).toBe("toggle");
-    expect(normalizeRecordingMode("double_tap_toggle")).toBe("double_tap_toggle");
+    expect(normalizeRecordingMode("legacy_mode")).toBe("hold_to_talk");
     expect(normalizeRecordingMode("anything-else")).toBe("hold_to_talk");
   });
 

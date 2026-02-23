@@ -111,7 +111,6 @@ const RECORDING_MODE_OPTIONS: ReadonlyArray<{
 }> = [
   { value: "hold_to_talk", label: "Hold-to-talk" },
   { value: "toggle", label: "Toggle" },
-  { value: "double_tap_toggle", label: "Double-tap toggle" },
 ];
 
 export default function Settings() {
@@ -612,11 +611,6 @@ export default function Settings() {
                 </button>
               ))}
             </div>
-            {recordingMode === "double_tap_toggle" && (
-              <p className="text-[11px] text-muted-foreground">
-                Press the shortcut twice quickly to start recording, then press once to stop.
-              </p>
-            )}
           </div>
 
           {/* Microphone */}

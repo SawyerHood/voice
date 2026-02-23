@@ -1,7 +1,7 @@
 export const DEFAULT_HOTKEY_SHORTCUT = "Alt+Space";
 export const OPENAI_PROVIDER = "openai";
 
-export type RecordingMode = "hold_to_talk" | "toggle" | "double_tap_toggle";
+export type RecordingMode = "hold_to_talk" | "toggle";
 
 type ShortcutCaptureEvent = Pick<
   KeyboardEvent,
@@ -39,7 +39,6 @@ export function normalizeOptionalText(value: string): string | null {
 
 export function normalizeRecordingMode(value: string): RecordingMode {
   if (value === "toggle") return "toggle";
-  if (value === "double_tap_toggle") return "double_tap_toggle";
   return "hold_to_talk";
 }
 

@@ -13,7 +13,6 @@ use tracing::{debug, info, warn};
 pub const DEFAULT_HOTKEY_SHORTCUT: &str = "Alt+Space";
 pub const RECORDING_MODE_HOLD_TO_TALK: &str = "hold_to_talk";
 pub const RECORDING_MODE_TOGGLE: &str = "toggle";
-pub const RECORDING_MODE_DOUBLE_TAP_TOGGLE: &str = "double_tap_toggle";
 pub const DEFAULT_TRANSCRIPTION_PROVIDER: &str = "openai";
 
 const SETTINGS_FILE_NAME: &str = "settings.json";
@@ -383,11 +382,9 @@ fn normalize_required_string(value: String, field_name: &str) -> Result<String, 
 fn normalize_recording_mode(value: String) -> Result<String, String> {
     let normalized = normalize_required_string(value, "recording_mode")?.to_lowercase();
     match normalized.as_str() {
-        RECORDING_MODE_HOLD_TO_TALK | RECORDING_MODE_TOGGLE | RECORDING_MODE_DOUBLE_TAP_TOGGLE => {
-            Ok(normalized)
-        }
+        RECORDING_MODE_HOLD_TO_TALK | RECORDING_MODE_TOGGLE => Ok(normalized),
         _ => Err(format!(
-            "Unsupported recording mode `{normalized}`. Expected `{RECORDING_MODE_HOLD_TO_TALK}`, `{RECORDING_MODE_TOGGLE}`, or `{RECORDING_MODE_DOUBLE_TAP_TOGGLE}`"
+            "Unsupported recording mode `{normalized}`. Expected `{RECORDING_MODE_HOLD_TO_TALK}` or `{RECORDING_MODE_TOGGLE}`"
         )),
     }
 }
@@ -592,21 +589,21 @@ mod tests {
     }
 
     #[test]
-    fn update_accepts_double_tap_toggle_recording_mode() {
+    fn update_accepts_hold_to_talk_recording_mode() {
         let store = SettingsStore::new();
-        let settings_path = unique_settings_path("double-tap-mode");
+        let settings_path = unique_settings_path("hold-to-talk-mode");
 
         let updated = store
             .update_at_path(
                 &settings_path,
                 VoiceSettingsUpdate {
-                    recording_mode: Some(RECORDING_MODE_DOUBLE_TAP_TOGGLE.to_string()),
+                    recording_mode: Some(RECORDING_MODE_HOLD_TO_TALK.to_string()),
                     ..VoiceSettingsUpdate::default()
                 },
             )
-            .expect("double tap toggle mode should be supported");
+            .expect("hold-to-talk mode should be supported");
 
-        assert_eq!(updated.recording_mode, RECORDING_MODE_DOUBLE_TAP_TOGGLE);
+        assert_eq!(updated.recording_mode, RECORDING_MODE_HOLD_TO_TALK);
         cleanup_settings_path(&settings_path);
     }
 
