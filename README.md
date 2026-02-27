@@ -4,7 +4,7 @@
 
 # Buzz 🐝
 
-[![CI](https://github.com/SawyerHood/voice/actions/workflows/ci.yml/badge.svg)](https://github.com/SawyerHood/voice/actions/workflows/ci.yml)
+[![CI](https://github.com/SawyerHood/buzz/actions/workflows/ci.yml/badge.svg)](https://github.com/SawyerHood/buzz/actions/workflows/ci.yml)
 
 Voice-to-text with a quick buzz.
 
@@ -78,7 +78,7 @@ Build output:
 
 Buzz uses Tauri's updater plugin and checks:
 
-- `https://github.com/SawyerHood/voice/releases/latest/download/latest.json`
+- `https://github.com/SawyerHood/buzz/releases/latest/download/latest.json`
 
 ### Signing prerequisites
 
@@ -102,7 +102,7 @@ When signing is configured, Tauri generates updater signatures (`.sig`) and upda
   "platforms": {
     "darwin-aarch64": {
       "signature": "...",
-      "url": "https://github.com/SawyerHood/voice/releases/download/v0.1.0/Buzz.app.tar.gz.sig"
+      "url": "https://github.com/SawyerHood/buzz/releases/download/v0.1.0/Buzz.app.tar.gz.sig"
     }
   }
 }

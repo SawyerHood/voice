@@ -53,4 +53,4 @@ gh release create "$TAG" $UPLOAD_ARGS \
   --latest
 
 echo "✅ GitHub Release $TAG created and artifacts uploaded!"
-echo "🔗 https://github.com/SawyerHood/voice/releases/tag/$TAG"
+echo "🔗 https://github.com/SawyerHood/buzz/releases/tag/$TAG"
