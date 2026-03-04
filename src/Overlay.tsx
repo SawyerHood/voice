@@ -7,14 +7,14 @@ import "./Overlay.css";
 type AppStatus = "idle" | "listening" | "transcribing" | "error";
 
 const EVENT_STATUS_CHANGED = "voice://status-changed";
-const COMMAND_CANCEL_RECORDING = "cancel_recording";
+const COMMAND_COMPLETE_RECORDING = "complete_recording";
 
 function Overlay() {
   const [status, setStatus] = useState<AppStatus>("idle");
   const [elapsedMs, setElapsedMs] = useState(0);
   const statusRef = useRef<AppStatus>("idle");
   const startedAtRef = useRef<number | null>(null);
-  const cancelInFlightRef = useRef(false);
+  const stopInFlightRef = useRef(false);
 
   useEffect(() => {
     let isMounted = true;
@@ -109,17 +109,17 @@ function Overlay() {
 
   const isListening = status === "listening";
   const isTranscribing = status === "transcribing";
-  const canCancel = isListening || isTranscribing;
+  const canStop = isListening;
   const statusLabel = isListening ? "Listening..." : isTranscribing ? "Transcribing..." : "";
 
-  const handleCancel = () => {
-    if (cancelInFlightRef.current) {
+  const handleStop = () => {
+    if (!canStop || stopInFlightRef.current) {
       return;
     }
 
-    cancelInFlightRef.current = true;
-    void invoke(COMMAND_CANCEL_RECORDING).finally(() => {
-      cancelInFlightRef.current = false;
+    stopInFlightRef.current = true;
+    void invoke(COMMAND_COMPLETE_RECORDING).finally(() => {
+      stopInFlightRef.current = false;
     });
   };
 
@@ -135,14 +135,14 @@ function Overlay() {
         </span>
         <p className="overlay-transcript-text" aria-live="polite">{statusLabel}</p>
         <p className="overlay-elapsed">{isListening ? formatElapsedLabel(elapsedMs) : "..."}</p>
-        {canCancel ? (
+        {canStop ? (
           <button
             type="button"
-            className="overlay-cancel-button"
-            onClick={handleCancel}
-            aria-label="Cancel recording"
+            className="overlay-stop-button"
+            onClick={handleStop}
+            aria-label="Stop recording"
           >
-            ×
+            Stop
           </button>
         ) : null}
       </section>

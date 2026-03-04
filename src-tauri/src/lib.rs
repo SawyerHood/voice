@@ -1422,6 +1422,12 @@ fn active_pipeline_session_id(runtime_state: &PipelineRuntimeState) -> Option<u6
     runtime_state.active_session_id()
 }
 
+fn resolve_or_begin_pipeline_session(runtime_state: &PipelineRuntimeState) -> u64 {
+    runtime_state
+        .active_session_id()
+        .unwrap_or_else(|| runtime_state.begin_session())
+}
+
 fn register_pipeline_handlers(app: &AppHandle) {
     info!("registering pipeline event handlers");
     let start_app = app.clone();
@@ -1871,6 +1877,33 @@ fn stop_recording(
 }
 
 #[tauri::command]
+async fn complete_recording(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    info!("recording completion requested");
+    let runtime_state = app.state::<PipelineRuntimeState>().inner().clone();
+    let _guard = runtime_state.execution_lock.lock().await;
+
+    let status = get_status_from_state(&state);
+    if status != AppStatus::Listening {
+        debug!(
+            ?status,
+            "ignoring recording completion request because app is not listening"
+        );
+        return Ok(());
+    }
+
+    let session_id = resolve_or_begin_pipeline_session(&runtime_state);
+    let delegate = AppPipelineDelegate::for_session(app, session_id);
+    VoicePipeline::default()
+        .handle_hotkey_stopped(&delegate)
+        .await;
+    info!(session_id, "recording completion pipeline finished");
+    Ok(())
+}
+
+#[tauri::command]
 fn cancel_recording(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
     info!("recording/transcription cancel requested");
     let cancel_result = cancel_recording_with_hooks(
@@ -2287,6 +2320,7 @@ pub fn run() {
             open_accessibility_settings,
             start_recording,
             stop_recording,
+            complete_recording,
             cancel_recording,
             get_audio_level,
             insert_text,
@@ -2782,6 +2816,27 @@ mod tests {
     fn active_pipeline_session_id_is_none_before_any_session_starts() {
         let runtime = PipelineRuntimeState::default();
         assert_eq!(active_pipeline_session_id(&runtime), None);
+    }
+
+    #[test]
+    fn resolve_or_begin_pipeline_session_uses_existing_active_session() {
+        let runtime = PipelineRuntimeState::default();
+        let existing_session = runtime.begin_session();
+        let next_before = runtime.next_session_id.load(Ordering::Relaxed);
+
+        assert_eq!(
+            crate::resolve_or_begin_pipeline_session(&runtime),
+            existing_session
+        );
+        assert_eq!(runtime.next_session_id.load(Ordering::Relaxed), next_before);
+    }
+
+    #[test]
+    fn resolve_or_begin_pipeline_session_starts_new_session_when_missing() {
+        let runtime = PipelineRuntimeState::default();
+
+        assert_eq!(crate::resolve_or_begin_pipeline_session(&runtime), 1);
+        assert_eq!(runtime.active_session_id(), Some(1));
     }
 
     #[test]
