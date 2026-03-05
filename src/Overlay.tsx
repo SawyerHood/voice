@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useEffect, useRef, useState } from "react";
+import { Square } from "lucide-react";
 import { formatElapsedLabel } from "./overlayUtils";
 import "./Overlay.css";
 
@@ -142,7 +143,7 @@ function Overlay() {
             onClick={handleStop}
             aria-label="Stop recording"
           >
-            Stop
+            <Square className="overlay-stop-icon" fill="currentColor" strokeWidth={0} aria-hidden="true" />
           </button>
         ) : null}
       </section>
